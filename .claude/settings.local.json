@@ -1,0 +1,29 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:gateway.docs.projectx.com)",
+      "WebFetch(domain:help.topstep.com)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(/usr/local/bin/python3 /Users/marek/mf-trade-bot/src/topstep_client.py 2>&1)",
+      "Bash(/usr/local/bin/python3 /Users/marek/mf-trade-bot/src/analytics.py 2>&1)",
+      "Bash(/usr/local/bin/python3 -c \"\nfrom src.topstep_client import TopstepClient\nwith TopstepClient\\(\\) as c:\n    contracts = c.search_contracts\\('MES'\\)\n    print\\(contracts[0]\\)\n\" 2>&1)",
+      "Bash(/usr/local/bin/python3 -c \"\nfrom src.topstep_client import TopstepClient\nfrom datetime import datetime, timedelta, timezone\nwith TopstepClient\\(\\) as c:\n    end = datetime.now\\(timezone.utc\\)\n    start = end - timedelta\\(minutes=30\\)\n    bars = c.get_bars\\('CON.F.US.MES.H26', start, end, unit=TopstepClient.MINUTE, unit_number=1, limit=31\\)\n    print\\(f'bars returned: {len\\(bars\\)}'\\)\n    if bars:\n        print\\(bars[-1]\\)\n\" 2>&1)",
+      "Bash(/usr/local/bin/python3 -c \"\nfrom src.topstep_client import TopstepClient\nfrom datetime import datetime, timedelta, timezone\nwith TopstepClient\\(\\) as c:\n    end = datetime.now\\(timezone.utc\\)\n    start = end - timedelta\\(hours=4\\)\n    bars = c.get_bars\\('CON.F.US.MES.H26', start, end, unit=TopstepClient.MINUTE, unit_number=5, limit=100\\)\n    print\\(f'5-min bars: {len\\(bars\\)}'\\)\n    bars2 = c.get_bars\\('CON.F.US.MES.H26', start, end, unit=TopstepClient.MINUTE, unit_number=1, limit=500\\)\n    print\\(f'1-min bars: {len\\(bars2\\)}'\\)\n\" 2>&1)",
+      "Bash(/usr/local/bin/python3 -c \"\nfrom src.topstep_client import TopstepClient\nfrom datetime import datetime, timedelta, timezone\nwith TopstepClient\\(\\) as c:\n    end = datetime.now\\(timezone.utc\\)\n    start = end - timedelta\\(hours=4\\)\n    bars = c.get_bars\\('CON.F.US.MES.H26', start, end, unit=TopstepClient.MINUTE, unit_number=1, limit=500\\)\n    print\\(f'now:       {end.isoformat\\(\\)}'\\)\n    print\\(f'last bar:  {bars[-1][\\\\\"t\\\\\"]}'\\)\n    print\\(f'first bar: {bars[0][\\\\\"t\\\\\"]}'\\)\n    delta = end - datetime.fromisoformat\\(bars[-1]['t']\\)\n    print\\(f'lag:       {delta}'\\)\n\" 2>&1)",
+      "Bash(/usr/local/bin/python3 src/analytics.py 2>&1)",
+      "Bash(find /Users/marek/mf-trade-bot -name \"*.csv\" -o -name \"*.json\" -o -name \"*.parquet\" 2>/dev/null | head -30)",
+      "Bash(/usr/local/bin/python3 -c \"\nimport openpyxl\nwb = openpyxl.load_workbook\\('/Users/marek/mf-trade-bot/polygon_data_SPY.xlsx', read_only=True\\)\nprint\\('sheets:', wb.sheetnames\\)\nws = wb.active\nrows = list\\(ws.iter_rows\\(values_only=True\\)\\)\nprint\\('total rows:', len\\(rows\\)\\)\nprint\\('header:', rows[0]\\)\nprint\\('row 1:', rows[1]\\)\nprint\\('row 2:', rows[2]\\)\nprint\\('last row:', rows[-1]\\)\n\" 2>&1)",
+      "Bash(pip install:*)",
+      "Bash(/usr/local/bin/python3 src/backtest_regime_vol.py 2>&1)",
+      "Bash(ls /Users/marek/mf-trade-bot/*.xlsx /Users/marek/mf-trade-bot/*.csv 2>/dev/null)",
+      "Bash(ls /Users/marek/mf-trade-bot/*.xlsx)",
+      "Bash(/usr/local/bin/python3 -c \"\nimport pandas as pd\ndf = pd.read_excel\\('/Users/marek/mf-trade-bot/polygon_data_QQQ.xlsx'\\)\ndf['ts'] = pd.to_datetime\\(df['t'], unit='ms', utc=True\\).dt.tz_convert\\('America/New_York'\\)\nprint\\('shape:', df.shape\\)\nprint\\('columns:', df.columns.tolist\\(\\)\\)\nprint\\('date range:', df['ts'].min\\(\\), 'to', df['ts'].max\\(\\)\\)\ndiffs = df['ts'].diff\\(\\).dropna\\(\\).value_counts\\(\\).head\\(5\\)\nprint\\('bar intervals:', diffs\\)\nprint\\(df.head\\(3\\)\\)\n\" 2>&1)",
+      "Bash(/usr/local/bin/python3 src/backtest_regime_vol.py ../polygon_data_QQQ.xlsx 2>&1)",
+      "Bash(/usr/local/bin/python3 src/backtest_regime_vol.py polygon_data_QQQ.xlsx 2>&1)",
+      "Bash(/usr/local/bin/python3 src/backtest_mes.py 2>&1)",
+      "Bash(/usr/local/bin/python3 src/continuation_prob.py 2>&1)"
+    ]
+  }
+}
