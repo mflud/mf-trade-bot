@@ -23,7 +23,25 @@
       "Bash(/usr/local/bin/python3 src/backtest_regime_vol.py ../polygon_data_QQQ.xlsx 2>&1)",
       "Bash(/usr/local/bin/python3 src/backtest_regime_vol.py polygon_data_QQQ.xlsx 2>&1)",
       "Bash(/usr/local/bin/python3 src/backtest_mes.py 2>&1)",
-      "Bash(/usr/local/bin/python3 src/continuation_prob.py 2>&1)"
+      "Bash(/usr/local/bin/python3 src/continuation_prob.py 2>&1)",
+      "mcp__massive__search_endpoints",
+      "mcp__massive__call_api",
+      "mcp__massive__get_endpoint_docs",
+      "Bash(python -c \"\nfrom datetime import datetime, timezone, timedelta\nfrom src.topstep_client import TopstepClient\n\nwith TopstepClient\\(\\) as client:\n    contracts = client.search_contracts\\('MES'\\)\n    print\\('Contracts found:'\\)\n    for c in contracts:\n        print\\(f'  id={c[\\\\\"id\\\\\"]}  name={c.get\\(\\\\\"name\\\\\"\\)}  description={c.get\\(\\\\\"description\\\\\",\\\\\"\\\\\"\\)}'\\)\n\")",
+      "Bash(python src/vol_comparison.py)",
+      "Bash(which python:*)",
+      "Bash(conda run:*)",
+      "WebFetch(domain:bookmap.com)",
+      "WebFetch(domain:docs.bookmap.com)",
+      "WebFetch(domain:renkoogrenci.com)",
+      "WebFetch(domain:databento.com)",
+      "WebFetch(domain:www.cmegroup.com)",
+      "WebFetch(domain:cmegroupclientsite.atlassian.net)",
+      "WebFetch(domain:www.quantvps.com)",
+      "WebFetch(domain:community.optimusfutures.com)",
+      "WebFetch(domain:www.scribd.com)",
+      "Bash(chmod +x /Users/marek/mf-trade-bot/scripts/run_dom_recorder.sh)",
+      "Bash(bash -n scripts/run_dom_recorder.sh && echo \"syntax OK\")"
     ]
   }
 }

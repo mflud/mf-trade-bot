@@ -5,6 +5,7 @@ API docs: https://gateway.docs.projectx.com/
 
 import os
 from datetime import datetime, timezone
+from typing import Literal
 import httpx
 from dotenv import load_dotenv
 
@@ -115,6 +116,98 @@ class TopstepClient:
         if not data.get("success"):
             raise RuntimeError(f"retrieveBars failed: {data.get('errorMessage')}")
         return data.get("bars", [])
+
+    # Known MES contracts in chronological order, oldest first.
+    # Extend this list when new quarterly contracts become available.
+    MES_CONTRACTS = [
+        "CON.F.US.MES.H25",  # Mar 2025
+        "CON.F.US.MES.M25",  # Jun 2025
+        "CON.F.US.MES.U25",  # Sep 2025
+        "CON.F.US.MES.Z25",  # Dec 2025
+        "CON.F.US.MES.H26",  # Mar 2026
+    ]
+
+    def get_continuous_mes_bars(
+        self,
+        unit: int = 4,           # DAY
+        unit_number: int = 1,
+        limit: int = 20000,
+        back_adjust: bool = True,
+    ) -> list[dict]:
+        """
+        Return a stitched continuous MES bar series across all available quarterly contracts.
+
+        On overlapping dates, the newer (next-quarter) contract takes precedence.
+        With back_adjust=True (default), historical prices are shifted at each roll so
+        that the series is gap-free (Panama/backward method). Prices reflect returns
+        accurately but are not actual traded prices.
+        With back_adjust=False, raw prices are returned with visible roll gaps.
+
+        Returns list of dicts sorted ascending by timestamp, each with:
+          t, o, h, l, c, v, contract (source contract id)
+        """
+        self._ensure_authenticated()
+
+        far_past = datetime(2020, 1, 1, tzinfo=timezone.utc)
+        far_future = datetime(2030, 1, 1, tzinfo=timezone.utc)
+
+        # Fetch all contracts; skip those with no data
+        per_contract: list[list[dict]] = []
+        for cid in self.MES_CONTRACTS:
+            bars = self.get_bars(
+                contract_id=cid,
+                start=far_past,
+                end=far_future,
+                unit=unit,
+                unit_number=unit_number,
+                limit=limit,
+            )
+            if not bars:
+                continue
+            # API returns newest-first; reverse to ascending
+            bars = list(reversed(bars))
+            for b in bars:
+                b["contract"] = cid
+            per_contract.append(bars)
+
+        if not per_contract:
+            return []
+
+        # Merge: newer contract wins on any overlapping timestamp
+        # Build a dict keyed by timestamp, iterating oldest→newest contract
+        merged: dict[str, dict] = {}
+        for bars in per_contract:
+            for b in bars:
+                merged[b["t"]] = b
+
+        series = sorted(merged.values(), key=lambda b: b["t"])
+
+        if not back_adjust:
+            return series
+
+        # Back-adjust (Panama method, backward pass):
+        # At each contract switch, calculate price gap and subtract it from all
+        # earlier bars so the series is continuous at the roll point.
+        cumulative_adj = 0.0
+        prev_contract = series[-1]["contract"]
+
+        # Walk backward; when contract changes, compute gap and accumulate
+        for i in range(len(series) - 2, -1, -1):
+            cur = series[i]
+            nxt = series[i + 1]
+
+            if nxt["contract"] != prev_contract:
+                # Roll: gap = close of old contract day - close of new contract day
+                # (nxt is the first bar of the new contract, cur is last of old)
+                gap = cur["c"] - nxt["c"]
+                cumulative_adj += gap
+                prev_contract = nxt["contract"]
+
+            if cumulative_adj != 0.0:
+                for field in ("o", "h", "l", "c"):
+                    cur[field] = round(cur[field] + cumulative_adj, 4)
+
+        return series
 
     def _ensure_authenticated(self):
         if not self.token:

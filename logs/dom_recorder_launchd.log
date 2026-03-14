@@ -1,0 +1,108 @@
+[2026-03-14 12:08:42]  Wrapper started (PID=96232)  env=topstep-project  args: --record --record-interval 5
+[2026-03-14 12:08:42]  Logs → /Users/marek/mf-trade-bot/logs/dom_recorder.log   PID file → /Users/marek/mf-trade-bot/logs/dom_recorder.pid
+/Users/marek/mf-trade-bot/scripts/run_dom_recorder.sh: line 47: /Users/marek/miniconda3/etc/profile.d/conda.sh: No such file or directory
+[2026-03-14 12:08:52]  Wrapper started (PID=96257)  env=topstep-project  args: --record --record-interval 5
+[2026-03-14 12:08:52]  Logs → /Users/marek/mf-trade-bot/logs/dom_recorder.log   PID file → /Users/marek/mf-trade-bot/logs/dom_recorder.pid
+/Users/marek/mf-trade-bot/scripts/run_dom_recorder.sh: line 47: /Users/marek/miniconda3/etc/profile.d/conda.sh: No such file or directory
+[2026-03-14 12:09:02]  Wrapper started (PID=96276)  env=topstep-project  args: --record --record-interval 5
+[2026-03-14 12:09:02]  Logs → /Users/marek/mf-trade-bot/logs/dom_recorder.log   PID file → /Users/marek/mf-trade-bot/logs/dom_recorder.pid
+/Users/marek/mf-trade-bot/scripts/run_dom_recorder.sh: line 47: /Users/marek/miniconda3/etc/profile.d/conda.sh: No such file or directory
+[2026-03-14 12:09:12]  Wrapper started (PID=96298)  env=topstep-project  args: --record --record-interval 5
+[2026-03-14 12:09:12]  Logs → /Users/marek/mf-trade-bot/logs/dom_recorder.log   PID file → /Users/marek/mf-trade-bot/logs/dom_recorder.pid
+/Users/marek/mf-trade-bot/scripts/run_dom_recorder.sh: line 47: /Users/marek/miniconda3/etc/profile.d/conda.sh: No such file or directory
+[2026-03-14 12:09:22]  Wrapper started (PID=96310)  env=topstep-project  args: --record --record-interval 5
+[2026-03-14 12:09:22]  Logs → /Users/marek/mf-trade-bot/logs/dom_recorder.log   PID file → /Users/marek/mf-trade-bot/logs/dom_recorder.pid
+/Users/marek/mf-trade-bot/scripts/run_dom_recorder.sh: line 47: /Users/marek/miniconda3/etc/profile.d/conda.sh: No such file or directory
+[2026-03-14 12:09:32]  Wrapper started (PID=96325)  env=topstep-project  args: --record --record-interval 5
+[2026-03-14 12:09:32]  Logs → /Users/marek/mf-trade-bot/logs/dom_recorder.log   PID file → /Users/marek/mf-trade-bot/logs/dom_recorder.pid
+/Users/marek/mf-trade-bot/scripts/run_dom_recorder.sh: line 47: /Users/marek/miniconda3/etc/profile.d/conda.sh: No such file or directory
+[2026-03-14 12:09:42]  Wrapper started (PID=96339)  env=topstep-project  args: --record --record-interval 5
+[2026-03-14 12:09:42]  Logs → /Users/marek/mf-trade-bot/logs/dom_recorder.log   PID file → /Users/marek/mf-trade-bot/logs/dom_recorder.pid
+/Users/marek/mf-trade-bot/scripts/run_dom_recorder.sh: line 47: /Users/marek/miniconda3/etc/profile.d/conda.sh: No such file or directory
+[2026-03-14 12:09:52]  Wrapper started (PID=96351)  env=topstep-project  args: --record --record-interval 5
+[2026-03-14 12:09:52]  Logs → /Users/marek/mf-trade-bot/logs/dom_recorder.log   PID file → /Users/marek/mf-trade-bot/logs/dom_recorder.pid
+/Users/marek/mf-trade-bot/scripts/run_dom_recorder.sh: line 47: /Users/marek/miniconda3/etc/profile.d/conda.sh: No such file or directory
+[2026-03-14 12:10:02]  Wrapper started (PID=96367)  env=topstep-project  args: --record --record-interval 5
+[2026-03-14 12:10:02]  Logs → /Users/marek/mf-trade-bot/logs/dom_recorder.log   PID file → /Users/marek/mf-trade-bot/logs/dom_recorder.pid
+/Users/marek/mf-trade-bot/scripts/run_dom_recorder.sh: line 47: /Users/marek/miniconda3/etc/profile.d/conda.sh: No such file or directory
+[2026-03-14 12:10:12]  Wrapper started (PID=96381)  env=topstep-project  args: --record --record-interval 5
+[2026-03-14 12:10:12]  Logs → /Users/marek/mf-trade-bot/logs/dom_recorder.log   PID file → /Users/marek/mf-trade-bot/logs/dom_recorder.pid
+/Users/marek/mf-trade-bot/scripts/run_dom_recorder.sh: line 47: /Users/marek/miniconda3/etc/profile.d/conda.sh: No such file or directory
+[2026-03-14 12:10:22]  Wrapper started (PID=96395)  env=topstep-project  args: --record --record-interval 5
+[2026-03-14 12:10:22]  Logs → /Users/marek/mf-trade-bot/logs/dom_recorder.log   PID file → /Users/marek/mf-trade-bot/logs/dom_recorder.pid
+/Users/marek/mf-trade-bot/scripts/run_dom_recorder.sh: line 47: /Users/marek/miniconda3/etc/profile.d/conda.sh: No such file or directory
+[2026-03-14 12:10:32]  Wrapper started (PID=96407)  env=topstep-project  args: --record --record-interval 5
+[2026-03-14 12:10:32]  Logs → /Users/marek/mf-trade-bot/logs/dom_recorder.log   PID file → /Users/marek/mf-trade-bot/logs/dom_recorder.pid
+/Users/marek/mf-trade-bot/scripts/run_dom_recorder.sh: line 47: /Users/marek/miniconda3/etc/profile.d/conda.sh: No such file or directory
+[2026-03-14 12:10:42]  Wrapper started (PID=96420)  env=topstep-project  args: --record --record-interval 5
+[2026-03-14 12:10:42]  Logs → /Users/marek/mf-trade-bot/logs/dom_recorder.log   PID file → /Users/marek/mf-trade-bot/logs/dom_recorder.pid
+/Users/marek/mf-trade-bot/scripts/run_dom_recorder.sh: line 47: /Users/marek/miniconda3/etc/profile.d/conda.sh: No such file or directory
+[2026-03-14 12:10:53]  Wrapper started (PID=96432)  env=topstep-project  args: --record --record-interval 5
+[2026-03-14 12:10:53]  Logs → /Users/marek/mf-trade-bot/logs/dom_recorder.log   PID file → /Users/marek/mf-trade-bot/logs/dom_recorder.pid
+/Users/marek/mf-trade-bot/scripts/run_dom_recorder.sh: line 47: /Users/marek/miniconda3/etc/profile.d/conda.sh: No such file or directory
+[2026-03-14 12:11:03]  Wrapper started (PID=96446)  env=topstep-project  args: --record --record-interval 5
+[2026-03-14 12:11:03]  Logs → /Users/marek/mf-trade-bot/logs/dom_recorder.log   PID file → /Users/marek/mf-trade-bot/logs/dom_recorder.pid
+/Users/marek/mf-trade-bot/scripts/run_dom_recorder.sh: line 47: /Users/marek/miniconda3/etc/profile.d/conda.sh: No such file or directory
+[2026-03-14 12:11:13]  Wrapper started (PID=96458)  env=topstep-project  args: --record --record-interval 5
+[2026-03-14 12:11:13]  Logs → /Users/marek/mf-trade-bot/logs/dom_recorder.log   PID file → /Users/marek/mf-trade-bot/logs/dom_recorder.pid
+/Users/marek/mf-trade-bot/scripts/run_dom_recorder.sh: line 47: /Users/marek/miniconda3/etc/profile.d/conda.sh: No such file or directory
+[2026-03-14 12:11:23]  Wrapper started (PID=96471)  env=topstep-project  args: --record --record-interval 5
+[2026-03-14 12:11:23]  Logs → /Users/marek/mf-trade-bot/logs/dom_recorder.log   PID file → /Users/marek/mf-trade-bot/logs/dom_recorder.pid
+/Users/marek/mf-trade-bot/scripts/run_dom_recorder.sh: line 47: /Users/marek/miniconda3/etc/profile.d/conda.sh: No such file or directory
+[2026-03-14 12:11:33]  Wrapper started (PID=96496)  env=topstep-project  args: --record --record-interval 5
+[2026-03-14 12:11:33]  Logs → /Users/marek/mf-trade-bot/logs/dom_recorder.log   PID file → /Users/marek/mf-trade-bot/logs/dom_recorder.pid
+/Users/marek/mf-trade-bot/scripts/run_dom_recorder.sh: line 47: /Users/marek/miniconda3/etc/profile.d/conda.sh: No such file or directory
+[2026-03-14 12:11:43]  Wrapper started (PID=96554)  env=topstep-project  args: --record --record-interval 5
+[2026-03-14 12:11:43]  Logs → /Users/marek/mf-trade-bot/logs/dom_recorder.log   PID file → /Users/marek/mf-trade-bot/logs/dom_recorder.pid
+/Users/marek/mf-trade-bot/scripts/run_dom_recorder.sh: line 47: /Users/marek/miniconda3/etc/profile.d/conda.sh: No such file or directory
+[2026-03-14 12:11:53]  Wrapper started (PID=96576)  env=topstep-project  args: --record --record-interval 5
+[2026-03-14 12:11:53]  Logs → /Users/marek/mf-trade-bot/logs/dom_recorder.log   PID file → /Users/marek/mf-trade-bot/logs/dom_recorder.pid
+/Users/marek/mf-trade-bot/scripts/run_dom_recorder.sh: line 47: /Users/marek/miniconda3/etc/profile.d/conda.sh: No such file or directory
+[2026-03-14 12:12:03]  Wrapper started (PID=96617)  env=topstep-project  args: --record --record-interval 5
+[2026-03-14 12:12:03]  Logs → /Users/marek/mf-trade-bot/logs/dom_recorder.log   PID file → /Users/marek/mf-trade-bot/logs/dom_recorder.pid
+/Users/marek/mf-trade-bot/scripts/run_dom_recorder.sh: line 47: /Users/marek/miniconda3/etc/profile.d/conda.sh: No such file or directory
+[2026-03-14 12:12:13]  Wrapper started (PID=96634)  env=topstep-project  args: --record --record-interval 5
+[2026-03-14 12:12:13]  Logs → /Users/marek/mf-trade-bot/logs/dom_recorder.log   PID file → /Users/marek/mf-trade-bot/logs/dom_recorder.pid
+/Users/marek/mf-trade-bot/scripts/run_dom_recorder.sh: line 47: /Users/marek/miniconda3/etc/profile.d/conda.sh: No such file or directory
+[2026-03-14 12:12:23]  Wrapper started (PID=96651)  env=topstep-project  args: --record --record-interval 5
+[2026-03-14 12:12:23]  Logs → /Users/marek/mf-trade-bot/logs/dom_recorder.log   PID file → /Users/marek/mf-trade-bot/logs/dom_recorder.pid
+/Users/marek/mf-trade-bot/scripts/run_dom_recorder.sh: line 47: /Users/marek/miniconda3/etc/profile.d/conda.sh: No such file or directory
+[2026-03-14 12:12:33]  Wrapper started (PID=96672)  env=topstep-project  args: --record --record-interval 5
+[2026-03-14 12:12:33]  Logs → /Users/marek/mf-trade-bot/logs/dom_recorder.log   PID file → /Users/marek/mf-trade-bot/logs/dom_recorder.pid
+/Users/marek/mf-trade-bot/scripts/run_dom_recorder.sh: line 47: /Users/marek/miniconda3/etc/profile.d/conda.sh: No such file or directory
+[2026-03-14 12:12:43]  Wrapper started (PID=96684)  env=topstep-project  args: --record --record-interval 5
+[2026-03-14 12:12:43]  Logs → /Users/marek/mf-trade-bot/logs/dom_recorder.log   PID file → /Users/marek/mf-trade-bot/logs/dom_recorder.pid
+/Users/marek/mf-trade-bot/scripts/run_dom_recorder.sh: line 47: /Users/marek/miniconda3/etc/profile.d/conda.sh: No such file or directory
+[2026-03-14 12:12:53]  Wrapper started (PID=96696)  env=topstep-project  args: --record --record-interval 5
+[2026-03-14 12:12:53]  Logs → /Users/marek/mf-trade-bot/logs/dom_recorder.log   PID file → /Users/marek/mf-trade-bot/logs/dom_recorder.pid
+/Users/marek/mf-trade-bot/scripts/run_dom_recorder.sh: line 47: /Users/marek/miniconda3/etc/profile.d/conda.sh: No such file or directory
+[2026-03-14 12:13:03]  Wrapper started (PID=96711)  env=topstep-project  args: --record --record-interval 5
+[2026-03-14 12:13:03]  Logs → /Users/marek/mf-trade-bot/logs/dom_recorder.log   PID file → /Users/marek/mf-trade-bot/logs/dom_recorder.pid
+/Users/marek/mf-trade-bot/scripts/run_dom_recorder.sh: line 47: /Users/marek/miniconda3/etc/profile.d/conda.sh: No such file or directory
+[2026-03-14 12:13:13]  Wrapper started (PID=96723)  env=topstep-project  args: --record --record-interval 5
+[2026-03-14 12:13:13]  Logs → /Users/marek/mf-trade-bot/logs/dom_recorder.log   PID file → /Users/marek/mf-trade-bot/logs/dom_recorder.pid
+/Users/marek/mf-trade-bot/scripts/run_dom_recorder.sh: line 47: /Users/marek/miniconda3/etc/profile.d/conda.sh: No such file or directory
+[2026-03-14 12:13:23]  Wrapper started (PID=96735)  env=topstep-project  args: --record --record-interval 5
+[2026-03-14 12:13:23]  Logs → /Users/marek/mf-trade-bot/logs/dom_recorder.log   PID file → /Users/marek/mf-trade-bot/logs/dom_recorder.pid
+/Users/marek/mf-trade-bot/scripts/run_dom_recorder.sh: line 47: /Users/marek/miniconda3/etc/profile.d/conda.sh: No such file or directory
+[2026-03-14 12:13:33]  Wrapper started (PID=96747)  env=topstep-project  args: --record --record-interval 5
+[2026-03-14 12:13:33]  Logs → /Users/marek/mf-trade-bot/logs/dom_recorder.log   PID file → /Users/marek/mf-trade-bot/logs/dom_recorder.pid
+/Users/marek/mf-trade-bot/scripts/run_dom_recorder.sh: line 47: /Users/marek/miniconda3/etc/profile.d/conda.sh: No such file or directory
+[2026-03-14 12:13:43]  Wrapper started (PID=96759)  env=topstep-project  args: --record --record-interval 5
+[2026-03-14 12:13:43]  Logs → /Users/marek/mf-trade-bot/logs/dom_recorder.log   PID file → /Users/marek/mf-trade-bot/logs/dom_recorder.pid
+/Users/marek/mf-trade-bot/scripts/run_dom_recorder.sh: line 47: /Users/marek/miniconda3/etc/profile.d/conda.sh: No such file or directory
+[2026-03-14 12:13:54]  Wrapper started (PID=96771)  env=topstep-project  args: --record --record-interval 5
+[2026-03-14 12:13:54]  Logs → /Users/marek/mf-trade-bot/logs/dom_recorder.log   PID file → /Users/marek/mf-trade-bot/logs/dom_recorder.pid
+/Users/marek/mf-trade-bot/scripts/run_dom_recorder.sh: line 47: /Users/marek/miniconda3/etc/profile.d/conda.sh: No such file or directory
+[2026-03-14 12:14:04]  Wrapper started (PID=96786)  env=topstep-project  args: --record --record-interval 5
+[2026-03-14 12:14:04]  Logs → /Users/marek/mf-trade-bot/logs/dom_recorder.log   PID file → /Users/marek/mf-trade-bot/logs/dom_recorder.pid
+/Users/marek/mf-trade-bot/scripts/run_dom_recorder.sh: line 47: /Users/marek/miniconda3/etc/profile.d/conda.sh: No such file or directory
+[2026-03-14 12:14:14]  Wrapper started (PID=96798)  env=topstep-project  args: --record --record-interval 5
+[2026-03-14 12:14:14]  Logs → /Users/marek/mf-trade-bot/logs/dom_recorder.log   PID file → /Users/marek/mf-trade-bot/logs/dom_recorder.pid
+/Users/marek/mf-trade-bot/scripts/run_dom_recorder.sh: line 47: /Users/marek/miniconda3/etc/profile.d/conda.sh: No such file or directory
+[2026-03-14 12:14:24]  Wrapper started (PID=96811)  env=topstep-project  args: --record --record-interval 5
+[2026-03-14 12:14:24]  Logs → /Users/marek/mf-trade-bot/logs/dom_recorder.log   PID file → /Users/marek/mf-trade-bot/logs/dom_recorder.pid
+/Users/marek/mf-trade-bot/scripts/run_dom_recorder.sh: line 47: /Users/marek/miniconda3/etc/profile.d/conda.sh: No such file or directory
+[2026-03-14 12:14:34]  Wrapper started (PID=96826)  env=topstep-project  args: --record --record-interval 5
+[2026-03-14 12:14:34]  Logs → /Users/marek/mf-trade-bot/logs/dom_recorder.log   PID file → /Users/marek/mf-trade-bot/logs/dom_recorder.pid
+/Users/marek/mf-trade-bot/scripts/run_dom_recorder.sh: line 47: /Users/marek/miniconda3/etc/profile.d/conda.sh: No such file or directory

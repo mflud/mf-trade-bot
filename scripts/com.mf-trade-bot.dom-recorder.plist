@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.mf-trade-bot.dom-recorder</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/marek/mf-trade-bot/scripts/run_dom_recorder.sh</string>
+    </array>
+
+    <!-- Start immediately when loaded, and restart if it exits for any reason -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Throttle rapid restart loops (seconds between launchd retries) -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!-- Working directory -->
+    <key>WorkingDirectory</key>
+    <string>/Users/marek/mf-trade-bot</string>
+
+    <!-- Redirect stdout/stderr (the wrapper also writes to logs/dom_recorder.log,
+         but launchd captures anything that escapes before the wrapper opens its log) -->
+    <key>StandardOutPath</key>
+    <string>/Users/marek/mf-trade-bot/logs/dom_recorder_launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/marek/mf-trade-bot/logs/dom_recorder_launchd.log</string>
+</dict>
+</plist>
