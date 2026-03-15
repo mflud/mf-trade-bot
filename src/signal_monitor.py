@@ -9,8 +9,8 @@ side-by-side panels for each configured instrument:
   - If signal: entry, target, stop in points + expiry countdown
 
 Instruments and their optimal parameters (from backtest):
-  MYM  Micro Dow      stop=2.0σ  target=2.5σ  $0.50/pt
-  MES  Micro S&P 500  stop=1.5σ  target=2.5σ  $5.00/pt
+  MYM  Micro Dow      stop=2.0σ  target=3.0σ  $0.50/pt
+  MES  Micro S&P 500  stop=2.0σ  target=3.0σ  $5.00/pt
 
 Run modes:
   python src/signal_monitor.py          # live (requires .env credentials)
@@ -18,11 +18,13 @@ Run modes:
 """
 
 import argparse
+import csv
 import math
 import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import numpy as np
 
@@ -39,11 +41,29 @@ from rich.text import Text
 # ── Strategy parameters ────────────────────────────────────────────────────────
 
 TF_MINUTES    = 5
-TRAILING_BARS = 100
+TRAILING_BARS = 20    # 20 × 5-min = 100 min (optimal from signal_window_grid)
+GK_VOL_BARS   = 20   # 20 × 5-min = 100-min window; Garman-Klass estimator
+MOM_BARS      = 8    # 8 × 5-min = 40 min momentum window
+CSR_THRESHOLD = 1.5  # CSR = Cumulative Scaled Return; min value aligned with signal direction
 SIGNAL_SIGMA  = 3.0
+MAX_SCALED    = 5.0   # ignore extreme event spikes above this
 VOL_RATIO_MIN = 1.5
 MAX_HOLD_MIN  = 15
 BARS_PER_YEAR = 252 * 23 * 60
+
+# Time-of-day blackout windows (UTC).  Signals are suppressed during these periods.
+#   13:00–14:00 UTC (08:00–09:00 EST) — economic data release window: P(stop)>0.40, EV negative
+BLACKOUT_WINDOWS_UTC = [
+    (13,  0, 14,  0),   # (start_h, start_m, end_h, end_m)  8:00–9:00 EST
+]
+
+LOG_PATH = Path("logs/signals.csv")
+LOG_FIELDS = [
+    "fired_at", "resolved_at", "symbol", "direction",
+    "entry", "target", "stop",
+    "sigma_pts", "scaled", "vol_ratio", "csr",
+    "outcome", "pnl_pts", "pnl_sigma",
+]
 
 REGIME_THRESHOLDS = [
     (0.10, "QUIET",    "dim"),
@@ -65,10 +85,10 @@ class InstrumentConfig:
 
 
 INSTRUMENTS = [
-    InstrumentConfig("MYM", "MYM", stop_sigma=2.0, target_sigma=2.5,
-                     point_value=0.50, ev_sigma=0.484),
-    InstrumentConfig("MES", "MES", stop_sigma=1.5, target_sigma=2.5,
-                     point_value=5.00, ev_sigma=0.081),
+    InstrumentConfig("MYM", "MYM", stop_sigma=2.0, target_sigma=3.0,
+                     point_value=0.50, ev_sigma=0.073),  # trail=20 pending MYM retest
+    InstrumentConfig("MES", "MES", stop_sigma=2.0, target_sigma=3.0,
+                     point_value=5.00, ev_sigma=0.073),  # trail=20, no filter, -2σ/+3σ
 ]
 
 console = Console()
@@ -95,6 +115,7 @@ class Signal:
     sigma_pts:  float
     scaled:     float
     vol_ratio:  float
+    csr:        float
     bar_ts:     datetime
     target:     float = field(init=False)
     stop:       float = field(init=False)
@@ -125,6 +146,8 @@ class InstrumentState:
     bars:          list[Bar] = field(default_factory=list)
     sigma:         float = 0.0
     sigma_pts:     float = 0.0
+    gk_ann_vol:    float = 0.0
+    csr:           float = 0.0   # cumulative scaled return (40 min, direction-adjusted)
     mean_vol:      float = 1.0
     active_signal: Signal | None = None
     history:       list[RecentSignal] = field(default_factory=list)
@@ -135,6 +158,18 @@ class InstrumentState:
 
 def annualised_vol(sigma: float) -> float:
     return sigma * math.sqrt(BARS_PER_YEAR / TF_MINUTES)
+
+
+def gk_annualised_vol(bars: list) -> float:
+    """Garman-Klass annualised vol from the last GK_VOL_BARS 5-min bars."""
+    sample = bars[-GK_VOL_BARS:] if len(bars) >= GK_VOL_BARS else bars
+    if len(sample) < 2:
+        return float("nan")
+    ln_hl = np.log(np.array([b.high / b.low   for b in sample]))
+    ln_co = np.log(np.array([b.close / b.open for b in sample]))
+    gk = 0.5 * ln_hl ** 2 - (2 * math.log(2) - 1) * ln_co ** 2
+    var = float(np.mean(gk))
+    return math.sqrt(var * BARS_PER_YEAR / TF_MINUTES) if var > 0 else float("nan")
 
 
 def regime_label(ann_vol: float) -> tuple[str, str]:
@@ -163,12 +198,17 @@ def build_regime_panel(state: InstrumentState) -> Panel:
     t.add_column(style="dim", width=16)
     t.add_column(width=24)
 
+    gk  = state.gk_ann_vol
+    gk_label, gk_style = regime_label(gk) if gk > 0 else (label, style)
+
     t.add_row("σ per bar:",
               f"[bold]{sigma * 10000:.2f} bps[/]  │  {sigma_pts:.2f} pts")
-    t.add_row("Ann. vol:",
-              f"[bold]{ann*100:.1f}%[/]")
+    t.add_row("Ann. vol (CR):",
+              f"{ann*100:.1f}%  [dim](close-return, 100 bars)[/]")
+    t.add_row("Ann. vol (GK):",
+              f"[bold]{gk*100:.1f}%[/]  [dim](Garman-Klass, 20 bars)[/]")
     t.add_row("Regime:",
-              f"[bold {style}]{label}[/]")
+              f"[bold {gk_style}]{gk_label}[/]  [dim](GK)[/]")
     t.add_row("Avg volume:",
               f"{state.mean_vol:,.0f}")
     t.add_row("Cur volume:",
@@ -228,12 +268,28 @@ def build_signal_panel(state: InstrumentState, now: datetime) -> Panel:
         t = Table.grid(padding=(0, 1))
         t.add_column(style="dim", width=16)
         t.add_column()
+        csr       = state.csr
+        csr_pct   = min(abs(csr) / CSR_THRESHOLD * 100, 100)
+        bar_csr   = "█" * int(csr_pct / 5) + "░" * (20 - int(csr_pct / 5))
+        csr_style = "green" if csr >= CSR_THRESHOLD else \
+                    ("yellow" if csr > 0 else "red")
+        csr_check = "✓" if csr >= CSR_THRESHOLD else \
+                    ("~" if csr > 0 else "✗")
+
         t.add_row("Scaled return:",
                   f"[yellow]{bar_sc}[/] {abs(scaled):.2f}σ / {SIGNAL_SIGMA:.0f}σ")
         t.add_row("Volume ratio:",
                   f"[yellow]{bar_vr}[/] {vol_ratio:.2f}× / {VOL_RATIO_MIN:.1f}×")
+        t.add_row("Momentum(40m):",
+                  f"[{csr_style}]{bar_csr}[/] {csr:+.2f}σ / {CSR_THRESHOLD:.1f}σ {csr_check}")
         t.add_row("", "")
-        t.add_row("", f"[dim]Need ≥{SIGNAL_SIGMA:.0f}σ + ≥{VOL_RATIO_MIN:.1f}× vol[/]")
+        bar_hm = (state.bars[-1].ts.hour, state.bars[-1].ts.minute)
+        in_blackout = any(
+            (sh, sm) <= bar_hm < (eh, em)
+            for sh, sm, eh, em in BLACKOUT_WINDOWS_UTC
+        )
+        blackout_note = "  [bold red]BLACKOUT[/]" if in_blackout else ""
+        t.add_row("", f"[dim]Need ≥{SIGNAL_SIGMA:.0f}σ + ≥{VOL_RATIO_MIN:.1f}× vol + CSR≥{CSR_THRESHOLD:.1f}σ[/]{blackout_note}")
 
         return Panel(t, title="[bold yellow]⬤  WATCHING[/]",
                      border_style="yellow", padding=(0, 2))
@@ -367,6 +423,55 @@ def render(states: list[InstrumentState],
     return root
 
 
+# ── Trade logging ──────────────────────────────────────────────────────────────
+
+def _ensure_log():
+    LOG_PATH.parent.mkdir(exist_ok=True)
+    if not LOG_PATH.exists():
+        with open(LOG_PATH, "w", newline="") as f:
+            csv.DictWriter(f, fieldnames=LOG_FIELDS).writeheader()
+
+
+def _log_trade(sym: str, sig: Signal, outcome: str,
+               pnl_pts: float, resolved_at: datetime):
+    row = {
+        "fired_at":    sig.bar_ts.isoformat(),
+        "resolved_at": resolved_at.isoformat(),
+        "symbol":      sym,
+        "direction":   "LONG" if sig.direction == 1 else "SHORT",
+        "entry":       round(sig.entry,      4),
+        "target":      round(sig.target,     4),
+        "stop":        round(sig.stop,       4),
+        "sigma_pts":   round(sig.sigma_pts,  4),
+        "scaled":      round(sig.scaled,     4),
+        "vol_ratio":   round(sig.vol_ratio,  4),
+        "csr":         round(sig.csr,        4),
+        "outcome":     outcome,
+        "pnl_pts":     round(pnl_pts,        4),
+        "pnl_sigma":   round(pnl_pts / sig.sigma_pts, 4) if sig.sigma_pts else 0.0,
+    }
+    with open(LOG_PATH, "a", newline="") as f:
+        csv.DictWriter(f, fieldnames=LOG_FIELDS).writerow(row)
+
+
+def _check_resolution(sig: Signal, bars: list[Bar]) -> tuple[str, float] | None:
+    """Scan bars after the signal bar for target/stop hit. Returns (outcome, pnl_pts) or None."""
+    for bar in bars:
+        if bar.ts <= sig.bar_ts:
+            continue
+        if sig.direction == 1:
+            if bar.high >= sig.target:
+                return "TARGET",  sig.target_pts()
+            if bar.low  <= sig.stop:
+                return "STOPPED", -sig.stop_pts()
+        else:
+            if bar.low  <= sig.target:
+                return "TARGET",  sig.target_pts()
+            if bar.high >= sig.stop:
+                return "STOPPED", -sig.stop_pts()
+    return None
+
+
 # ── Live mode ──────────────────────────────────────────────────────────────────
 
 def evaluate(state: InstrumentState) -> Signal | None:
@@ -383,17 +488,36 @@ def evaluate(state: InstrumentState) -> Signal | None:
     state.sigma     = sigma
     state.sigma_pts = sigma_pts
     state.mean_vol  = mean_vol
+    state.gk_ann_vol = gk_annualised_vol(bars)
 
     last      = bars[-1]
     bar_ret   = math.log(last.close / last.open) if last.open else 0.0
     scaled    = bar_ret / sigma if sigma else 0.0
     vol_ratio = last.volume / mean_vol
 
-    if abs(scaled) >= SIGNAL_SIGMA and vol_ratio >= VOL_RATIO_MIN:
+    # 40-min cumulative scaled return (direction-adjusted; >CSR_THRESHOLD = with momentum)
+    direction = 1 if scaled > 0 else -1
+    if len(closes) >= MOM_BARS + 1:
+        mom_rets = np.log(closes[-MOM_BARS:] / closes[-MOM_BARS - 1:-1])
+        state.csr = float(mom_rets.sum()) / sigma * direction if sigma else 0.0
+    else:
+        state.csr = 0.0
+
+    # Blackout check
+    bar_hm = (last.ts.hour, last.ts.minute)
+    in_blackout = any(
+        (sh, sm) <= bar_hm < (eh, em)
+        for sh, sm, eh, em in BLACKOUT_WINDOWS_UTC
+    )
+
+    if (not in_blackout
+            and abs(scaled) >= SIGNAL_SIGMA and abs(scaled) <= MAX_SCALED
+            and vol_ratio >= VOL_RATIO_MIN and state.csr >= CSR_THRESHOLD):
         return Signal(cfg=state.cfg,
                       direction=1 if scaled > 0 else -1,
                       entry=last.close, sigma=sigma, sigma_pts=sigma_pts,
-                      scaled=scaled, vol_ratio=vol_ratio, bar_ts=last.ts)
+                      scaled=scaled, vol_ratio=vol_ratio, csr=state.csr,
+                      bar_ts=last.ts)
     return None
 
 
@@ -415,6 +539,7 @@ def run_live():
         console.print(f"  {cfg.symbol}: {c['name']}  id={c['id']}")
 
     combined_history: list[RecentSignal] = []
+    _ensure_log()
 
     def fetch_bars(state: InstrumentState):
         end   = datetime.now(timezone.utc)
@@ -427,6 +552,12 @@ def run_live():
                           open=b["o"], high=b["h"], low=b["l"],
                           close=b["c"], volume=b["v"]) for b in raw]
 
+    def resolve(state: InstrumentState, outcome: str, pnl_pts: float, now: datetime):
+        sig = state.active_signal
+        combined_history.append(RecentSignal(state.cfg.symbol, sig, outcome, pnl_pts))
+        _log_trade(state.cfg.symbol, sig, outcome, pnl_pts, now)
+        state.active_signal = None
+
     with Live(console=console, refresh_per_second=1, screen=True) as live:
         while True:
             now = datetime.now(timezone.utc)
@@ -438,21 +569,20 @@ def run_live():
 
                 new_sig = evaluate(state)
 
-                # Resolve expired active signal
-                if state.active_signal and now >= state.active_signal.expires_at:
-                    last_close = state.bars[-1].close
-                    pnl = (last_close - state.active_signal.entry) * state.active_signal.direction
-                    combined_history.append(
-                        RecentSignal(state.cfg.symbol, state.active_signal, "TIME EXIT", pnl)
-                    )
-                    state.active_signal = None
+                # Check active signal for target/stop hit or expiry
+                if state.active_signal:
+                    hit = _check_resolution(state.active_signal, state.bars)
+                    if hit:
+                        resolve(state, hit[0], hit[1], now)
+                    elif now >= state.active_signal.expires_at:
+                        last_close = state.bars[-1].close
+                        pnl = (last_close - state.active_signal.entry) * state.active_signal.direction
+                        resolve(state, "TIME EXIT", pnl, now)
 
                 if new_sig and (state.active_signal is None or
                                 new_sig.bar_ts != state.active_signal.bar_ts):
                     if state.active_signal:
-                        combined_history.append(
-                            RecentSignal(state.cfg.symbol, state.active_signal, "OPEN", 0)
-                        )
+                        resolve(state, "SUPERSEDED", 0.0, now)
                     state.active_signal = new_sig
 
             live.update(render(states, combined_history, now))
@@ -473,6 +603,7 @@ def run_demo():
     mym_state = InstrumentState(cfg=mym_cfg, cname="MYMH6")
     mym_state.sigma     = mym_sigma
     mym_state.sigma_pts = mym_sp
+    mym_state.gk_ann_vol = 0.198   # ~19.8% GK vol (slightly above close-return)
     mym_state.mean_vol  = 4_200.0
     mym_state.bars = [Bar(ts=now - timedelta(minutes=5),
                           open=46_430, high=46_560, low=46_415,
@@ -480,7 +611,7 @@ def run_demo():
     mym_state.active_signal = Signal(
         cfg=mym_cfg, direction=1, entry=46_500,
         sigma=mym_sigma, sigma_pts=mym_sp,
-        scaled=+3.91, vol_ratio=2.33, bar_ts=now - timedelta(minutes=5),
+        scaled=+3.91, vol_ratio=2.33, csr=1.82, bar_ts=now - timedelta(minutes=5),
     )
 
     # MES synthetic state — watching
@@ -492,6 +623,7 @@ def run_demo():
     mes_state = InstrumentState(cfg=mes_cfg, cname="MESH6")
     mes_state.sigma     = mes_sigma
     mes_state.sigma_pts = mes_sp
+    mes_state.gk_ann_vol = 0.198
     mes_state.mean_vol  = 8_450.0
     mes_state.bars = [Bar(ts=now - timedelta(minutes=5),
                           open=6_622.0, high=6_627.5, low=6_620.5,
@@ -499,16 +631,16 @@ def run_demo():
 
     history = [
         RecentSignal("MYM", Signal(mym_cfg, -1, 46_550, mym_sigma, mym_sp,
-                                   -3.5, 2.1, now - timedelta(minutes=75)),
+                                   -3.5, 2.1, 1.91, now - timedelta(minutes=75)),
                      "TARGET",    mym_sp * 2.5),
         RecentSignal("MES", Signal(mes_cfg, +1, 6_610, mes_sigma, mes_sp,
-                                   +4.1, 1.9, now - timedelta(minutes=130)),
+                                   +4.1, 1.9, 2.04, now - timedelta(minutes=130)),
                      "STOPPED",  -mes_sp * 1.5),
         RecentSignal("MYM", Signal(mym_cfg, +1, 46_380, mym_sigma, mym_sp,
-                                   +3.3, 1.7, now - timedelta(minutes=215)),
+                                   +3.3, 1.7, 1.63, now - timedelta(minutes=215)),
                      "TIME EXIT", mym_sp * 0.6),
         RecentSignal("MES", Signal(mes_cfg, -1, 6_645, mes_sigma, mes_sp,
-                                   -3.8, 2.4, now - timedelta(minutes=280)),
+                                   -3.8, 2.4, 1.55, now - timedelta(minutes=280)),
                      "TARGET",    mes_sp * 2.5),
     ]
 
@@ -521,6 +653,7 @@ def run_demo():
     mes_state2 = InstrumentState(cfg=mes_cfg, cname="MESH6")
     mes_state2.sigma     = mes_sigma
     mes_state2.sigma_pts = mes_sp
+    mes_state2.gk_ann_vol = 0.198
     mes_state2.mean_vol  = 8_450.0
     mes_state2.bars = [Bar(ts=now - timedelta(minutes=5),
                            open=6_640.0, high=6_641.0, low=6_618.5,
@@ -528,12 +661,13 @@ def run_demo():
     mes_state2.active_signal = Signal(
         cfg=mes_cfg, direction=-1, entry=6_620.0,
         sigma=mes_sigma, sigma_pts=mes_sp,
-        scaled=-4.12, vol_ratio=2.58, bar_ts=now - timedelta(minutes=5),
+        scaled=-4.12, vol_ratio=2.58, csr=2.17, bar_ts=now - timedelta(minutes=5),
     )
 
     mym_state2 = InstrumentState(cfg=mym_cfg, cname="MYMH6")
     mym_state2.sigma     = mym_sigma
     mym_state2.sigma_pts = mym_sp
+    mym_state2.gk_ann_vol = 0.198
     mym_state2.mean_vol  = 4_200.0
     mym_state2.bars = [Bar(ts=now - timedelta(minutes=5),
                            open=46_490, high=46_505, low=46_475,

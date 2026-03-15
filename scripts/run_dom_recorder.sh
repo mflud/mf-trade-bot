@@ -10,7 +10,7 @@
 #   kill $(cat logs/dom_recorder.pid)
 # ──────────────────────────────────────────────────────────────────────────────
 
-set -euo pipefail
+set -uo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOG_FILE="$REPO_DIR/logs/dom_recorder.log"
@@ -41,9 +41,30 @@ echo $$ > "$PID_FILE"
 log "Wrapper started (PID=$$)  env=$CONDA_ENV  args: $DOM_ARGS"
 log "Logs → $LOG_FILE   PID file → $PID_FILE"
 
-# Activate conda (works even when not in an interactive shell)
+# Locate conda — launchd doesn't load shell profiles so we search common paths
+CONDA_BASE=""
+for candidate in \
+    "$HOME/anaconda3" \
+    "$HOME/miniconda3" \
+    "$HOME/opt/anaconda3" \
+    "$HOME/opt/miniconda3" \
+    "/opt/anaconda3" \
+    "/opt/miniconda3" \
+    "/usr/local/anaconda3" \
+    "/usr/local/miniconda3"; do
+    if [ -f "$candidate/etc/profile.d/conda.sh" ]; then
+        CONDA_BASE="$candidate"
+        break
+    fi
+done
+
+if [ -z "$CONDA_BASE" ]; then
+    log "ERROR: could not locate conda installation — tried common paths"
+    exit 1
+fi
+
+log "Using conda at $CONDA_BASE"
 # shellcheck source=/dev/null
-CONDA_BASE="$(conda info --base 2>/dev/null || echo "$HOME/miniconda3")"
 source "$CONDA_BASE/etc/profile.d/conda.sh"
 conda activate "$CONDA_ENV"
 
