@@ -209,6 +209,107 @@ class TopstepClient:
 
         return series
 
+    # ── Order / position constants ──────────────────────────────────────────
+    BID          = 0   # Buy / long entry
+    ASK          = 1   # Sell / short entry
+    ORDER_MARKET = 2
+    ORDER_LIMIT  = 1
+    ORDER_STOP   = 4
+
+    def place_order(
+        self,
+        account_id:        int,
+        contract_id:       str,
+        side:              int,          # BID or ASK
+        size:              int  = 1,
+        order_type:        int  = 2,     # ORDER_MARKET
+        limit_price:       float | None = None,
+        stop_price:        float | None = None,
+        stop_loss_ticks:   int   | None = None,   # bracket: ticks from fill
+        take_profit_ticks: int   | None = None,   # bracket: ticks from fill
+        custom_tag:        str   | None = None,
+    ) -> dict:
+        """
+        Place an order.  Returns full response dict; raises on failure.
+
+        stop_loss_ticks / take_profit_ticks attach native API brackets so the
+        exchange manages the OCO pair — no need to track them manually.
+        """
+        self._ensure_authenticated()
+        body: dict = {
+            "accountId":  account_id,
+            "contractId": contract_id,
+            "type":       order_type,
+            "side":       side,
+            "size":       size,
+        }
+        if limit_price       is not None: body["limitPrice"]       = limit_price
+        if stop_price        is not None: body["stopPrice"]        = stop_price
+        if custom_tag        is not None: body["customTag"]        = custom_tag
+        if stop_loss_ticks   is not None:
+            body["stopLossBracket"]   = {"ticks": stop_loss_ticks,   "type": self.ORDER_STOP}
+        if take_profit_ticks is not None:
+            body["takeProfitBracket"] = {"ticks": take_profit_ticks, "type": self.ORDER_LIMIT}
+
+        resp = self._client.post("/api/Order/place", json=body)
+        resp.raise_for_status()
+        data = resp.json()
+        if not data.get("success"):
+            raise RuntimeError(f"place_order failed: {data.get('errorCode')} – {data.get('errorMessage')}")
+        return data
+
+    def cancel_order(self, account_id: int, order_id: int) -> dict:
+        """Cancel an open order."""
+        self._ensure_authenticated()
+        resp = self._client.post("/api/Order/cancel",
+                                 json={"accountId": account_id, "orderId": order_id})
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_open_orders(self, account_id: int) -> list[dict]:
+        """Return all open orders for the account."""
+        self._ensure_authenticated()
+        resp = self._client.post("/api/Order/searchOpen", json={"accountId": account_id})
+        resp.raise_for_status()
+        data = resp.json()
+        if not data.get("success"):
+            raise RuntimeError(f"searchOpen orders failed: {data.get('errorMessage')}")
+        return data.get("orders", [])
+
+    def get_open_positions(self, account_id: int) -> list[dict]:
+        """Return all open positions for the account."""
+        self._ensure_authenticated()
+        resp = self._client.post("/api/Position/searchOpen", json={"accountId": account_id})
+        resp.raise_for_status()
+        data = resp.json()
+        if not data.get("success"):
+            raise RuntimeError(f"searchOpen positions failed: {data.get('errorMessage')}")
+        return data.get("positions", [])
+
+    def close_position(self, account_id: int, contract_id: str) -> dict:
+        """Close an entire position at market."""
+        self._ensure_authenticated()
+        resp = self._client.post("/api/Position/closeContract",
+                                 json={"accountId": account_id, "contractId": contract_id})
+        resp.raise_for_status()
+        return resp.json()
+
+    def search_trades(self, account_id: int,
+                      start: datetime, end: datetime | None = None) -> list[dict]:
+        """Return executed trades between start and end."""
+        self._ensure_authenticated()
+        body = {
+            "accountId":      account_id,
+            "startTimestamp": start.isoformat(),
+            "endTimestamp":   (end or datetime.now(timezone.utc)).isoformat(),
+        }
+        resp = self._client.post("/api/Trade/search", json=body)
+        resp.raise_for_status()
+        data = resp.json()
+        if not data.get("success"):
+            raise RuntimeError(f"search_trades failed: {data.get('errorMessage')}")
+        return data.get("trades", [])
+
     def _ensure_authenticated(self):
         if not self.token:
             self.login()
