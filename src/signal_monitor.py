@@ -25,6 +25,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import numpy as np
 
@@ -51,10 +52,11 @@ VOL_RATIO_MIN = 1.5
 MAX_HOLD_MIN  = 15
 BARS_PER_YEAR = 252 * 23 * 60
 
-# Time-of-day blackout windows (UTC).  Signals are suppressed during these periods.
-#   13:00–14:00 UTC (08:00–09:00 EST) — economic data release window: P(stop)>0.40, EV negative
-BLACKOUT_WINDOWS_UTC = [
-    (13,  0, 14,  0),   # (start_h, start_m, end_h, end_m)  8:00–9:00 EST
+# Time-of-day blackout windows (ET local time).  Signals are suppressed during these periods.
+#   08:00–09:00 ET — economic data release window (e.g. 8:30 ET NFP/CPI): P(stop)>0.40, EV negative
+ET = ZoneInfo("America/New_York")
+BLACKOUT_WINDOWS_ET = [
+    (8,  0, 9,  0),   # (start_h, start_m, end_h, end_m)  8:00–9:00 ET (DST-aware)
 ]
 
 LOG_PATH = Path("logs/signals.csv")
@@ -148,10 +150,11 @@ class InstrumentState:
     sigma_pts:     float = 0.0
     gk_ann_vol:    float = 0.0
     csr:           float = 0.0   # cumulative scaled return (40 min, direction-adjusted)
-    mean_vol:      float = 1.0
-    active_signal: Signal | None = None
-    history:       list[RecentSignal] = field(default_factory=list)
-    error:         str | None = None
+    mean_vol:           float | None = None
+    active_signal:      Signal | None = None
+    history:            list[RecentSignal] = field(default_factory=list)
+    error:              str | None = None
+    last_evaluated_ts:  datetime | None = None   # ts of last bar evaluated for signals
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -192,7 +195,7 @@ def build_regime_panel(state: InstrumentState) -> Panel:
     ann = annualised_vol(sigma)
     label, style = regime_label(ann)
     cur_vol   = state.bars[-1].volume if state.bars else 0.0
-    vol_ratio = cur_vol / state.mean_vol if state.mean_vol else 0.0
+    vol_ratio = (cur_vol / state.mean_vol) if state.mean_vol is not None else None
 
     t = Table.grid(padding=(0, 1))
     t.add_column(style="dim", width=16)
@@ -210,9 +213,9 @@ def build_regime_panel(state: InstrumentState) -> Panel:
     t.add_row("Regime:",
               f"[bold {gk_style}]{gk_label}[/]  [dim](GK)[/]")
     t.add_row("Avg volume:",
-              f"{state.mean_vol:,.0f}")
+              f"{state.mean_vol:,.0f}" if state.mean_vol is not None else "[dim]—[/]")
     t.add_row("Cur volume:",
-              f"{cur_vol:,.0f}  ({vol_ratio:.1f}× avg)")
+              f"{cur_vol:,.0f}  ({vol_ratio:.1f}× avg)" if vol_ratio is not None else f"{cur_vol:,.0f}  [dim](warming up)[/]")
 
     return Panel(t, title="[bold]VOL REGIME[/]",
                  border_style="blue", padding=(0, 1))
@@ -223,16 +226,16 @@ def build_bar_panel(state: InstrumentState) -> Panel:
     sigma = state.sigma
     ret    = math.log(bar.close / bar.open) if bar.open else 0.0
     scaled = ret / sigma if sigma else 0.0
-    vol_ratio = bar.volume / state.mean_vol if state.mean_vol else 0.0
+    vol_ratio = (bar.volume / state.mean_vol) if state.mean_vol is not None else None
 
     sc_style = ("green" if scaled > 0 else "red") if abs(scaled) >= SIGNAL_SIGMA \
                else ("yellow" if abs(scaled) >= SIGNAL_SIGMA * 0.7 else "white")
-    vr_style = "green" if vol_ratio >= VOL_RATIO_MIN else \
-               ("yellow" if vol_ratio >= VOL_RATIO_MIN * 0.7 else "white")
+    vr_style = ("green" if vol_ratio >= VOL_RATIO_MIN else
+                ("yellow" if vol_ratio >= VOL_RATIO_MIN * 0.7 else "white")) if vol_ratio is not None else "dim"
     sc_check = "✓" if abs(scaled) >= SIGNAL_SIGMA else \
                ("~" if abs(scaled) >= SIGNAL_SIGMA * 0.7 else "✗")
-    vr_check = "✓" if vol_ratio >= VOL_RATIO_MIN else \
-               ("~" if vol_ratio >= VOL_RATIO_MIN * 0.7 else "✗")
+    vr_check = ("✓" if vol_ratio >= VOL_RATIO_MIN else
+                ("~" if vol_ratio >= VOL_RATIO_MIN * 0.7 else "✗")) if vol_ratio is not None else "?"
 
     t = Table.grid(padding=(0, 1))
     t.add_column(style="dim", width=10)
@@ -243,9 +246,12 @@ def build_bar_panel(state: InstrumentState) -> Panel:
     t.add_row("Low:",    f"[red]{bar.low:,.2f}[/]")
     t.add_row("Close:",  f"[bold]{bar.close:,.2f}[/]")
     t.add_row("Volume:", f"{bar.volume:,.0f}  [{vr_style}]{vol_ratio:.2f}× "
-                         f"[thr {VOL_RATIO_MIN:.1f}×] {vr_check}[/]")
-    t.add_row("Scaled:", f"[{sc_style}]{scaled:+.2f}σ  "
-                         f"[thr {SIGNAL_SIGMA:.0f}σ] {sc_check}[/]")
+                         f"[thr {VOL_RATIO_MIN:.1f}×] {vr_check}[/]"
+              if vol_ratio is not None else
+              f"{bar.volume:,.0f}  [dim](warming up)[/]")
+    val_style = "bold green" if scaled > 0 else "bold red"
+    t.add_row("Scaled:", f"[{val_style}]{scaled:+.2f}σ[/]  "
+                         f"[{sc_style}][thr {SIGNAL_SIGMA:.0f}σ] {sc_check}[/]")
 
     return Panel(t, title=f"[bold]LAST {TF_MINUTES}-MIN BAR[/]",
                  border_style="blue", padding=(0, 1))
@@ -259,9 +265,9 @@ def build_signal_panel(state: InstrumentState, now: datetime) -> Panel:
         bar    = state.bars[-1]
         sigma  = state.sigma
         scaled = math.log(bar.close / bar.open) / sigma if sigma and bar.open else 0.0
-        vol_ratio = bar.volume / state.mean_vol if state.mean_vol else 0.0
-        sc_pct = min(abs(scaled)  / SIGNAL_SIGMA * 100, 100)
-        vr_pct = min(vol_ratio    / VOL_RATIO_MIN * 100, 100)
+        vol_ratio = (bar.volume / state.mean_vol) if state.mean_vol is not None else None
+        sc_pct = min(abs(scaled) / SIGNAL_SIGMA * 100, 100)
+        vr_pct = min(vol_ratio   / VOL_RATIO_MIN * 100, 100) if vol_ratio is not None else 0.0
         bar_sc = "█" * int(sc_pct / 5) + "░" * (20 - int(sc_pct / 5))
         bar_vr = "█" * int(vr_pct / 5) + "░" * (20 - int(vr_pct / 5))
 
@@ -279,20 +285,49 @@ def build_signal_panel(state: InstrumentState, now: datetime) -> Panel:
         t.add_row("Scaled return:",
                   f"[yellow]{bar_sc}[/] {abs(scaled):.2f}σ / {SIGNAL_SIGMA:.0f}σ")
         t.add_row("Volume ratio:",
-                  f"[yellow]{bar_vr}[/] {vol_ratio:.2f}× / {VOL_RATIO_MIN:.1f}×")
+                  f"[yellow]{bar_vr}[/] {vol_ratio:.2f}× / {VOL_RATIO_MIN:.1f}×"
+                  if vol_ratio is not None else
+                  f"[dim]{bar_vr}[/] warming up")
         t.add_row("Momentum(40m):",
                   f"[{csr_style}]{bar_csr}[/] {csr:+.2f}σ / {CSR_THRESHOLD:.1f}σ {csr_check}")
-        t.add_row("", "")
-        bar_hm = (state.bars[-1].ts.hour, state.bars[-1].ts.minute)
+        bar_et = state.bars[-1].ts.astimezone(ET)
+        bar_hm = (bar_et.hour, bar_et.minute)
         in_blackout = any(
             (sh, sm) <= bar_hm < (eh, em)
-            for sh, sm, eh, em in BLACKOUT_WINDOWS_UTC
+            for sh, sm, eh, em in BLACKOUT_WINDOWS_ET
         )
-        blackout_note = "  [bold red]BLACKOUT[/]" if in_blackout else ""
+        # Show BLACKOUT only when in the restricted window AND CSR doesn't lift it
+        blackout_note = ("  [bold red]BLACKOUT[/]"
+                         if in_blackout and csr < CSR_THRESHOLD else "")
         t.add_row("", f"[dim]Need ≥{SIGNAL_SIGMA:.0f}σ + ≥{VOL_RATIO_MIN:.1f}× vol + CSR≥{CSR_THRESHOLD:.1f}σ[/]{blackout_note}")
 
-        return Panel(t, title="[bold yellow]⬤  WATCHING[/]",
-                     border_style="yellow", padding=(0, 2))
+        # NOTRADE: show indicative SL/TP based on current price and σ
+        price     = bar.close
+        sigma_pts = state.sigma_pts
+        nt = Table.grid(padding=(0, 1))
+        nt.add_column(style="dim", width=10)
+        nt.add_column()
+        if sigma_pts > 0:
+            long_tgt  = price + cfg.target_sigma * sigma_pts
+            long_stop = price - cfg.stop_sigma   * sigma_pts
+            shrt_tgt  = price - cfg.target_sigma * sigma_pts
+            shrt_stop = price + cfg.stop_sigma   * sigma_pts
+            nt.add_row("Price:",  f"[dim]{price:,.2f}[/]")
+            nt.add_row("LONG:",   f"[dim]tgt {long_tgt:,.2f}  /  sl {long_stop:,.2f}[/]")
+            nt.add_row("SHORT:",  f"[dim]tgt {shrt_tgt:,.2f}  /  sl {shrt_stop:,.2f}[/]")
+        else:
+            nt.add_row("", "[dim]warming up[/]")
+
+        watching_panel = Panel(t,  title="[bold yellow]⬤  WATCHING[/]",
+                               border_style="yellow", padding=(0, 2))
+        notrade_panel  = Panel(nt, title="[dim]NOTRADE[/]",
+                               border_style="dim",    padding=(0, 2))
+
+        col = Table.grid()
+        col.add_column()
+        col.add_row(watching_panel)
+        col.add_row(notrade_panel)
+        return col
 
     direction_str = "LONG  ▲" if signal.direction == 1 else "SHORT ▼"
     color         = "green"  if signal.direction == 1 else "red"
@@ -337,6 +372,13 @@ def build_instrument_column(state: InstrumentState, now: datetime) -> Table:
         Text(state.cname or state.cfg.symbol, style="bold cyan", justify="center"),
         border_style="dark_blue", padding=(0, 1),
     ))
+    if not state.bars:
+        msg = f"[red]{state.error}[/]" if state.error else "[dim]Waiting for bars…[/]"
+        col.add_row(Panel(msg, border_style="dim", padding=(0, 1)))
+        return col
+    if state.error:
+        col.add_row(Panel(f"[yellow]⚠ {state.error} — showing last known data[/]",
+                          border_style="yellow", padding=(0, 1)))
     col.add_row(build_regime_panel(state))
     col.add_row(build_bar_panel(state))
     col.add_row(build_signal_panel(state, now))
@@ -479,11 +521,14 @@ def evaluate(state: InstrumentState) -> Signal | None:
     closes  = np.array([b.close  for b in bars])
     volumes = np.array([b.volume for b in bars])
 
-    trail = np.log(closes[-TRAILING_BARS:] / closes[-TRAILING_BARS - 1:-1]) \
-            if len(closes) > TRAILING_BARS else np.array([])
+    trail = np.log(closes[1:] / closes[:-1])[-TRAILING_BARS:] \
+            if len(closes) >= 2 else np.array([])
     sigma     = float(np.std(trail, ddof=1)) if len(trail) >= 2 else 0.0
     sigma_pts = sigma * closes[-1]
-    mean_vol  = float(volumes[-TRAILING_BARS - 1:-1].mean()) if len(volumes) > 1 else 1.0
+    warmed_up = len(closes) > TRAILING_BARS   # full window required for signals
+    prior_vols = volumes[-TRAILING_BARS - 1:-1]
+    active_vols = prior_vols[prior_vols >= 10]
+    mean_vol = float(np.median(active_vols)) if len(active_vols) >= 10 else None
 
     state.sigma     = sigma
     state.sigma_pts = sigma_pts
@@ -493,7 +538,7 @@ def evaluate(state: InstrumentState) -> Signal | None:
     last      = bars[-1]
     bar_ret   = math.log(last.close / last.open) if last.open else 0.0
     scaled    = bar_ret / sigma if sigma else 0.0
-    vol_ratio = last.volume / mean_vol
+    vol_ratio = (last.volume / mean_vol) if mean_vol is not None else None
 
     # 40-min cumulative scaled return (direction-adjusted; >CSR_THRESHOLD = with momentum)
     direction = 1 if scaled > 0 else -1
@@ -503,16 +548,12 @@ def evaluate(state: InstrumentState) -> Signal | None:
     else:
         state.csr = 0.0
 
-    # Blackout check
-    bar_hm = (last.ts.hour, last.ts.minute)
-    in_blackout = any(
-        (sh, sm) <= bar_hm < (eh, em)
-        for sh, sm, eh, em in BLACKOUT_WINDOWS_UTC
-    )
-
-    if (not in_blackout
+    # Conditional blackout: 08:00–09:00 ET only blocks if CSR < threshold.
+    # CSR≥threshold is already required below, so no separate gate needed here.
+    if (warmed_up
             and abs(scaled) >= SIGNAL_SIGMA and abs(scaled) <= MAX_SCALED
-            and vol_ratio >= VOL_RATIO_MIN and state.csr >= CSR_THRESHOLD):
+            and vol_ratio is not None and vol_ratio >= VOL_RATIO_MIN
+            and state.csr >= CSR_THRESHOLD):
         return Signal(cfg=state.cfg,
                       direction=1 if scaled > 0 else -1,
                       entry=last.close, sigma=sigma, sigma_pts=sigma_pts,
@@ -543,14 +584,19 @@ def run_live():
 
     def fetch_bars(state: InstrumentState):
         end   = datetime.now(timezone.utc)
-        start = end - timedelta(minutes=TF_MINUTES * (TRAILING_BARS + 5))
-        raw = client.get_bars(contract_id=state.cid, start=start, end=end,
-                              unit=TopstepClient.MINUTE, unit_number=TF_MINUTES,
-                              limit=TRAILING_BARS + 10)
-        raw = list(reversed(raw))
-        state.bars = [Bar(ts=datetime.fromisoformat(b["t"]),
-                          open=b["o"], high=b["h"], low=b["l"],
-                          close=b["c"], volume=b["v"]) for b in raw]
+        lookback = TRAILING_BARS + MOM_BARS + 10
+        start = end - timedelta(minutes=TF_MINUTES * lookback)
+        try:
+            raw = client.get_bars(contract_id=state.cid, start=start, end=end,
+                                  unit=TopstepClient.MINUTE, unit_number=TF_MINUTES,
+                                  limit=lookback)
+            raw = list(reversed(raw))
+            state.bars = [Bar(ts=datetime.fromisoformat(b["t"]),
+                              open=b["o"], high=b["h"], low=b["l"],
+                              close=b["c"], volume=b["v"]) for b in raw]
+            state.error = None
+        except Exception as e:
+            state.error = f"fetch error: {e}"
 
     def resolve(state: InstrumentState, outcome: str, pnl_pts: float, now: datetime):
         sig = state.active_signal
@@ -564,10 +610,18 @@ def run_live():
 
             for state in states:
                 fetch_bars(state)
-                if len(state.bars) < TRAILING_BARS + 1:
+                if not state.bars:
                     continue
 
+                # Update display metrics and check for signal
                 new_sig = evaluate(state)
+
+                # Only act on a signal from a bar we haven't seen before
+                last_bar_ts = state.bars[-1].ts
+                if last_bar_ts == state.last_evaluated_ts:
+                    new_sig = None
+                else:
+                    state.last_evaluated_ts = last_bar_ts
 
                 # Check active signal for target/stop hit or expiry
                 if state.active_signal:

@@ -2,3 +2,7 @@
 __pycache__/
 *.pyc
 .venv/
+*.csv
+*.zst
+*.zip
+logs/

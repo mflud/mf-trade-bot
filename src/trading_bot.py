@@ -10,7 +10,7 @@ Signal criteria (identical to signal_monitor.py):
   1. |bar_return / σ| ≥ 3.0   (σ = trailing 100-min close-return std dev)
   2. Volume ≥ 1.5× trailing mean volume
   3. 40-min CSR ≥ 1.5σ aligned with signal direction (momentum filter)
-  4. Not in 08:00–09:00 EST blackout window (economic data releases)
+  4. Not in 08:00–09:00 ET blackout window (economic data releases, DST-aware)
   5. |scaled| ≤ 5.0 (extreme event filter)
 
 Execution:
@@ -31,10 +31,12 @@ import csv
 import logging
 import math
 import os
+import random
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import sys
@@ -62,7 +64,8 @@ VOL_RATIO_MIN = 1.5
 MAX_HOLD_MIN  = 15     # force-close after this many minutes
 POLL_SECONDS  = 30
 
-BLACKOUT_UTC = [(13, 0, 14, 0)]   # 08:00–09:00 EST = 13:00–14:00 UTC
+ET = ZoneInfo("America/New_York")
+BLACKOUT_ET = [(8, 0, 9, 0)]   # 08:00–09:00 ET (DST-aware; was fixed UTC, now tracks DST)
 
 LOG_PATH = Path("logs/bot_trades.csv")
 LOG_FIELDS = [
@@ -139,9 +142,10 @@ class InstrumentState:
     bars:         list[Bar] = field(default_factory=list)
     sigma:        float = 0.0
     sigma_pts:    float = 0.0
-    mean_vol:     float = 1.0
-    csr:          float = 0.0
-    active_trade: ActiveTrade | None = None
+    mean_vol:           float | None = None
+    csr:                float = 0.0
+    active_trade:       ActiveTrade | None = None
+    last_evaluated_ts:  datetime | None = None
 
 
 # ── Trade logging ────────────────────────────────────────────────────────────
@@ -199,11 +203,13 @@ def evaluate(state: InstrumentState) -> dict | None:
         return None
 
     sigma_pts = sigma * closes[-1]
-    mean_vol  = float(volumes[-TRAILING_BARS - 1:-1].mean())
+    prior_vols   = volumes[-TRAILING_BARS - 1:-1]
+    active_vols  = prior_vols[prior_vols >= 10]
+    mean_vol     = float(np.median(active_vols)) if len(active_vols) >= 10 else None
     last      = bars[-1]
     bar_ret   = math.log(last.close / last.open) if last.open else 0.0
     scaled    = bar_ret / sigma
-    vol_ratio = last.volume / mean_vol if mean_vol else 0.0
+    vol_ratio = (last.volume / mean_vol) if mean_vol is not None else None
     direction = 1 if scaled > 0 else -1
 
     # 40-min CSR (Cumulative Scaled Return), direction-adjusted
@@ -218,13 +224,17 @@ def evaluate(state: InstrumentState) -> dict | None:
     state.mean_vol  = mean_vol
     state.csr       = csr
 
-    # Blackout window
-    h, m = last.ts.hour, last.ts.minute
-    if any((sh, sm) <= (h, m) < (eh, em) for sh, sm, eh, em in BLACKOUT_UTC):
+    # Conditional blackout: 08:00–09:00 ET blocks only if CSR < threshold.
+    # Signals with CSR≥threshold are allowed through even during this window.
+    bar_et = last.ts.astimezone(ET)
+    in_blackout = any((sh, sm) <= (bar_et.hour, bar_et.minute) < (eh, em)
+                      for sh, sm, eh, em in BLACKOUT_ET)
+    if in_blackout and csr < CSR_THRESHOLD:
         return None
 
     if (abs(scaled) >= SIGNAL_SIGMA and abs(scaled) <= MAX_SCALED
-            and vol_ratio >= VOL_RATIO_MIN and csr >= CSR_THRESHOLD):
+            and vol_ratio is not None and vol_ratio >= VOL_RATIO_MIN
+            and csr >= CSR_THRESHOLD):
         return {
             "direction": direction,
             "entry":     last.close,
@@ -241,13 +251,14 @@ def evaluate(state: InstrumentState) -> dict | None:
 # ── Bar fetching ─────────────────────────────────────────────────────────────
 
 def fetch_bars(client: TopstepClient, state: InstrumentState):
-    end   = datetime.now(timezone.utc)
-    start = end - timedelta(minutes=TF_MINUTES * (TRAILING_BARS + 5))
+    end      = datetime.now(timezone.utc)
+    lookback = TRAILING_BARS + MOM_BARS + 10
+    start    = end - timedelta(minutes=TF_MINUTES * lookback)
     raw = client.get_bars(
         contract_id=state.contract_id,
         start=start, end=end,
         unit=TopstepClient.MINUTE, unit_number=TF_MINUTES,
-        limit=TRAILING_BARS + 10,
+        limit=lookback,
     )
     state.bars = [
         Bar(ts=datetime.fromisoformat(b["t"]),
@@ -266,8 +277,13 @@ def place_signal(client: TopstepClient, state: InstrumentState,
     sigma_pts = sig["sigma_pts"]
     tick      = inst.tick_size
 
-    stop_ticks   = max(1, round(inst.stop_sigma   * sigma_pts / tick))
-    target_ticks = max(1, round(inst.target_sigma * sigma_pts / tick))
+    # API ticks are signed relative to fill price: negative = below, positive = above.
+    # Long:  stop below entry (negative), target above entry (positive)
+    # Short: stop above entry (positive), target below entry (negative)
+    stop_mag   = max(1, round(inst.stop_sigma   * sigma_pts / tick))
+    target_mag = max(1, round(inst.target_sigma * sigma_pts / tick))
+    stop_ticks   = -stop_mag   * direction
+    target_ticks =  target_mag * direction
     side         = TopstepClient.BID if direction == 1 else TopstepClient.ASK
     dir_str      = "LONG" if direction == 1 else "SHORT"
 
@@ -294,7 +310,7 @@ def place_signal(client: TopstepClient, state: InstrumentState,
             order_type=TopstepClient.ORDER_MARKET,
             stop_loss_ticks=stop_ticks,
             take_profit_ticks=target_ticks,
-            custom_tag=f"bot_{inst.symbol}_{sig['bar_ts'].strftime('%H%M')}",
+            custom_tag=f"bot_{inst.symbol}_{sig['bar_ts'].strftime('%Y%m%d%H%M%S')}_{random.randint(100,999)}",
         )
         trade.order_id = resp.get("orderId")
         log.info(
@@ -466,8 +482,12 @@ def run(account_id: int | None, paper: bool):
 
                 if not state.active_trade:
                     sig = evaluate(state)
-                    if sig:
+                    last_bar_ts = state.bars[-1].ts if state.bars else None
+                    if sig and last_bar_ts != state.last_evaluated_ts:
+                        state.last_evaluated_ts = last_bar_ts
                         place_signal(client, state, sig, account_id, paper)
+                    elif last_bar_ts != state.last_evaluated_ts:
+                        state.last_evaluated_ts = last_bar_ts
 
             except Exception as e:
                 log.error(f"{state.instrument.symbol}: {e}", exc_info=True)

@@ -1,0 +1,192 @@
+MES/MYM Systematic Signal Research — Journey Summary
+======================================================
+Written: 2026-03-15
+
+
+STARTING POINT
+--------------
+Goal: identify a repeatable, quantifiable signal on MES (Micro E-mini S&P 500) and
+MYM (Micro Dow) futures that predicts short-term price continuation, suitable for
+automated execution on a Topstep practice account.
+
+Data source: TopstepX REST API (api.topstepx.com), via a custom Python client
+(src/topstep_client.py). All analysis used 5-minute bars fetched live.
+
+
+SIGNAL HYPOTHESIS — 3σ CONTINUATION
+-------------------------------------
+The core idea: when a 5-minute bar moves sharply relative to recent volatility (≥ 3
+standard deviations), price tends to continue in that direction rather than revert.
+
+Standard deviation (σ) was computed as the rolling close-return std dev over the 20
+bars immediately preceding and including the signal bar ("trailing σ"). Volume was
+added as a secondary filter: signal bar volume must be ≥ 1.5× the trailing 20-bar
+mean volume.
+
+The signal is directional: a large up-bar predicts continuation up; a large down-bar
+predicts continuation down. Targets and stops were set in multiples of σ (target = 3σ,
+stop = 2σ from entry).
+
+This was backtested across MES 1-minute bars (converted to 5-minute) spanning several
+years, producing the baseline metrics: trade count, win rate, expectancy, and Sharpe.
+
+
+VOLATILITY MEASURE SELECTION
+------------------------------
+Two approaches were compared for computing the signal bar's "size" relative to recent
+volatility:
+
+1. Close-return standard deviation — standard approach, uses only closing prices.
+2. Garman-Klass (GK) volatility — uses OHLC, theoretically more efficient.
+
+A key methodological question arose: should the signal bar itself be included in the
+volatility window? It was discovered that the signal bar IS included in the trailing σ
+window as implemented. When corrected to use only prior bars, the threshold effectively
+drops — the move appears larger — and the number of triggers roughly doubles, but
+expectancy collapses. The self-inclusion acts as an inadvertent quality filter: because
+the signal bar's large return inflates σ, only moves that are genuinely extreme (~3.5σ
+in true terms) pass a 3σ threshold. The decision was made to keep the self-inclusion.
+
+Between GK and close-return σ: close-return consistently outperformed across all
+window sizes. GK was retained only for display purposes in the live monitor (annualised
+regime volatility, not used in signal logic).
+
+
+MOMENTUM FILTER — CSR
+----------------------
+CSR (Cumulative Scaled Return) was added to filter out signals that occur against an
+established counter-trend. It measures the cumulative momentum in the 40 minutes
+(8 × 5-min bars) prior to the signal bar:
+
+  CSR = Σ (log_return_i / σ) for i in prior 8 bars, direction-adjusted
+
+Only signals where CSR ≥ 1.5 (i.e., at least modest prior momentum in the signal
+direction) are accepted.
+
+The critical design question: should the current bar be included in CSR? Testing showed
+that including the signal bar's own large return floods ~90% of all signals through
+(the signal bar dominates the sum), destroying the filter's discriminating power. CSR
+uses only the 8 bars prior to the signal bar.
+
+Volume-weighted CSR was also tested. The correlation between plain and volume-weighted
+CSR was r ≈ 0.90, and plain CSR performed better on EV metrics. Volume weighting was
+dropped.
+
+
+TIME-OF-DAY FILTER — BLACKOUT WINDOWS
+---------------------------------------
+The signal was evaluated by UTC hour-of-day to identify periods with unfavorable
+outcomes (P(stop) > 0.40 or low sample count).
+
+The first 30 minutes after NYSE open (13:30–14:00 UTC / 09:30–10:00 EST) was
+hypothesised as problematic based on prior experience. Analysis confirmed that the
+problematic window is actually broader: 13:00–14:00 UTC (08:00–09:00 EST), which
+corresponds to the peak U.S. economic data release window (NFP, CPI, Fed announcements,
+etc.). This hour was added as a blackout.
+
+The CME late-session period was also examined (initially labeled "CME close" at
+20:00–21:00 UTC / 15:00–16:00 EST). Sample count was only n=41 over the full
+backtest period — too thin to be reliable. This tentative blackout was removed.
+
+Final configuration: one blackout window — 13:00–14:00 UTC.
+
+
+FINAL SIGNAL PARAMETERS
+-------------------------
+  Bar size:          5 minutes
+  Trailing σ window: 20 bars (100 minutes), including signal bar
+  σ threshold:       3.0 (|return / σ| ≥ 3.0)
+  Volume filter:     ≥ 1.5× trailing 20-bar mean volume
+  CSR window:        8 prior bars (40 minutes), excluding signal bar
+  CSR threshold:     ≥ 1.5 (direction-adjusted)
+  Blackout:          13:00–14:00 UTC
+  Target:            3.0 × σ_pts from entry
+  Stop:              2.0 × σ_pts from entry
+
+
+PRODUCTION COMPONENTS
+----------------------
+Three scripts form the live production system:
+
+src/topstep_client.py
+  Core API client. Handles authentication, contract search, bar history, order
+  placement, position management, and trade search. Order placement supports native
+  API stop-loss/take-profit brackets (OCO, exchange-managed). MES quarterly contracts
+  are hardcoded in MES_CONTRACTS and must be updated each quarter.
+
+src/signal_monitor.py
+  Terminal dashboard. Connects to TopstepX, streams live 5-minute bars for MES and
+  MYM, and evaluates the signal in real time. Displays: current bar progress, trailing
+  σ, volume ratio, CSR progress bar, regime volatility (GK, display only), and
+  whether the instrument is currently in a signal state. All signal events are logged
+  to logs/signals.csv for post-hoc analysis.
+
+src/trading_bot.py
+  Automated execution layer. Reads the same signal logic as signal_monitor but places
+  real market orders on the Topstep practice account. Places orders with native API
+  brackets so stop/target management is exchange-side. Monitors open positions and
+  force-closes any position held longer than 15 minutes. Classifies exits as TARGET,
+  STOPPED, or TIME EXIT, and logs all trades to logs/bot_trades.csv.
+
+  Safety: hardcoded to account PRAC-V2-88916-19336808 (id=10634862). The account name
+  string is verified at startup; the bot will not run against any other account.
+  Run with --paper to log signals without placing orders.
+
+
+DOM RECORDER
+-------------
+In parallel with bar data, real-time Depth of Market (DOM) data was captured via the
+TopstepX SignalR WebSocket (Market Hub). The DOM provides the live order book — bid
+and ask sizes at each price level — along with best bid/ask quotes and individual trade
+prints.
+
+src/dom_client.py
+  Connects to rtc.topstepx.com/hubs/market and subscribes to three event streams:
+  GatewayDepth (incremental order book updates), GatewayQuote (top-of-book), and
+  GatewayTrades (individual prints). Maintains a live DOMBook in memory with
+  thread-safe incremental updates (add/remove levels, full reset on session open).
+
+  In --record mode, DOM snapshots are taken at regular intervals (default 5 minutes,
+  aligned to clock boundaries) and appended to mes_dom_snapshots.csv. Each row is an
+  ML-ready feature vector: top-10 bid/ask prices and sizes, total liquidity each side,
+  bid/ask imbalance at L1/L5/L10, and largest resting order ("wall") on each side with
+  its distance from mid-price.
+
+  In display mode (default), renders a live terminal order book view refreshed twice
+  per second, showing both sides of the book with size bars, spread, and total
+  liquidity.
+
+Deployed via a shell wrapper (scripts/run_dom_recorder.sh) with exponential back-off
+restart logic (5s → 300s cap), which is itself managed by a macOS LaunchAgent
+(com.mf-trade-bot.dom-recorder). The wrapper handles conda environment activation
+since launchd does not load shell profiles.
+
+The DOM data is being accumulated for future microstructure research — e.g., whether
+order book imbalance at the time of a 3σ signal predicts continuation strength, or
+whether large resting orders ("walls") near the target price reduce fill probability.
+
+
+5-SECOND BAR RECORDER
+-----------------------
+The TopstepX API retains approximately 28 hours of 5-second bar history. To enable
+future short-timeframe signal research (scaling 100-minute analysis down to 100–300
+seconds), a persistent recorder was built:
+
+src/bar_recorder.py
+  Polls the API every 60 seconds, backfills all available 5-second history on first
+  run, and appends new bars to CSV files (mes_hist_5sec.csv, mym_hist_5sec.csv).
+  Deduplication is handled by recording the last saved timestamp and filtering all
+  fetched bars accordingly.
+
+Deployed as a macOS LaunchAgent (com.mf-trade-bot.bar-recorder) so it starts at
+login, stays running, and restarts automatically after crashes. Weeks of accumulation
+are required before short-timeframe signal analysis is meaningful.
+
+
+WHAT REMAINS OPEN
+------------------
+- MYM-specific backtest at the final parameters has not been run in isolation.
+- 5-second bar analysis: insufficient data yet; revisit after several weeks of
+  continuous recording.
+- Live signal performance tracking: bot trades logged to logs/bot_trades.csv will
+  accumulate real signal outcomes against the backtest predictions.
