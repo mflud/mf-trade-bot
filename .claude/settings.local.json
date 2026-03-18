@@ -61,7 +61,11 @@
       "Bash(python src/regime_analysis.py --sym MES 2>&1 | head -120)",
       "Bash(conda env:*)",
       "WebFetch(domain:api.topstepx.com)",
-      "Bash(wait && conda run -n topstep-project python src/backtest_tf_sweep.py --sym MES --option A 2>&1)"
+      "Bash(wait && conda run -n topstep-project python src/backtest_tf_sweep.py --sym MES --option A 2>&1)",
+      "Bash(ls *.csv 2>/dev/null; ls /Users/marek/mf-trade-bot/*.csv 2>/dev/null)",
+      "Bash(ls /Users/marek/mf-trade-bot/*.zip 2>/dev/null; ls /Users/marek/mf-trade-bot/*.gz 2>/dev/null)",
+      "Bash(unzip -l GLBX-20260316-3SWPQEFJ8S.zip)",
+      "Bash(python src/backtest_csr_percentile.py 2>&1)"
     ]
   }
 }

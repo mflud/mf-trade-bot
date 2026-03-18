@@ -44,20 +44,15 @@ from rich.text import Text
 TF_MINUTES    = 5
 TRAILING_BARS = 20    # 20 × 5-min = 100 min (optimal from signal_window_grid)
 GK_VOL_BARS   = 20   # 20 × 5-min = 100-min window; Garman-Klass estimator
-MOM_BARS      = 8    # 8 × 5-min = 40 min momentum window
+MOM_BARS      = 8    # 8 × 5-min = 40 min momentum window (default; overridden dynamically)
 CSR_THRESHOLD = 1.5  # CSR = Cumulative Scaled Return; min value aligned with signal direction
 SIGNAL_SIGMA  = 3.0
 MAX_SCALED    = 5.0   # ignore extreme event spikes above this
 VOL_RATIO_MIN = 1.5
-MAX_HOLD_MIN  = 15
+MAX_HOLD_MIN  = 25
 BARS_PER_YEAR = 252 * 23 * 60
 
-# Time-of-day blackout windows (ET local time).  Signals are suppressed during these periods.
-#   08:00–09:00 ET — economic data release window (e.g. 8:30 ET NFP/CPI): P(stop)>0.40, EV negative
 ET = ZoneInfo("America/New_York")
-BLACKOUT_WINDOWS_ET = [
-    (8,  0, 9,  0),   # (start_h, start_m, end_h, end_m)  8:00–9:00 ET (DST-aware)
-]
 
 LOG_PATH = Path("logs/signals.csv")
 LOG_FIELDS = [
@@ -84,13 +79,28 @@ class InstrumentConfig:
     target_sigma: float       # profit target in σ units
     point_value: float        # $ per point (for display only)
     ev_sigma:    float        # expected EV per signal in σ (from backtest)
+    # Dynamic CSR window: list of (gk_ann_vol_upper_bound, mom_bars).
+    # First entry whose upper bound exceeds current GK vol is used.
+    csr_vol_windows: list = field(default_factory=lambda: [(1.0, 8)])
+    # Per-instrument blackout windows: (start_h, start_m, end_h, end_m, conditional).
+    # conditional=True: block only when CSR < threshold; False: always block.
+    blackout_windows: list = field(default_factory=list)
 
 
 INSTRUMENTS = [
     InstrumentConfig("MYM", "MYM", stop_sigma=2.0, target_sigma=3.0,
-                     point_value=0.50, ev_sigma=0.073),  # trail=20 pending MYM retest
+                     point_value=0.50, ev_sigma=0.073,
+                     csr_vol_windows=[(0.08, 4), (1.0, 8)],
+                     blackout_windows=[
+                         (9,  0,  9, 30, False),  # pre-open: EV=-0.076σ CSR-filtered
+                         (15, 0, 16,  0, False),  # NYSE close: EV=-0.375σ CSR-filtered
+                     ]),
     InstrumentConfig("MES", "MES", stop_sigma=2.0, target_sigma=3.0,
-                     point_value=5.00, ev_sigma=0.073),  # trail=20, no filter, -2σ/+3σ
+                     point_value=5.00, ev_sigma=0.073,
+                     csr_vol_windows=[(0.08, 4), (1.0, 8)],
+                     blackout_windows=[
+                         (8, 0, 9, 0, True),  # econ releases: block only if CSR<1.5
+                     ]),
 ]
 
 console = Console()
@@ -163,6 +173,14 @@ def annualised_vol(sigma: float) -> float:
     return sigma * math.sqrt(BARS_PER_YEAR / TF_MINUTES)
 
 
+def get_mom_bars(gk_ann_vol: float, csr_vol_windows: list) -> int:
+    """Return the CSR window (in bars) for the current GK vol regime."""
+    for upper, bars in csr_vol_windows:
+        if gk_ann_vol < upper:
+            return bars
+    return csr_vol_windows[-1][1]
+
+
 def gk_annualised_vol(bars: list) -> float:
     """Garman-Klass annualised vol from the last GK_VOL_BARS 5-min bars."""
     sample = bars[-GK_VOL_BARS:] if len(bars) >= GK_VOL_BARS else bars
@@ -199,7 +217,7 @@ def build_regime_panel(state: InstrumentState) -> Panel:
 
     t = Table.grid(padding=(0, 1))
     t.add_column(style="dim", width=16)
-    t.add_column(width=24)
+    t.add_column(width=34)
 
     gk  = state.gk_ann_vol
     gk_label, gk_style = regime_label(gk) if gk > 0 else (label, style)
@@ -288,17 +306,16 @@ def build_signal_panel(state: InstrumentState, now: datetime) -> Panel:
                   f"[yellow]{bar_vr}[/] {vol_ratio:.2f}× / {VOL_RATIO_MIN:.1f}×"
                   if vol_ratio is not None else
                   f"[dim]{bar_vr}[/] warming up")
-        t.add_row("Momentum(40m):",
+        mom_bars = get_mom_bars(state.gk_ann_vol, state.cfg.csr_vol_windows)
+        t.add_row(f"Momentum({mom_bars * TF_MINUTES}m):",
                   f"[{csr_style}]{bar_csr}[/] {csr:+.2f}σ / {CSR_THRESHOLD:.1f}σ {csr_check}")
         bar_et = state.bars[-1].ts.astimezone(ET)
         bar_hm = (bar_et.hour, bar_et.minute)
-        in_blackout = any(
-            (sh, sm) <= bar_hm < (eh, em)
-            for sh, sm, eh, em in BLACKOUT_WINDOWS_ET
+        in_active_blackout = any(
+            (sh, sm) <= bar_hm < (eh, em) and (not conditional or csr < CSR_THRESHOLD)
+            for sh, sm, eh, em, conditional in state.cfg.blackout_windows
         )
-        # Show BLACKOUT only when in the restricted window AND CSR doesn't lift it
-        blackout_note = ("  [bold red]BLACKOUT[/]"
-                         if in_blackout and csr < CSR_THRESHOLD else "")
+        blackout_note = "  [bold red]BLACKOUT[/]" if in_active_blackout else ""
         t.add_row("", f"[dim]Need ≥{SIGNAL_SIGMA:.0f}σ + ≥{VOL_RATIO_MIN:.1f}× vol + CSR≥{CSR_THRESHOLD:.1f}σ[/]{blackout_note}")
 
         # NOTRADE: show indicative SL/TP based on current price and σ
@@ -313,8 +330,8 @@ def build_signal_panel(state: InstrumentState, now: datetime) -> Panel:
             shrt_tgt  = price - cfg.target_sigma * sigma_pts
             shrt_stop = price + cfg.stop_sigma   * sigma_pts
             nt.add_row("Price:",  f"[dim]{price:,.2f}[/]")
-            nt.add_row("LONG:",   f"[dim]tgt {long_tgt:,.2f}  /  sl {long_stop:,.2f}[/]")
-            nt.add_row("SHORT:",  f"[dim]tgt {shrt_tgt:,.2f}  /  sl {shrt_stop:,.2f}[/]")
+            nt.add_row("LONG:",   f"[dim]tgt {long_tgt:,.2f}  /  sl  {long_stop:,.2f}[/]")
+            nt.add_row("SHORT:",  f"[dim]tgt {shrt_tgt:,.2f}  /  cs  {shrt_stop:,.2f}[/]")
         else:
             nt.add_row("", "[dim]warming up[/]")
 
@@ -540,16 +557,23 @@ def evaluate(state: InstrumentState) -> Signal | None:
     scaled    = bar_ret / sigma if sigma else 0.0
     vol_ratio = (last.volume / mean_vol) if mean_vol is not None else None
 
-    # 40-min cumulative scaled return (direction-adjusted; >CSR_THRESHOLD = with momentum)
+    # Dynamic CSR window based on current GK vol regime
     direction = 1 if scaled > 0 else -1
-    if len(closes) >= MOM_BARS + 1:
-        mom_rets = np.log(closes[-MOM_BARS:] / closes[-MOM_BARS - 1:-1])
+    mom_bars  = get_mom_bars(state.gk_ann_vol, state.cfg.csr_vol_windows)
+    if len(closes) >= mom_bars + 1:
+        mom_rets  = np.log(closes[-mom_bars:] / closes[-mom_bars - 1:-1])
         state.csr = float(mom_rets.sum()) / sigma * direction if sigma else 0.0
     else:
         state.csr = 0.0
 
-    # Conditional blackout: 08:00–09:00 ET only blocks if CSR < threshold.
-    # CSR≥threshold is already required below, so no separate gate needed here.
+    # Per-instrument blackout windows.
+    bar_et = last.ts.astimezone(ET)
+    bar_hm = (bar_et.hour, bar_et.minute)
+    for sh, sm, eh, em, conditional in state.cfg.blackout_windows:
+        if (sh, sm) <= bar_hm < (eh, em):
+            if not conditional or state.csr < CSR_THRESHOLD:
+                return None
+
     if (warmed_up
             and abs(scaled) >= SIGNAL_SIGMA and abs(scaled) <= MAX_SCALED
             and vol_ratio is not None and vol_ratio >= VOL_RATIO_MIN
@@ -584,7 +608,8 @@ def run_live():
 
     def fetch_bars(state: InstrumentState):
         end   = datetime.now(timezone.utc)
-        lookback = TRAILING_BARS + MOM_BARS + 10
+        max_mom  = max(bars for cfg in INSTRUMENTS for _, bars in cfg.csr_vol_windows)
+        lookback = TRAILING_BARS + max_mom + 10
         start = end - timedelta(minutes=TF_MINUTES * lookback)
         try:
             raw = client.get_bars(contract_id=state.cid, start=start, end=end,

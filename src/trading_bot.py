@@ -10,14 +10,16 @@ Signal criteria (identical to signal_monitor.py):
   1. |bar_return / σ| ≥ 3.0   (σ = trailing 100-min close-return std dev)
   2. Volume ≥ 1.5× trailing mean volume
   3. 40-min CSR ≥ 1.5σ aligned with signal direction (momentum filter)
-  4. Not in 08:00–09:00 ET blackout window (economic data releases, DST-aware)
+  4. Not in instrument-specific blackout window (DST-aware, per-instrument):
+       MES: 08:00–09:00 ET conditional (block only if CSR<1.5; tech earnings pre-mkt)
+       MYM: 09:00–09:30 ET unconditional; 15:00–16:00 ET unconditional
   5. |scaled| ≤ 5.0 (extreme event filter)
 
 Execution:
   - 1 contract market order per signal, per instrument
   - Native API bracket: stop = 2σ below entry, target = 3σ above entry
     (both in ticks, OCO-managed server-side)
-  - Force-close at market after 15 minutes if neither bracket is hit
+  - Force-close at market after 25 minutes if neither bracket is hit
   - Only one position per instrument at a time
 
 Usage:
@@ -56,16 +58,15 @@ PRACTICE_ACCOUNT_NAME = "PRAC-V2-88916-19336808"
 
 TF_MINUTES    = 5
 TRAILING_BARS = 20     # 20 × 5-min = 100-min σ window
-MOM_BARS      = 8      # 8 × 5-min = 40-min CSR window
+MOM_BARS      = 8      # 8 × 5-min = 40-min CSR window (default; overridden dynamically)
 CSR_THRESHOLD = 1.5    # min cumulative scaled return aligned with signal direction
 SIGNAL_SIGMA  = 3.0
 MAX_SCALED    = 5.0    # ignore extreme event spikes
 VOL_RATIO_MIN = 1.5
-MAX_HOLD_MIN  = 15     # force-close after this many minutes
+MAX_HOLD_MIN  = 25     # force-close after this many minutes
 POLL_SECONDS  = 30
 
 ET = ZoneInfo("America/New_York")
-BLACKOUT_ET = [(8, 0, 9, 0)]   # 08:00–09:00 ET (DST-aware; was fixed UTC, now tracks DST)
 
 LOG_PATH = Path("logs/bot_trades.csv")
 LOG_FIELDS = [
@@ -88,11 +89,25 @@ class BotInstrument:
     target_sigma: float = 3.0
     tick_size:    float = 0.25   # minimum price increment
     point_value:  float = 5.00  # $ per point (informational only)
+    # Dynamic CSR window: list of (gk_ann_vol_upper_bound, mom_bars)
+    csr_vol_windows: list = field(default_factory=lambda: [(1.0, 8)])
+    # Per-instrument blackout windows: (start_h, start_m, end_h, end_m, conditional)
+    # conditional=True: block only when CSR < threshold; False: always block.
+    blackout_windows: list = field(default_factory=list)
 
 
 INSTRUMENTS = [
-    BotInstrument("MES", "MES", tick_size=0.25, point_value=5.00),
-    BotInstrument("MYM", "MYM", tick_size=1.00, point_value=0.50),
+    BotInstrument("MES", "MES", tick_size=0.25, point_value=5.00,
+                  csr_vol_windows=[(0.08, 4), (1.0, 8)],
+                  blackout_windows=[
+                      (8, 0, 9, 0, True),   # econ releases: block only if CSR<1.5
+                  ]),
+    BotInstrument("MYM", "MYM", tick_size=1.00, point_value=0.50,
+                  csr_vol_windows=[(0.08, 4), (1.0, 8)],
+                  blackout_windows=[
+                      (9,  0,  9, 30, False),  # pre-open: EV=-0.076σ CSR-filtered
+                      (15, 0, 16,  0, False),  # NYSE close: EV=-0.375σ CSR-filtered
+                  ]),
 ]
 
 
@@ -143,6 +158,7 @@ class InstrumentState:
     sigma:        float = 0.0
     sigma_pts:    float = 0.0
     mean_vol:           float | None = None
+    gk_ann_vol:         float = 0.0
     csr:                float = 0.0
     active_trade:       ActiveTrade | None = None
     last_evaluated_ts:  datetime | None = None
@@ -186,6 +202,35 @@ def _log_trade(trade: ActiveTrade, outcome: str, exit_price: float, now: datetim
     )
 
 
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+GK_VOL_BARS   = 20
+BARS_PER_YEAR = 252 * 23 * 60
+
+def _gk_annualised_vol(bars: list) -> float:
+    sample = bars[-GK_VOL_BARS:] if len(bars) >= GK_VOL_BARS else bars
+    if len(sample) < 2:
+        return 0.0
+    vals = []
+    for b in sample:
+        if b.open <= 0 or b.high <= 0 or b.low <= 0 or b.close <= 0:
+            continue
+        hl = math.log(b.high / b.low) ** 2
+        co = math.log(b.close / b.open) ** 2
+        vals.append(0.5 * hl - (2 * math.log(2) - 1) * co)
+    if not vals:
+        return 0.0
+    return math.sqrt(max(0.0, float(np.mean(vals))) * BARS_PER_YEAR / TF_MINUTES)
+
+
+def get_mom_bars(gk_ann_vol: float, csr_vol_windows: list) -> int:
+    """Return CSR window (bars) for current GK vol regime."""
+    for upper, bars in csr_vol_windows:
+        if gk_ann_vol < upper:
+            return bars
+    return csr_vol_windows[-1][1]
+
+
 # ── Signal evaluation (identical logic to signal_monitor.py) ────────────────
 
 def evaluate(state: InstrumentState) -> dict | None:
@@ -212,9 +257,11 @@ def evaluate(state: InstrumentState) -> dict | None:
     vol_ratio = (last.volume / mean_vol) if mean_vol is not None else None
     direction = 1 if scaled > 0 else -1
 
-    # 40-min CSR (Cumulative Scaled Return), direction-adjusted
-    if len(closes) >= MOM_BARS + 1:
-        mom_rets = np.log(closes[-MOM_BARS:] / closes[-MOM_BARS - 1:-1])
+    # Dynamic CSR window based on current GK vol regime
+    state.gk_ann_vol = _gk_annualised_vol(bars)
+    mom_bars = get_mom_bars(state.gk_ann_vol, state.instrument.csr_vol_windows)
+    if len(closes) >= mom_bars + 1:
+        mom_rets = np.log(closes[-mom_bars:] / closes[-mom_bars - 1:-1])
         csr = float(mom_rets.sum()) / sigma * direction
     else:
         csr = 0.0
@@ -224,13 +271,13 @@ def evaluate(state: InstrumentState) -> dict | None:
     state.mean_vol  = mean_vol
     state.csr       = csr
 
-    # Conditional blackout: 08:00–09:00 ET blocks only if CSR < threshold.
-    # Signals with CSR≥threshold are allowed through even during this window.
+    # Per-instrument blackout windows.
     bar_et = last.ts.astimezone(ET)
-    in_blackout = any((sh, sm) <= (bar_et.hour, bar_et.minute) < (eh, em)
-                      for sh, sm, eh, em in BLACKOUT_ET)
-    if in_blackout and csr < CSR_THRESHOLD:
-        return None
+    bar_hm = (bar_et.hour, bar_et.minute)
+    for sh, sm, eh, em, conditional in state.instrument.blackout_windows:
+        if (sh, sm) <= bar_hm < (eh, em):
+            if not conditional or csr < CSR_THRESHOLD:
+                return None
 
     if (abs(scaled) >= SIGNAL_SIGMA and abs(scaled) <= MAX_SCALED
             and vol_ratio is not None and vol_ratio >= VOL_RATIO_MIN
@@ -252,7 +299,8 @@ def evaluate(state: InstrumentState) -> dict | None:
 
 def fetch_bars(client: TopstepClient, state: InstrumentState):
     end      = datetime.now(timezone.utc)
-    lookback = TRAILING_BARS + MOM_BARS + 10
+    max_mom  = max(bars for inst in INSTRUMENTS for _, bars in inst.csr_vol_windows)
+    lookback = TRAILING_BARS + max_mom + 10
     start    = end - timedelta(minutes=TF_MINUTES * lookback)
     raw = client.get_bars(
         contract_id=state.contract_id,
@@ -355,16 +403,31 @@ def handle_active_trade(client: TopstepClient, state: InstrumentState,
         log.info(f"{trade.instrument.symbol} fill confirmed: {trade.fill_price:.2f}")
 
     if pos is None:
-        # Position is gone — brackets closed it
+        # Position is gone — brackets closed it; cancel any residual OCO orders
         exit_price = _get_exit_price(client, account_id, trade, now)
         outcome    = _classify_outcome(trade, exit_price)
         _log_trade(trade, outcome, exit_price, now)
         state.active_trade = None
+        try:
+            n_cancelled = client.cancel_all_orders(account_id)
+            if n_cancelled:
+                log.info(f"{trade.instrument.symbol} {outcome}: cancelled {n_cancelled} residual order(s)")
+        except Exception as e:
+            log.warning(f"{trade.instrument.symbol}: cancel_all_orders failed: {e}")
         return
 
     # Force time exit if max hold exceeded
     if now >= trade.expires_at:
-        log.info(f"{trade.instrument.symbol} max hold reached — closing at market")
+        log.info(f"{trade.instrument.symbol} max hold reached — cancelling brackets then closing at market")
+        # Cancel brackets BEFORE closing: the API treats close_position() as a new
+        # market order and can attach fresh brackets to it, or leave orphan OCO legs
+        # that later fill and open an unwanted opposing position.
+        try:
+            n_cancelled = client.cancel_all_orders(account_id)
+            if n_cancelled:
+                log.info(f"{trade.instrument.symbol}: cancelled {n_cancelled} bracket order(s) before time exit")
+        except Exception as e:
+            log.warning(f"{trade.instrument.symbol}: pre-close cancel_all failed: {e}")
         try:
             client.close_position(account_id, trade.contract_id)
         except Exception as e:
@@ -373,6 +436,13 @@ def handle_active_trade(client: TopstepClient, state: InstrumentState,
         exit_price = state.bars[-1].close if state.bars else (trade.fill_price or trade.est_entry)
         _log_trade(trade, "TIME EXIT", exit_price, now)
         state.active_trade = None
+        # Cancel again in case the closing order itself spawned new brackets
+        try:
+            n_cancelled = client.cancel_all_orders(account_id)
+            if n_cancelled:
+                log.info(f"{trade.instrument.symbol} TIME EXIT: cancelled {n_cancelled} residual order(s) after close")
+        except Exception as e:
+            log.warning(f"{trade.instrument.symbol}: post-close cancel_all failed: {e}")
 
 
 def _get_exit_price(client: TopstepClient, account_id: int,

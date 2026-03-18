@@ -39,8 +39,7 @@ class TopstepClient:
 
     def get_accounts(self) -> list[dict]:
         """Return all active practice/combine accounts."""
-        self._ensure_authenticated()
-        resp = self._client.post(
+        resp = self._post(
             "/api/Account/search",
             json={"onlyActiveAccounts": True},
         )
@@ -60,8 +59,7 @@ class TopstepClient:
 
     def search_contracts(self, text: str, live: bool = False) -> list[dict]:
         """Search contracts by name (e.g. 'NQ', 'ES'). Returns up to 20 results."""
-        self._ensure_authenticated()
-        resp = self._client.post(
+        resp = self._post(
             "/api/Contract/search",
             json={"searchText": text, "live": live},
         )
@@ -91,14 +89,12 @@ class TopstepClient:
         unit: TopstepClient.SECOND/MINUTE/HOUR/DAY/WEEK/MONTH
         limit: max bars returned (capped at 20,000 per request)
         """
-        self._ensure_authenticated()
-
         def _fmt(dt: datetime) -> str:
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
             return dt.isoformat()
 
-        resp = self._client.post(
+        resp = self._post(
             "/api/History/retrieveBars",
             json={
                 "contractId": contract_id,
@@ -146,8 +142,6 @@ class TopstepClient:
         Returns list of dicts sorted ascending by timestamp, each with:
           t, o, h, l, c, v, contract (source contract id)
         """
-        self._ensure_authenticated()
-
         far_past = datetime(2020, 1, 1, tzinfo=timezone.utc)
         far_future = datetime(2030, 1, 1, tzinfo=timezone.utc)
 
@@ -235,7 +229,6 @@ class TopstepClient:
         stop_loss_ticks / take_profit_ticks attach native API brackets so the
         exchange manages the OCO pair — no need to track them manually.
         """
-        self._ensure_authenticated()
         body: dict = {
             "accountId":  account_id,
             "contractId": contract_id,
@@ -251,7 +244,7 @@ class TopstepClient:
         if take_profit_ticks is not None:
             body["takeProfitBracket"] = {"ticks": take_profit_ticks, "type": self.ORDER_LIMIT}
 
-        resp = self._client.post("/api/Order/place", json=body)
+        resp = self._post("/api/Order/place", json=body)
         resp.raise_for_status()
         data = resp.json()
         if not data.get("success"):
@@ -260,16 +253,33 @@ class TopstepClient:
 
     def cancel_order(self, account_id: int, order_id: int) -> dict:
         """Cancel an open order."""
-        self._ensure_authenticated()
-        resp = self._client.post("/api/Order/cancel",
+        resp = self._post("/api/Order/cancel",
                                  json={"accountId": account_id, "orderId": order_id})
         resp.raise_for_status()
         return resp.json()
 
+    def cancel_all_orders(self, account_id: int) -> int:
+        """
+        Cancel all open orders for the account.
+        Returns the number of orders cancelled.
+        Silently skips any order that fails to cancel (already filled/cancelled).
+        """
+        orders = self.get_open_orders(account_id)
+        cancelled = 0
+        for order in orders:
+            oid = order.get("id") or order.get("orderId")
+            if oid is None:
+                continue
+            try:
+                self.cancel_order(account_id, oid)
+                cancelled += 1
+            except Exception:
+                pass
+        return cancelled
+
     def get_open_orders(self, account_id: int) -> list[dict]:
         """Return all open orders for the account."""
-        self._ensure_authenticated()
-        resp = self._client.post("/api/Order/searchOpen", json={"accountId": account_id})
+        resp = self._post("/api/Order/searchOpen", json={"accountId": account_id})
         resp.raise_for_status()
         data = resp.json()
         if not data.get("success"):
@@ -278,8 +288,7 @@ class TopstepClient:
 
     def get_open_positions(self, account_id: int) -> list[dict]:
         """Return all open positions for the account."""
-        self._ensure_authenticated()
-        resp = self._client.post("/api/Position/searchOpen", json={"accountId": account_id})
+        resp = self._post("/api/Position/searchOpen", json={"accountId": account_id})
         resp.raise_for_status()
         data = resp.json()
         if not data.get("success"):
@@ -288,8 +297,7 @@ class TopstepClient:
 
     def close_position(self, account_id: int, contract_id: str) -> dict:
         """Close an entire position at market."""
-        self._ensure_authenticated()
-        resp = self._client.post("/api/Position/closeContract",
+        resp = self._post("/api/Position/closeContract",
                                  json={"accountId": account_id, "contractId": contract_id})
         resp.raise_for_status()
         return resp.json()
@@ -297,18 +305,26 @@ class TopstepClient:
     def search_trades(self, account_id: int,
                       start: datetime, end: datetime | None = None) -> list[dict]:
         """Return executed trades between start and end."""
-        self._ensure_authenticated()
         body = {
             "accountId":      account_id,
             "startTimestamp": start.isoformat(),
             "endTimestamp":   (end or datetime.now(timezone.utc)).isoformat(),
         }
-        resp = self._client.post("/api/Trade/search", json=body)
+        resp = self._post("/api/Trade/search", json=body)
         resp.raise_for_status()
         data = resp.json()
         if not data.get("success"):
             raise RuntimeError(f"search_trades failed: {data.get('errorMessage')}")
         return data.get("trades", [])
+
+    def _post(self, path: str, **kwargs) -> "httpx.Response":
+        """POST with automatic one-time re-login on 401 (token expiry)."""
+        self._ensure_authenticated()
+        resp = self._client.post(path, **kwargs)
+        if resp.status_code == 401:
+            self.login()
+            resp = self._client.post(path, **kwargs)
+        return resp
 
     def _ensure_authenticated(self):
         if not self.token:

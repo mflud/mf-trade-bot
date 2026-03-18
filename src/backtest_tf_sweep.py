@@ -40,24 +40,26 @@ STOPS   = [0.5, 1.0, 1.5, 2.0]
 TARGETS = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
 PRAC_S, PRAC_T = 2.0, 3.0
 
-TIMEFRAMES = [2, 3, 4, 5, 6]   # minutes
+TIMEFRAMES = [2, 3, 4, 5, 6, 10]   # minutes
 
 # Option A: same candle counts for all TFs
 PARAMS_A = {
-    2: {"trailing": 20, "mom": 8, "hold": 3},
-    3: {"trailing": 20, "mom": 8, "hold": 3},
-    4: {"trailing": 20, "mom": 8, "hold": 3},
-    5: {"trailing": 20, "mom": 8, "hold": 3},
-    6: {"trailing": 20, "mom": 8, "hold": 3},
+     2: {"trailing": 20, "mom": 8, "hold": 3},
+     3: {"trailing": 20, "mom": 8, "hold": 3},
+     4: {"trailing": 20, "mom": 8, "hold": 3},
+     5: {"trailing": 20, "mom": 8, "hold": 3},
+     6: {"trailing": 20, "mom": 8, "hold": 3},
+    10: {"trailing": 20, "mom": 8, "hold": 3},
 }
 
 # Option B: same time windows (~100-min σ, ~40-min CSR, ~15-min hold)
 PARAMS_B = {
-    2: {"trailing": 50, "mom": 20, "hold": 8},
-    3: {"trailing": 33, "mom": 13, "hold": 5},
-    4: {"trailing": 25, "mom": 10, "hold": 4},
-    5: {"trailing": 20, "mom":  8, "hold": 3},
-    6: {"trailing": 17, "mom":  7, "hold": 3},
+     2: {"trailing": 50, "mom": 20, "hold": 8},
+     3: {"trailing": 33, "mom": 13, "hold": 5},
+     4: {"trailing": 25, "mom": 10, "hold": 4},
+     5: {"trailing": 20, "mom":  8, "hold": 3},
+     6: {"trailing": 17, "mom":  7, "hold": 3},
+    10: {"trailing": 10, "mom":  4, "hold": 2},
 }
 
 INSTRUMENTS = {

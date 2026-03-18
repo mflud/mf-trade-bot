@@ -1,6 +1,6 @@
 MES/MYM Systematic Signal Research — Journey Summary
 ======================================================
-Written: 2026-03-15
+Written: 2026-03-15  |  Updated: 2026-03-16
 
 
 STARTING POINT
@@ -88,20 +88,57 @@ The CME late-session period was also examined (initially labeled "CME close" at
 20:00–21:00 UTC / 15:00–16:00 EST). Sample count was only n=41 over the full
 backtest period — too thin to be reliable. This tentative blackout was removed.
 
-Final configuration: one blackout window — 13:00–14:00 UTC.
+DST CORRECTION (2026-03-16): The original blackout was defined as fixed UTC hours
+(13:00–14:00 UTC). This correctly maps to 08:00–09:00 EST in winter but shifts to
+09:00–10:00 EDT in summer — incorrectly blocking 30 minutes of market open and missing
+the 08:30 EDT economic releases (which occur at 12:30 UTC in summer). All scripts were
+updated to use ET local time via Python's zoneinfo module, so the blackout always covers
+08:00–09:00 ET regardless of DST.
+
+CONDITIONAL BLACKOUT (2026-03-16): A full time-of-day EV breakdown (src/backtest_tod.py)
+revealed that during the 08:00–09:00 ET window, unfiltered signals are mildly negative
+(EV = -0.04σ) but CSR-filtered signals are mildly positive (+0.09σ). The blackout was
+therefore made conditional: it only blocks signals where CSR < 1.5. Signals that already
+pass the CSR threshold are allowed through even during 08:00–09:00 ET. The 09:00–09:30
+pre-open window (+0.45σ CSR-filtered) was confirmed to have no blackout and remain
+tradeable.
+
+MES final configuration: conditional blackout 08:00–09:00 ET (blocks if CSR < 1.5).
+
+MYM-SPECIFIC BLACKOUT (2026-03-16): A MYM-specific TOD breakdown (src/backtest_tod.py
+--sym MYM) revealed that MYM behaves differently from MES in several windows, consistent
+with MYM (Dow) being less exposed to pre-market tech earnings than MES (S&P 500):
+
+  08:00–09:00 ET:  MYM no-CSR = +0.1153σ, CSR-filtered = +0.0960σ  → POSITIVE for MYM
+  09:00–09:30 ET:  MYM no-CSR = -0.2780σ, CSR-filtered = -0.0760σ  → negative (MES = +0.45σ)
+  15:00–16:00 ET:  MYM no-CSR = -0.1590σ, CSR-filtered = -0.3748σ  → very negative (n=65)
+
+The 08:00–09:00 blackout was removed for MYM entirely (signals are positive even without
+CSR). Two unconditional blackouts were added:
+  09:00–09:30 ET — pre-NYSE-open; Dow names do not benefit from tech pre-market moves
+  15:00–16:00 ET — NYSE close; strong mean-reversion effect for MYM specifically
+
+Per-instrument blackout windows are now configured in InstrumentConfig / BotInstrument:
+  MES: [(8, 0, 9, 0, conditional=True)]
+  MYM: [(9, 0, 9, 30, conditional=False), (15, 0, 16, 0, conditional=False)]
 
 
 FINAL SIGNAL PARAMETERS
 -------------------------
-  Bar size:          5 minutes
+  Bar size:          5 minutes, clock-aligned (:00/:05/:10 — see bar alignment below)
   Trailing σ window: 20 bars (100 minutes), including signal bar
   σ threshold:       3.0 (|return / σ| ≥ 3.0)
-  Volume filter:     ≥ 1.5× trailing 20-bar mean volume
-  CSR window:        8 prior bars (40 minutes), excluding signal bar
-  CSR threshold:     ≥ 1.5 (direction-adjusted)
-  Blackout:          13:00–14:00 UTC
+  Volume filter:     ≥ 1.5× trailing 20-bar median volume (bars with volume ≥ 10 only;
+                     requires ≥ 10 qualifying bars, else "warming up")
+  CSR window:        dynamic — 4 bars (20 min) when GK vol < 8% ann;
+                     8 bars (40 min) when GK vol ≥ 8% ann
+  CSR threshold:     ≥ 1.5 (direction-adjusted), excluding signal bar
+  Blackout:          per-instrument (DST-aware ET local time):
+                       MES: 08:00–09:00 ET conditional (blocks only if CSR < 1.5)
+                       MYM: 09:00–09:30 ET unconditional; 15:00–16:00 ET unconditional
   Target:            3.0 × σ_pts from entry
   Stop:              2.0 × σ_pts from entry
+  Force-close:       25 minutes (5 bars) if neither bracket hit
 
 
 PRODUCTION COMPONENTS
@@ -183,6 +220,144 @@ login, stays running, and restarts automatically after crashes. Weeks of accumul
 are required before short-timeframe signal analysis is meaningful.
 
 
+BAR ALIGNMENT STUDY (2026-03-16)
+---------------------------------
+Tested whether the 5-minute signal edge depends on bars being clock-aligned
+(:00/:05/:10) or merely on the 5-minute duration. Five offsets were tested using
+src/backtest_offset.py: offset 0 closes at :00/:05/:10, offset 1 at :01/:06/:11, etc.
+
+Results (CSR-filtered EV):
+  Offset 0 (:00/:05/:10)  +0.216σ  ← standard grid   BEST
+  Offset 4 (:04/:09/:14)  +0.154σ
+  Offset 3 (:03/:08/:13)  +0.025σ
+  Offset 2 (:02/:07/:12)  +0.002σ
+  Offset 1 (:01/:06/:11)  -0.007σ  (negative)
+
+Conclusion: the edge is strongly concentrated in clock-aligned bars. Offset 1 is
+negative. The likely mechanism: most charting platforms, algos, and order flow cluster
+around the standard :00/:05/:10 boundaries, creating the volume/momentum spikes that
+the signal captures. Off-grid bars close mid-candle and capture noise instead.
+The production system (offset 0) is optimal and correct.
+
+
+TIMEFRAME STUDY (2026-03-16)
+------------------------------
+Timeframes 2-min, 3-min, 4-min, 5-min, 6-min, and 10-min were tested under two
+parameterisation schemes:
+
+  Option A (same candle counts — trailing=20, mom=4-8, hold=3):
+    2m: -0.005σ   3m: +0.008σ   4m: +0.083σ   5m: +0.195σ   6m: -0.053σ   10m: +0.050σ
+
+  Option B (same time windows — ~100min σ, ~40min CSR, ~15min hold):
+    2m: +0.054σ   3m: -0.019σ   4m: +0.069σ   5m: +0.195σ   6m: +0.015σ   10m: -0.250σ
+
+5-minute bars are the clear winner under both schemes. The drop-off at 6 minutes and
+non-monotonic pattern with 10 minutes further supports that the clock-alignment effect
+(see above) is a key component of the edge, not just bar duration.
+
+Intra-bar signal test (src/backtest_intrabar.py): signals evaluated at each 1-minute
+mark within a developing 5-minute bar were deeply negative (EV = -0.92σ to -0.46σ for
+minutes 1-4). Only the closed bar has positive EV (+0.047σ). The live system includes
+a bar-close guard to prevent firing on partial bars.
+
+
+CROSS-INSTRUMENT CORRELATION STUDY (2026-03-16)
+-------------------------------------------------
+Correlation of scaled log returns across MES, MNQ (Micro Nasdaq), and MYM using full
+history (7 years, ~97,500 aligned 5-min bars; MNQ data acquired from Databento):
+
+  MES–MNQ: 0.907   MES–MYM: 0.899   MNQ–MYM: 0.758
+
+Rolling 100-min correlation ranges (p5/p95):
+  MES–MNQ: 0.731 / 0.986   MES–MYM: 0.636 / 0.990   MNQ–MYM: 0.273 / 0.968
+
+MYM divergence from MES+MNQ consensus shows consistent next-bar reversion at z > 2.0
+(EV ≈ -0.0002/bar following a positive deviation). MNQ tends to continue rather than
+revert — consistent with Nasdaq leading broad market moves.
+
+Lead/lag: essentially zero at all non-zero lags at the 5-minute level; no instrument
+reliably leads another. Cross-instrument divergence trades were evaluated but rejected:
+the EV margin (~0.0002/bar) is too thin relative to the bid/ask spread to trade
+profitably. MNQ as a confirmation filter for MES/MYM signals was also tested but
+added negligible value (-0.005σ for MES, +0.037σ for MYM with -69% signal reduction)
+because the CSR filter already captures the "broad-based move" information.
+
+
+DYNAMIC CSR WINDOW (2026-03-16)
+---------------------------------
+The fixed 8-bar (40-min) CSR window was tested for regime-dependence using
+src/backtest_csr_sweep.py. CSR windows from 2 to 24 bars were swept, broken down by
+GK volatility regime.
+
+Key finding: in low-volatility regimes (GK vol < 8% annualised), a shorter 4-bar
+(20-min) CSR window outperforms the 8-bar baseline for both MES and MYM. In normal and
+higher-vol regimes the 8-bar window remains optimal. The 4-bar result is consistent
+across both instruments and years, and is theoretically grounded: in quiet markets
+momentum builds slowly and recent bars carry more signal than noise.
+
+More granular regime windows (12-bar for Active, 20-bar for High) were found but
+rejected as likely overfit given smaller samples (n=212–561 vs n=1,100+ for Low/Normal)
+and non-monotonic patterns.
+
+Final dynamic rule (same for both instruments):
+  GK vol < 8%:  CSR window = 4 bars (20 min)
+  GK vol ≥ 8%:  CSR window = 8 bars (40 min)
+
+The live system reads state.gk_ann_vol (already computed for display) and applies this
+lookup in evaluate() / check_signal(). The display label "Momentum(40m):" updates live
+to reflect the active window.
+
+EV improvement from dynamic CSR, two-tier rule (in-sample):
+  MES: +0.196σ → +0.271σ (+0.075σ)   MYM: +0.166σ → +0.196σ (+0.030σ)
+
+ROLLING PERCENTILE THRESHOLD (2026-03-16): The concern that the fixed 8% boundary
+is arbitrary and shifts relative to ambient vol was tested via src/backtest_csr_percentile.py.
+Each bar's GK vol was ranked against a trailing rolling window and the bottom-p% assigned
+the 4-bar CSR window; the rest kept 8 bars.
+
+Key results (MES):
+  Absolute threshold (gk<8%→4)       n=1,011  EV=+0.2705σ  (+0.075σ vs fixed-8)
+  Roll=250, p<40%→4, else→8         n=1,019  EV=+0.2655σ  (+0.070σ vs fixed-8)
+
+Threshold stability analysis confirmed the user's concern: the 25th percentile of GK vol
+ranges from 4.8% to 9.9% across years (e.g., 2024 mean=9.4%, 2021 mean=5.8%), meaning
+the fixed 8% boundary sits above the median in quiet years and below the 25th percentile
+in volatile years.
+
+Decision: retain the absolute 8% threshold. The rolling percentile improves EV by only
+~0.005σ over the absolute threshold (noise-level), while adding complexity (250-bar
+rolling history of GK vol for percentile lookup). The absolute threshold scores highest
+in-sample and is sufficient.
+
+
+HOLD-PERIOD STUDY (2026-03-16)
+-------------------------------
+src/backtest_hold_sweep.py swept force-close times from 1–12 bars (5–60 min)
+using the full current signal config (dynamic CSR, per-instrument blackouts).
+The stop/target brackets are exchange-managed OCO orders and remain active
+regardless of hold period; MAX_HOLD_MIN only controls the time-exit fallback.
+
+Results (stop=2σ, target=3σ):
+
+  MES (n=1,071 triggers):
+    3 bars (15 min): +0.267σ  ← was current
+    5 bars (25 min): +0.286σ  ← new setting
+    9 bars (45 min): +0.331σ  ← in-sample peak
+  MYM (n=650 triggers):
+    3 bars (15 min): +0.225σ  ← was current
+    5 bars (25 min): +0.235σ  ← new setting
+    6 bars (30 min): +0.253σ  ← local peak before non-monotonic noise
+
+EV increases monotonically through 9 bars for MES (smooth curve); MYM shows
+a dip at 7 bars suggesting sampling noise with only 650 triggers. In-sample
+peak (9/11 bars) was not adopted to avoid overfitting. 5 bars (25 min) was
+chosen as a conservative improvement: captures momentum that persists beyond
+15 min without overextending. At 3 bars, ~41% of MES trades were time exits;
+at 5 bars this drops to ~34%.
+
+MAX_HOLD_MIN updated from 15 → 25 in both signal_monitor.py and trading_bot.py.
+
+
 WHAT REMAINS OPEN
 ------------------
 - MYM-specific backtest at the final parameters has not been run in isolation.
@@ -190,3 +365,5 @@ WHAT REMAINS OPEN
   continuous recording.
 - Live signal performance tracking: bot trades logged to logs/bot_trades.csv will
   accumulate real signal outcomes against the backtest predictions.
+- Dynamic CSR window out-of-sample validation: the two-tier rule was selected on
+  in-sample data; live performance will provide the first true out-of-sample test.
