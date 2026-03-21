@@ -20,10 +20,12 @@ Run modes:
 import argparse
 import csv
 import math
+import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -52,13 +54,34 @@ VOL_RATIO_MIN = 1.5
 MAX_HOLD_MIN  = 25
 BARS_PER_YEAR = 252 * 23 * 60
 
+PL_N_BARS = 10    # 1-min bars to look back for PL computation
+PL_THRESH = 0.50  # PL_aligned ≥ this → 2× sizing
+
 ET = ZoneInfo("America/New_York")
 
+# ORB parameters (15-min ORB, wide-range LONG, morning + power-hour windows)
+ORB_BARS      = 3          # 3 × 5-min = 15-min opening range
+ORB_WIDTH_MIN = 15.25      # pts — wide tertile cutoff from backtest
+ORB_STOP_SIG  = 2.0
+ORB_TGT_SIG   = 2.0        # 2σ:2σ → EV ≈ +0.61R
+ORB_WINDOWS   = [          # (start_h, start_m, end_h, end_m, label)
+    (9,  45, 10, 30, "Morning"),
+    (13, 30, 16,  0, "Power hr"),
+]
+
 LOG_PATH = Path("logs/signals.csv")
+ORB_LOG_PATH = Path("logs/orb_signals.csv")
+ORB_LOG_FIELDS = [
+    "fired_at", "resolved_at", "symbol", "direction",
+    "entry", "target", "stop",
+    "orb_high", "orb_low", "orb_width", "sigma_pts",
+    "window", "outcome", "pnl_pts", "pnl_r",
+]
 LOG_FIELDS = [
     "fired_at", "resolved_at", "symbol", "direction",
     "entry", "target", "stop",
     "sigma_pts", "scaled", "vol_ratio", "csr",
+    "pl_aligned", "contracts",
     "outcome", "pnl_pts", "pnl_sigma",
 ]
 
@@ -88,6 +111,12 @@ class InstrumentConfig:
 
 
 INSTRUMENTS = [
+    InstrumentConfig("MES", "MES", stop_sigma=2.0, target_sigma=3.0,
+                     point_value=5.00, ev_sigma=0.073,
+                     csr_vol_windows=[(0.08, 4), (1.0, 8)],
+                     blackout_windows=[
+                         (8, 0, 9, 0, True),  # econ releases: block only if CSR<1.5
+                     ]),
     InstrumentConfig("MYM", "MYM", stop_sigma=2.0, target_sigma=3.0,
                      point_value=0.50, ev_sigma=0.073,
                      csr_vol_windows=[(0.08, 4), (1.0, 8)],
@@ -95,13 +124,18 @@ INSTRUMENTS = [
                          (9,  0,  9, 30, False),  # pre-open: EV=-0.076σ CSR-filtered
                          (15, 0, 16,  0, False),  # NYSE close: EV=-0.375σ CSR-filtered
                      ]),
-    InstrumentConfig("MES", "MES", stop_sigma=2.0, target_sigma=3.0,
-                     point_value=5.00, ev_sigma=0.073,
-                     csr_vol_windows=[(0.08, 4), (1.0, 8)],
-                     blackout_windows=[
-                         (8, 0, 9, 0, True),  # econ releases: block only if CSR<1.5
-                     ]),
 ]
+
+ALERT_SOUND = "/System/Library/Sounds/Ping.aiff"
+
+
+def play_alert():
+    """Play alert sound in background thread (non-blocking)."""
+    threading.Thread(
+        target=lambda: subprocess.run(["afplay", ALERT_SOUND], check=False),
+        daemon=True,
+    ).start()
+
 
 console = Console()
 
@@ -129,6 +163,7 @@ class Signal:
     vol_ratio:  float
     csr:        float
     bar_ts:     datetime
+    pl_aligned: float | None = None   # set after signal fires; drives 2× sizing
     target:     float = field(init=False)
     stop:       float = field(init=False)
     expires_at: datetime = field(init=False)
@@ -140,6 +175,34 @@ class Signal:
 
     def target_pts(self): return abs(self.target - self.entry)
     def stop_pts(self):   return abs(self.stop   - self.entry)
+
+
+@dataclass
+class OrbSignal:
+    entry:      float
+    target:     float
+    stop:       float
+    orb_high:   float
+    orb_low:    float
+    sigma_pts:  float
+    window:     str
+    bar_ts:     datetime
+
+    def target_pts(self): return abs(self.target - self.entry)
+    def stop_pts(self):   return abs(self.stop   - self.entry)
+    def risk_pts(self):   return self.stop_pts()
+
+
+@dataclass
+class OrbState:
+    session_date:    date | None = None
+    orb_high:        float = 0.0
+    orb_low:         float = 0.0
+    orb_bars_seen:   int   = 0
+    orb_complete:    bool  = False
+    morning_fired:   bool  = False
+    power_hr_fired:  bool  = False
+    active_signal:   OrbSignal | None = None
 
 
 @dataclass
@@ -162,6 +225,8 @@ class InstrumentState:
     csr:           float = 0.0   # cumulative scaled return (40 min, direction-adjusted)
     mean_vol:           float | None = None
     active_signal:      Signal | None = None
+    current_pl:         float | None = None      # raw 1-min PL, refreshed every poll
+    orb:                OrbState = field(default_factory=OrbState)
     history:            list[RecentSignal] = field(default_factory=list)
     error:              str | None = None
     last_evaluated_ts:  datetime | None = None   # ts of last bar evaluated for signals
@@ -198,6 +263,35 @@ def regime_label(ann_vol: float) -> tuple[str, str]:
         if ann_vol < thresh:
             return label, style
     return REGIME_THRESHOLDS[-1][1], REGIME_THRESHOLDS[-1][2]
+
+
+def _pl_bar(pl: float, width: int = 20) -> str:
+    """
+    Render a signed [-1, +1] bar with:
+      - red ░░░ fill for the [-1, -0.5] region (left quarter)
+      - dim ─── fill for the [-0.5, +0.5] neutral region
+      - green ░░░ fill for the [+0.5, +1] region (right quarter)
+      - dim │ at the centre (pl=0 reference)
+      - bold █ marker at current pl position, coloured by region
+    """
+    marker = min(width - 1, int((pl + 1) / 2 * width))
+    center = width // 2
+    parts  = []
+    for i in range(width):
+        in_red   = i < width // 4
+        in_green = i >= width - width // 4
+        if i == marker:
+            style = "bold red" if in_red else ("bold green" if in_green else "bold white")
+            parts.append(f"[{style}]█[/]")
+        elif i == center:
+            parts.append("[dim]│[/]")
+        elif in_red:
+            parts.append("[red]░[/]")
+        elif in_green:
+            parts.append("[green]░[/]")
+        else:
+            parts.append("[dim]─[/]")
+    return "".join(parts)
 
 
 def _next_bar_close(now: datetime) -> datetime:
@@ -309,6 +403,15 @@ def build_signal_panel(state: InstrumentState, now: datetime) -> Panel:
         mom_bars = get_mom_bars(state.gk_ann_vol, state.cfg.csr_vol_windows)
         t.add_row(f"Momentum({mom_bars * TF_MINUTES}m):",
                   f"[{csr_style}]{bar_csr}[/] {csr:+.2f}σ / {CSR_THRESHOLD:.1f}σ {csr_check}")
+
+        pl = state.current_pl
+        if pl is not None:
+            val_style = "green" if pl >= PL_THRESH else ("red" if pl <= -PL_THRESH else "white")
+            t.add_row("1-min PL:",
+                      f"{_pl_bar(pl)} [{val_style}]{pl:+.2f}[/]")
+        else:
+            t.add_row("1-min PL:", "[dim]fetching…[/]")
+
         bar_et = state.bars[-1].ts.astimezone(ET)
         bar_hm = (bar_et.hour, bar_et.minute)
         in_active_blackout = any(
@@ -376,9 +479,20 @@ def build_signal_panel(state: InstrumentState, now: datetime) -> Panel:
     t.add_row("Trigger:",
               f"[dim]scaled={signal.scaled:+.2f}σ  vol={signal.vol_ratio:.2f}×[/]")
 
+    sizing_2x = signal.pl_aligned is not None and signal.pl_aligned >= PL_THRESH
+    if sizing_2x:
+        pl_str = f"{signal.pl_aligned:+.2f}"
+        t.add_row("", "")
+        t.add_row("Size:",
+                  f"[bold yellow on dark_red]  ⚡ 2× CONTRACTS  PL={pl_str}  [/]")
+    elif signal.pl_aligned is not None:
+        t.add_row("PL:",
+                  f"[dim]{signal.pl_aligned:+.2f} (1× size)[/]")
+
+    border = "yellow" if sizing_2x else color
     return Panel(t,
                  title=f"[bold {color}]⬤  {direction_str}  SIGNAL[/]",
-                 border_style=color, padding=(0, 2))
+                 border_style=border, padding=(0, 2))
 
 
 def build_instrument_column(state: InstrumentState, now: datetime) -> Table:
@@ -399,6 +513,8 @@ def build_instrument_column(state: InstrumentState, now: datetime) -> Table:
     col.add_row(build_regime_panel(state))
     col.add_row(build_bar_panel(state))
     col.add_row(build_signal_panel(state, now))
+    if state.cfg.symbol == "MES":
+        col.add_row(build_orb_panel(state, now))
     return col
 
 
@@ -453,7 +569,7 @@ def build_header(now: datetime) -> Panel:
     local = now.astimezone(datetime.now().astimezone().tzinfo)
     t = Text(justify="center")
     t.append("  SIGNAL MONITOR  ", style="bold white on dark_blue")
-    t.append("  MYM & MES  ", style="bold cyan")
+    t.append("  MES & MYM  ", style="bold cyan")
     t.append("│  ")
     t.append(local.strftime("%a %Y-%m-%d  %H:%M:%S %Z"), style="dim")
     t.append("  │  next bar: ")
@@ -505,6 +621,8 @@ def _log_trade(sym: str, sig: Signal, outcome: str,
         "scaled":      round(sig.scaled,     4),
         "vol_ratio":   round(sig.vol_ratio,  4),
         "csr":         round(sig.csr,        4),
+        "pl_aligned":  round(sig.pl_aligned, 4) if sig.pl_aligned is not None else "",
+        "contracts":   2 if (sig.pl_aligned is not None and sig.pl_aligned >= PL_THRESH) else 1,
         "outcome":     outcome,
         "pnl_pts":     round(pnl_pts,        4),
         "pnl_sigma":   round(pnl_pts / sig.sigma_pts, 4) if sig.sigma_pts else 0.0,
@@ -529,6 +647,210 @@ def _check_resolution(sig: Signal, bars: list[Bar]) -> tuple[str, float] | None:
             if bar.high >= sig.stop:
                 return "STOPPED", -sig.stop_pts()
     return None
+
+
+# ── ORB evaluation ─────────────────────────────────────────────────────────────
+
+def _orb_window(bar_et: datetime) -> str | None:
+    hm = (bar_et.hour, bar_et.minute)
+    for sh, sm, eh, em, label in ORB_WINDOWS:
+        if (sh, sm) <= hm < (eh, em):
+            return label
+    return None
+
+
+def evaluate_orb(state: InstrumentState) -> OrbSignal | None:
+    """Update OrbState incrementally; return a new OrbSignal on qualifying breakout."""
+    if not state.bars:
+        return None
+
+    bar    = state.bars[-1]
+    bar_et = bar.ts.astimezone(ET)
+    today  = bar_et.date()
+    orb    = state.orb
+
+    if orb.session_date != today:
+        orb.session_date   = today
+        orb.orb_high       = 0.0
+        orb.orb_low        = 0.0
+        orb.orb_bars_seen  = 0
+        orb.orb_complete   = False
+        orb.morning_fired  = False
+        orb.power_hr_fired = False
+        orb.active_signal  = None
+
+    hm = (bar_et.hour, bar_et.minute)
+
+    if (9, 30) <= hm < (9, 30 + ORB_BARS * TF_MINUTES) and not orb.orb_complete:
+        if orb.orb_bars_seen == 0:
+            orb.orb_high = bar.high
+            orb.orb_low  = bar.low
+        else:
+            orb.orb_high = max(orb.orb_high, bar.high)
+            orb.orb_low  = min(orb.orb_low,  bar.low)
+        orb.orb_bars_seen += 1
+        if orb.orb_bars_seen >= ORB_BARS:
+            orb.orb_complete = True
+        return None
+
+    if not orb.orb_complete:
+        return None
+    if hm < (9, 30) or hm >= (16, 0):
+        return None
+
+    window = _orb_window(bar_et)
+    if window is None:
+        return None
+    if window == "Morning"  and orb.morning_fired:
+        return None
+    if window == "Power hr" and orb.power_hr_fired:
+        return None
+
+    orb_width = orb.orb_high - orb.orb_low
+    if orb_width < ORB_WIDTH_MIN:
+        return None
+    if state.sigma_pts <= 0:
+        return None
+
+    if bar.close > orb.orb_high:
+        entry  = bar.close
+        sig = OrbSignal(
+            entry=entry,
+            target=entry + ORB_TGT_SIG * state.sigma_pts,
+            stop=entry   - ORB_STOP_SIG * state.sigma_pts,
+            orb_high=orb.orb_high, orb_low=orb.orb_low,
+            sigma_pts=state.sigma_pts, window=window, bar_ts=bar.ts,
+        )
+        if window == "Morning":
+            orb.morning_fired  = True
+        else:
+            orb.power_hr_fired = True
+        orb.active_signal = sig
+        return sig
+
+    return None
+
+
+def _check_orb_resolution(sig: OrbSignal, bars: list[Bar]) -> tuple[str, float] | None:
+    for bar in bars:
+        if bar.ts <= sig.bar_ts:
+            continue
+        if bar.high >= sig.target:
+            return "TARGET",  sig.target_pts()
+        if bar.low  <= sig.stop:
+            return "STOPPED", -sig.stop_pts()
+    return None
+
+
+def build_orb_panel(state: InstrumentState, now: datetime) -> Panel:
+    orb    = state.orb
+    bar_et = state.bars[-1].ts.astimezone(ET) if state.bars else None
+
+    t = Table.grid(padding=(0, 1))
+    t.add_column(style="dim", width=14)
+    t.add_column()
+
+    if orb.orb_complete:
+        width   = orb.orb_high - orb.orb_low
+        w_style = "green" if width >= ORB_WIDTH_MIN else "red"
+        w_flag  = " ✓" if width >= ORB_WIDTH_MIN else f" ✗ need>{ORB_WIDTH_MIN:.0f}"
+        t.add_row("ORB high:", f"{orb.orb_high:,.2f}")
+        t.add_row("ORB low:",  f"{orb.orb_low:,.2f}")
+        t.add_row("ORB width:", f"[{w_style}]{width:.2f} pts{w_flag}[/]")
+    elif orb.session_date == (bar_et.date() if bar_et else None):
+        t.add_row("ORB:", f"[yellow]Building… {orb.orb_bars_seen}/{ORB_BARS} bars[/]")
+    else:
+        t.add_row("ORB:", "[dim]Waiting for RTH open[/]")
+
+    if orb.active_signal:
+        sig   = orb.active_signal
+        rem   = (sig.bar_ts + timedelta(minutes=MAX_HOLD_MIN)) - now
+        rem_s = int(rem.total_seconds())
+        rem_str = f"{rem_s // 60}m {rem_s % 60:02d}s" if rem_s > 0 else "[blink]EXPIRED[/]"
+        t.add_row("", "")
+        t.add_row("Entry:",  f"[bold]{sig.entry:,.2f}[/]  [dim]({sig.window})[/]")
+        t.add_row("Target:", f"[bold green]{sig.target:,.2f}[/]  "
+                              f"([green]+{sig.target_pts():.2f} pts[/] │ +{ORB_TGT_SIG:.1f}σ)")
+        t.add_row("Stop:",   f"[bold red]{sig.stop:,.2f}[/]  "
+                              f"([red]−{sig.stop_pts():.2f} pts[/] │ −{ORB_STOP_SIG:.1f}σ)")
+        t.add_row("EV:",     f"+0.61R ≈ +{0.61*sig.risk_pts():.1f} pts  [{rem_str}]")
+        return Panel(t, title="[bold green]⬤  ORB LONG ▲[/]",
+                     border_style="green", padding=(0, 1))
+
+    if orb.orb_complete:
+        width  = orb.orb_high - orb.orb_low
+        window = _orb_window(bar_et) if bar_et else None
+        if width < ORB_WIDTH_MIN:
+            status = "[dim]ORB too narrow[/]"
+        elif window:
+            fired = (window == "Morning" and orb.morning_fired) or \
+                    (window == "Power hr" and orb.power_hr_fired)
+            status = "[dim]Already fired[/]" if fired else \
+                     f"[yellow]Watch >{orb.orb_high:.2f}[/]"
+        else:
+            remaining = [l for sh, sm, eh, em, l in ORB_WINDOWS
+                         if not ((l == "Morning" and orb.morning_fired) or
+                                 (l == "Power hr" and orb.power_hr_fired))]
+            status = f"[dim]Next: {remaining[0]}[/]" if remaining else "[dim]Done today[/]"
+        t.add_row("Status:", status)
+
+    border = "yellow" if (orb.orb_complete and _orb_window(bar_et) and
+                          not (orb.morning_fired and orb.power_hr_fired)) else "dim"
+    return Panel(t, title="[bold]ORB LONG[/]", border_style=border, padding=(0, 1))
+
+
+def _log_orb(sym: str, sig: OrbSignal, outcome: str,
+             pnl_pts: float, resolved_at: datetime):
+    ORB_LOG_PATH.parent.mkdir(exist_ok=True)
+    if not ORB_LOG_PATH.exists():
+        with open(ORB_LOG_PATH, "w", newline="") as f:
+            csv.DictWriter(f, fieldnames=ORB_LOG_FIELDS).writeheader()
+    row = {
+        "fired_at": sig.bar_ts.isoformat(), "resolved_at": resolved_at.isoformat(),
+        "symbol": sym, "direction": "LONG",
+        "entry": round(sig.entry, 4), "target": round(sig.target, 4),
+        "stop": round(sig.stop, 4),
+        "orb_high": round(sig.orb_high, 4), "orb_low": round(sig.orb_low, 4),
+        "orb_width": round(sig.orb_high - sig.orb_low, 4),
+        "sigma_pts": round(sig.sigma_pts, 4), "window": sig.window,
+        "outcome": outcome, "pnl_pts": round(pnl_pts, 4),
+        "pnl_r": round(pnl_pts / sig.risk_pts(), 4) if sig.risk_pts() else 0.0,
+    }
+    with open(ORB_LOG_PATH, "a", newline="") as f:
+        csv.DictWriter(f, fieldnames=ORB_LOG_FIELDS).writerow(row)
+
+
+# ── PL confidence sizing ───────────────────────────────────────────────────────
+
+def fetch_1min_pl(client, contract_id: str,
+                  signal_bar_ts: datetime, direction: int) -> float | None:
+    """
+    Fetch PL_N_BARS 1-min bars ending just before the signal 5-min bar and
+    return PL_aligned = (signed path length) × direction.
+    +1 = 1-min flow perfectly aligned; ≥ PL_THRESH → 2× sizing.
+    Returns None on fetch error or insufficient data.
+    """
+    from topstep_client import TopstepClient
+    end   = signal_bar_ts
+    start = end - timedelta(minutes=PL_N_BARS + 5)
+    try:
+        raw = client.get_bars(
+            contract_id=contract_id, start=start, end=end,
+            unit=TopstepClient.MINUTE, unit_number=1,
+            limit=PL_N_BARS + 5,
+        )
+        raw = list(reversed(raw))
+    except Exception:
+        return None
+    if len(raw) < PL_N_BARS + 1:
+        return None
+    closes   = np.array([b["c"] for b in raw[-(PL_N_BARS + 1):]])
+    rets     = np.log(closes[1:] / closes[:-1])
+    sum_absr = float(np.abs(rets).sum())
+    if sum_absr == 0:
+        return None
+    pl = float(rets.sum()) / sum_absr
+    return pl * direction
 
 
 # ── Live mode ──────────────────────────────────────────────────────────────────
@@ -638,17 +960,22 @@ def run_live():
                 if not state.bars:
                     continue
 
+                # Refresh 1-min PL for watching display
+                state.current_pl = fetch_1min_pl(client, state.cid, now, 1)
+
                 # Update display metrics and check for signal
                 new_sig = evaluate(state)
+                new_orb = evaluate_orb(state) if state.cfg.symbol == "MES" else None
 
                 # Only act on a signal from a bar we haven't seen before
                 last_bar_ts = state.bars[-1].ts
                 if last_bar_ts == state.last_evaluated_ts:
                     new_sig = None
+                    new_orb = None
                 else:
                     state.last_evaluated_ts = last_bar_ts
 
-                # Check active signal for target/stop hit or expiry
+                # Check momentum signal for target/stop hit or expiry
                 if state.active_signal:
                     hit = _check_resolution(state.active_signal, state.bars)
                     if hit:
@@ -663,6 +990,28 @@ def run_live():
                     if state.active_signal:
                         resolve(state, "SUPERSEDED", 0.0, now)
                     state.active_signal = new_sig
+                    pl = fetch_1min_pl(client, state.cid,
+                                       new_sig.bar_ts, new_sig.direction)
+                    if pl is not None:
+                        state.active_signal.pl_aligned = pl
+                    play_alert()
+
+                # Check ORB signal for target/stop hit or expiry (MES only)
+                if state.orb.active_signal:
+                    hit = _check_orb_resolution(state.orb.active_signal, state.bars)
+                    if hit:
+                        _log_orb(state.cfg.symbol, state.orb.active_signal,
+                                 hit[0], hit[1], now)
+                        state.orb.active_signal = None
+                    elif now >= state.orb.active_signal.bar_ts + timedelta(minutes=MAX_HOLD_MIN):
+                        pnl = state.bars[-1].close - state.orb.active_signal.entry
+                        _log_orb(state.cfg.symbol, state.orb.active_signal,
+                                 "TIME EXIT", pnl, now)
+                        state.orb.active_signal = None
+
+                if new_orb and state.orb.active_signal is None:
+                    state.orb.active_signal = new_orb
+                    play_alert()
 
             live.update(render(states, combined_history, now))
             time.sleep(30)
@@ -673,17 +1022,37 @@ def run_live():
 def run_demo():
     now = datetime.now(timezone.utc)
 
-    # MYM synthetic state
-    mym_cfg   = INSTRUMENTS[0]
-    mym_sigma = 0.000721       # ~19% annualised at 5-min bars
+    # MES synthetic state — watching, with completed wide ORB
+    mes_cfg   = INSTRUMENTS[0]
+    mes_sigma = 0.000721
+    mes_price = 6_625.0
+    mes_sp    = mes_sigma * mes_price   # ≈ 4.78 pts per 1σ
+    now_et    = now.astimezone(ET)
+
+    mes_state = InstrumentState(cfg=mes_cfg, cname="MESH6")
+    mes_state.sigma      = mes_sigma
+    mes_state.sigma_pts  = mes_sp
+    mes_state.gk_ann_vol = 0.198
+    mes_state.mean_vol   = 8_450.0
+    mes_state.bars = [Bar(ts=now - timedelta(minutes=5),
+                          open=6_622.0, high=6_627.5, low=6_620.5,
+                          close=6_625.0, volume=6_820)]
+    mes_state.orb.session_date  = now_et.date()
+    mes_state.orb.orb_high      = 6_618.0
+    mes_state.orb.orb_low       = 6_594.0   # width = 24 pts ✓
+    mes_state.orb.orb_complete  = True
+
+    # MYM synthetic state — long signal active
+    mym_cfg   = INSTRUMENTS[1]
+    mym_sigma = 0.000721
     mym_price = 46_500.0
     mym_sp    = mym_sigma * mym_price   # ≈ 33.5 pts per 1σ
 
     mym_state = InstrumentState(cfg=mym_cfg, cname="MYMH6")
-    mym_state.sigma     = mym_sigma
-    mym_state.sigma_pts = mym_sp
-    mym_state.gk_ann_vol = 0.198   # ~19.8% GK vol (slightly above close-return)
-    mym_state.mean_vol  = 4_200.0
+    mym_state.sigma      = mym_sigma
+    mym_state.sigma_pts  = mym_sp
+    mym_state.gk_ann_vol = 0.198
+    mym_state.mean_vol   = 4_200.0
     mym_state.bars = [Bar(ts=now - timedelta(minutes=5),
                           open=46_430, high=46_560, low=46_415,
                           close=46_500, volume=9_800)]
@@ -692,21 +1061,6 @@ def run_demo():
         sigma=mym_sigma, sigma_pts=mym_sp,
         scaled=+3.91, vol_ratio=2.33, csr=1.82, bar_ts=now - timedelta(minutes=5),
     )
-
-    # MES synthetic state — watching
-    mes_cfg   = INSTRUMENTS[1]
-    mes_sigma = 0.000721
-    mes_price = 6_625.0
-    mes_sp    = mes_sigma * mes_price   # ≈ 4.78 pts per 1σ
-
-    mes_state = InstrumentState(cfg=mes_cfg, cname="MESH6")
-    mes_state.sigma     = mes_sigma
-    mes_state.sigma_pts = mes_sp
-    mes_state.gk_ann_vol = 0.198
-    mes_state.mean_vol  = 8_450.0
-    mes_state.bars = [Bar(ts=now - timedelta(minutes=5),
-                          open=6_622.0, high=6_627.5, low=6_620.5,
-                          close=6_625.0, volume=6_820)]
 
     history = [
         RecentSignal("MYM", Signal(mym_cfg, -1, 46_550, mym_sigma, mym_sp,
@@ -724,16 +1078,16 @@ def run_demo():
     ]
 
     console.print()
-    console.print("[bold underline]DEMO — MYM: LONG SIGNAL  │  MES: WATCHING[/]",
+    console.print("[bold underline]DEMO — MES: WATCHING (ORB ready)  │  MYM: LONG SIGNAL[/]",
                   justify="center")
-    console.print(render([mym_state, mes_state], history, now))
+    console.print(render([mes_state, mym_state], history, now))
 
-    # Frame 2: MES short, MYM watching
+    # Frame 2: MES short signal, MYM watching
     mes_state2 = InstrumentState(cfg=mes_cfg, cname="MESH6")
-    mes_state2.sigma     = mes_sigma
-    mes_state2.sigma_pts = mes_sp
+    mes_state2.sigma      = mes_sigma
+    mes_state2.sigma_pts  = mes_sp
     mes_state2.gk_ann_vol = 0.198
-    mes_state2.mean_vol  = 8_450.0
+    mes_state2.mean_vol   = 8_450.0
     mes_state2.bars = [Bar(ts=now - timedelta(minutes=5),
                            open=6_640.0, high=6_641.0, low=6_618.5,
                            close=6_620.0, volume=21_800)]
@@ -742,20 +1096,24 @@ def run_demo():
         sigma=mes_sigma, sigma_pts=mes_sp,
         scaled=-4.12, vol_ratio=2.58, csr=2.17, bar_ts=now - timedelta(minutes=5),
     )
+    mes_state2.orb.session_date = now_et.date()
+    mes_state2.orb.orb_high     = 6_635.0
+    mes_state2.orb.orb_low      = 6_611.0   # width = 24 pts ✓
+    mes_state2.orb.orb_complete = True
 
     mym_state2 = InstrumentState(cfg=mym_cfg, cname="MYMH6")
-    mym_state2.sigma     = mym_sigma
-    mym_state2.sigma_pts = mym_sp
+    mym_state2.sigma      = mym_sigma
+    mym_state2.sigma_pts  = mym_sp
     mym_state2.gk_ann_vol = 0.198
-    mym_state2.mean_vol  = 4_200.0
+    mym_state2.mean_vol   = 4_200.0
     mym_state2.bars = [Bar(ts=now - timedelta(minutes=5),
                            open=46_490, high=46_505, low=46_475,
                            close=46_490, volume=3_100)]
 
     console.print()
-    console.print("[bold underline]DEMO — MYM: WATCHING  │  MES: SHORT SIGNAL[/]",
+    console.print("[bold underline]DEMO — MES: SHORT SIGNAL (ORB ready)  │  MYM: WATCHING[/]",
                   justify="center")
-    console.print(render([mym_state2, mes_state2], history, now))
+    console.print(render([mes_state2, mym_state2], history, now))
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────

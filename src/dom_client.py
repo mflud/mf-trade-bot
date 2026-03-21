@@ -67,6 +67,8 @@ class DOMBook:
     def apply_depth(self, updates: list[dict]):
         with self._lock:
             for u in updates:
+                if u is None:
+                    continue
                 price    = u.get("price",  0)
                 volume   = u.get("volume", 0)
                 dom_type = u.get("type",   -1)
@@ -90,6 +92,7 @@ class DOMBook:
             if last_price is not None: self.last_price = last_price
             if best_bid   is not None: self.best_bid   = best_bid
             if best_ask   is not None: self.best_ask   = best_ask
+            self.last_update = datetime.now(timezone.utc)
 
     def snapshot(self, n_levels: int = 10):
         """Return top n bid/ask levels sorted correctly."""
@@ -103,12 +106,18 @@ class DOMBook:
     def record_features(self, n_levels: int = 10) -> dict:
         """Return a flat dict of ML-ready features from current book state."""
         with self._lock:
-            bids = sorted(self.bids.items(), reverse=True)[:n_levels]
-            asks = sorted(self.asks.items())[:n_levels]
             last  = self.last_price
             bb    = self.best_bid
             ba    = self.best_ask
             mid   = (bb + ba) / 2 if bb and ba else last
+            # Filter out crossed levels — stale bids above best_ask or asks below best_bid
+            # that weren't removed during fast price moves
+            if bb and ba:
+                bids = sorted(((p, s) for p, s in self.bids.items() if p < ba), reverse=True)[:n_levels]
+                asks = sorted((p, s) for p, s in self.asks.items() if p > bb)[:n_levels]
+            else:
+                bids = sorted(self.bids.items(), reverse=True)[:n_levels]
+                asks = sorted(self.asks.items())[:n_levels]
 
         row: dict = {
             "ts":        self.last_update.isoformat(),
@@ -315,7 +324,7 @@ def render(book: DOMBook, contract: str, n_levels: int = 10):
         b = bar(size, max_size, ch="▓")
         lines.append(f"  {GREEN}{size:>{col_w},.0f}  {b:<20}{RESET}  "
                      f"{GREEN}{price:^10.2f}{RESET}  "
-                     f"{DIM}{' '*20}  {' '*{col_w}}{RESET}")
+                     f"{DIM}{' '*20}  {' ' * col_w}{RESET}")
 
     lines.append("")
     lines.append(f"  {DIM}Total bid liquidity: "
@@ -448,26 +457,60 @@ def main():
             interval_minutes=args.record_interval,
         )
 
-    hub.start()
-    print("Waiting for initial DOM snapshot...")
-    time.sleep(3)   # let first batch of depth events arrive
+    # ── Connection loop — rebuilds hub with fresh token on disconnect ─────────
+    _stop = threading.Event()
+
+    def _run_hub():
+        nonlocal hub
+        while not _stop.is_set():
+            try:
+                token = client.login()
+                book.bids.clear()   # clear stale levels before fresh subscribe
+                book.asks.clear()
+                hub   = build_connection(token, contract_id, book, verbose=args.verbose)
+                hub.start()
+                time.sleep(3)   # let first batch of depth events arrive
+                # Block until the connection drops (signalrcore calls on_close / raises)
+                # We detect a dead connection by watching book.last_update stall
+                while not _stop.is_set():
+                    time.sleep(30)
+                    age = (datetime.now(timezone.utc) - book.last_update).total_seconds()
+                    if age > 120:
+                        print(f"[dom] No updates for {age:.0f}s — reconnecting with fresh token…")
+                        break
+                hub.stop()
+            except Exception as e:
+                print(f"[dom] Hub error: {e} — reconnecting in 10s…")
+                time.sleep(10)
+
+    hub_thread = threading.Thread(target=_run_hub, daemon=True)
+    hub_thread.start()
+    time.sleep(4)   # let first connection establish
 
     if recorder:
         recorder.start()
 
     try:
-        while True:
-            print(render(book, contract_name, n_levels=args.levels),
-                  end="", flush=True)
-            time.sleep(0.5)   # refresh twice per second
+        if args.record:
+            # Headless recording mode — no display, just block until killed
+            threading.Event().wait()
+        else:
+            while True:
+                print(render(book, contract_name, n_levels=args.levels),
+                      end="", flush=True)
+                time.sleep(0.5)   # refresh twice per second
     except KeyboardInterrupt:
         print("\nDisconnecting…")
     finally:
+        _stop.set()
         if recorder:
             recorder.stop()
-        hub.send("UnsubscribeContractMarketDepth", [contract_id])
-        hub.send("UnsubscribeContractQuotes",      [contract_id])
-        hub.stop()
+        try:
+            hub.send("UnsubscribeContractMarketDepth", [contract_id])
+            hub.send("UnsubscribeContractQuotes",      [contract_id])
+            hub.stop()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

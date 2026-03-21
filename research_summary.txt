@@ -1,6 +1,6 @@
 MES/MYM Systematic Signal Research — Journey Summary
 ======================================================
-Written: 2026-03-15  |  Updated: 2026-03-16
+Written: 2026-03-15  |  Updated: 2026-03-20 (3)
 
 
 STARTING POINT
@@ -358,6 +358,279 @@ at 5 bars this drops to ~34%.
 MAX_HOLD_MIN updated from 15 → 25 in both signal_monitor.py and trading_bot.py.
 
 
+MNQ ORB STRATEGY EVALUATION (2026-03-20)
+-----------------------------------------
+The momentum / 3σ continuation strategy was already known to not work for MNQ.
+As a separate investigation, the Opening Range Breakout (ORB) strategy (src/backtest_orb.py)
+was extended to support MNQ (mnq_hist_1min.csv, 678,804 RTH bars, 2019–2026) by adding
+it to the HIST symbol map.
+
+ORB results (LONG only, EOD hit rate / avg pts, n≈1,100–1,500 per period):
+  ORB  1 min: 56.1% hit / +6.59 pts avg
+  ORB  5 min: 56.1% hit / +5.23 pts avg
+  ORB 10 min: 55.7% hit / +4.85 pts avg
+  ORB 15 min: 56.6% hit / +5.70 pts avg
+  ORB 30 min: 57.7% hit / +5.68 pts avg
+  ORB 60 min: 57.3% hit / +5.14 pts avg
+
+Key findings:
+- Long signals show genuine edge across all ORB periods (55–58% EOD hit rate).
+- Short signals are consistently flat to negative (~46–48% hit rate) — the asymmetry
+  is persistent and would require long-only operation.
+- Medium-width ORBs outperform both narrow and wide (e.g., ORB 5/10/15 min medium
+  tier hits 57–59% EOD with +10–12 pts avg, vs wide ~55% / +0.5–5 pts).
+- Sigma-based stop (2σ), wide ORB, morning breakout (9:45–10:30 ET) is the standout
+  setup: EV = +0.44–0.52R, consistent across most years, with total backtested R of
+  +49R (5-min), +117R (10-min), +147R (15-min) over 7 years.
+- Tight stop at ORB high (breakout extension only) is consistently negative (EV
+  = -0.12 to -0.28R); wide stop or σ-stop required.
+- Decision: MES remains the focus. MNQ ORB longs show edge but the weak short side
+  limits practical utility, and the research focus stays on MES.
+
+
+PL-BASED CONFIDENCE SIZING (2026-03-20)
+----------------------------------------
+Research question: given that the 3σ signal fires 1–2 times per day, can we
+increase profitability without reducing signal frequency by sizing up on the
+"best" signals rather than filtering signals out?
+
+THEORETICAL GROUNDING
+The signed Path Length (PL) over the N 1-min bars preceding a signal is defined as:
+
+  PL = Σ(log_returns) / Σ|log_returns|  ∈ [-1, +1]
+
++1 = price moved perfectly in one direction over N bars (maximum trending).
+0  = fully choppy (as many up as down moves).
+-1 = perfectly trending against the signal direction.
+
+PL_aligned = PL × signal_direction, so positive values mean the 1-min flow
+leading into the signal was trending in the same direction as the signal.
+
+BACKTEST (src/backtest_pl_momentum.py)
+Standalone test of PL + M/N (fraction of strong bars) as a predictor on 1-min
+MES bars, sweeping N ∈ {10, 20, 30, 50}, MN thresh ∈ {0.50, 0.60},
+PL thresh ∈ {0.50, 0.70, 0.80}, forward window K = N // 10 bars.
+
+Best result: N=20, MN>0.60, PL>0.80 → EV = +0.39σ, but n=128 over the full
+history — too sparse for a standalone signal.
+
+FILTER TEST (src/backtest_pl_filter.py)
+Tested PL_aligned and M/N as filters on top of the production 3σ signal. Attached
+1-min features by fetching N 1-min bars ending at signal_ts − 5min for each trigger.
+
+Baseline (no filter): n=1,091 triggers, EV = +0.264σ.
+Best filtered combo (N=10, MN>0.50, PL>0.50): n=125 (0.06/day), EV = +0.81σ.
+
+Problem: filtered rate drops to ~0.06 signals/day — too sparse to be practical given
+only 1–2 base signals per day. Pure filtering was rejected.
+
+QUARTILE BREAKDOWN (src/backtest_pl_sizing.py, Analysis 1)
+PL_aligned quartile EVs across all 1,091 baseline triggers:
+  Q1 (PL ≤ +0.14):  EV = +0.24σ  (weakest)
+  Q2 (+0.14–+0.35): EV = +0.34σ
+  Q3 (+0.35–+0.56): EV = +0.10σ  (worst — "grind regimes that stall")
+  Q4 (PL > +0.56):  EV = +0.41σ  (best)
+
+The non-monotonic pattern (Q3 worse than Q1) undermines simple threshold filtering
+but does not affect a top-quartile sizing approach.
+
+CONFIDENCE SIZING (src/backtest_pl_sizing.py, Analysis 2)
+Keep all signals; trade 2× when PL_aligned ≥ threshold, 1× otherwise.
+
+Results at key thresholds:
+  PL ≥ +0.50 (top ~30%, n=323): +0.024σ/unit improvement, total +124R vs baseline +297R (+42%)
+  PL ≥ +0.556 (top 25%, n=273): +0.027σ/unit improvement, total +111R vs baseline +297R (+37%)
+
+The top-25% (PL ≥ +0.556) rule is positive in 7/8 years (only 2022 barely negative),
+providing strong year-by-year consistency. A round threshold of PL ≥ 0.50 was chosen
+for implementation: slightly more trades qualify, marginally better absolute R, and
+cleaner to describe.
+
+IMPLEMENTATION (2026-03-20)
+PL_N_BARS = 10 (1-min bars, same as the 5-min signal bar duration).
+PL_THRESH = 0.50 (top ~30% of signals).
+
+Both signal_monitor.py and trading_bot.py were updated:
+
+  fetch_1min_pl(client, contract_id, signal_bar_ts, direction):
+    Fetches PL_N_BARS + 5 1-min bars ending at signal_bar_ts from the API,
+    takes the last PL_N_BARS log returns, computes PL = Σr / Σ|r|, returns
+    PL × direction. Returns None on fetch error or insufficient data.
+
+  signal_monitor.py changes:
+    - Signal.pl_aligned field (float | None, set after signal fires)
+    - run_live(): calls fetch_1min_pl immediately after each new signal and
+      stores the result on the active_signal object
+    - build_signal_panel(): when pl_aligned ≥ PL_THRESH, displays a prominent
+      "⚡ 2× CONTRACTS  PL=+X.XX" row (bold yellow on dark red) and switches
+      the panel border to yellow; otherwise shows a dim "PL=+X.XX (1× size)" row
+    - LOG_FIELDS: added pl_aligned and contracts columns to logs/signals.csv
+
+  trading_bot.py changes:
+    - ActiveTrade.pl_aligned and ActiveTrade.contracts fields
+    - Main loop: computes PL after each new signal; sets sig["contracts"] = 2
+      when PL_aligned ≥ PL_THRESH, else 1
+    - place_signal(): uses sig["contracts"] for the size= API parameter;
+      log message includes pl=+X.XX, contracts=N, and [⚡ 2× SIZE] marker
+    - LOG_FIELDS: added pl_aligned and contracts columns to logs/bot_trades.csv
+
+Signal frequency is unchanged (all signals still fire); 2× sizing is applied to
+approximately 30% of signals based on the 1-min momentum context.
+
+
+REAL-TIME PL DISPLAY IN SIGNAL MONITOR (2026-03-20)
+----------------------------------------------------
+The 1-min PL is now computed and displayed continuously in the WATCHING panel
+of signal_monitor.py, refreshed every 30-second poll, so the trader can observe
+how the metric evolves throughout the session and build intuition for what values
+tend to precede strong signals.
+
+Display format: a signed [-1, +1] bar with:
+  - Red ░░░░░ region for PL -1.0 to -0.5 (left quarter)
+  - Dim ───── region for neutral -0.5 to +0.5
+  - Dim │ centre tick at PL = 0
+  - Green ░░░░░ region for PL +0.5 to +1.0 (right quarter)
+  - Bold █ marker at current PL position, coloured by region
+  - Numeric value coloured green (≥+0.50), red (≤-0.50), or white otherwise
+
+Implementation: InstrumentState.current_pl field updated via fetch_1min_pl()
+each poll cycle. The helper _pl_bar() in signal_monitor.py renders the bar
+as Rich markup segments.
+
+
+KAMA — INDEPENDENT REDISCOVERY OF PATH LENGTH (2026-03-20)
+-----------------------------------------------------------
+Perry Kaufman's "Efficiency Ratio" (1995, "Smarter Trading") is defined as:
+
+  ER = |net price change over N bars| / Σ|each bar's change|
+     = |Σ rᵢ| / Σ|rᵢ|  =  |PL|  (unsigned path length)
+
+The signed version (PL = Σrᵢ / Σ|rᵢ|) and its use as a directional signal
+strength metric and position sizing multiplier were arrived at independently.
+Kaufman used ER only to drive the smoothing speed of an adaptive moving average
+(KAMA); the signed directional form and confidence-sizing application are
+original extensions.
+
+Related concepts: Fractal Efficiency (same measure, different name in academic
+literature), Hurst exponent (same underlying question via rescaled range).
+The name "regime_pl" / "path length" used in this codebase is a cleaner
+description than "efficiency ratio."
+
+
+VWAP/AVWAP AS VISUAL CONTEXT (2026-03-20)
+------------------------------------------
+Anchored VWAP (AVWAP) is used in Bookmap for intraday session context.
+Analysis of 2026-03-20 MES session (6643 open → 6524 low → 6560 close):
+
+  - Session VWAP (9:30 ET anchor, yellow): declined from ~6630 to ~6597 by
+    end of day; price stayed 20-50 pts below it from noon onwards.
+  - Event AVWAP anchored at 11:23 spike (22,914 vol, day's high): bent
+    downward from anchor; price stayed below it for the entire afternoon.
+  - From ~14:00: price locked between the ±1σ and ±2σ lower bands of both
+    VWAPs simultaneously — the "trending channel" in VWAP terms. When price
+    holds in the outer band zone rather than oscillating back to centre, it
+    is a regime signal that this is a directional day.
+
+Recommended AVWAP setup for intraday MES trading:
+  1. Session VWAP from Globex open (~18:00 ET prior day) — overnight context
+  2. Session VWAP from NYSE open (9:30 ET) — primary intraday reference
+  3. Event AVWAP: anchor at the "Create VWAP (current time)" button at key
+     order-flow events visible in Bookmap (large liquidity cluster that holds,
+     a gap fill, a high-volume reversal bar)
+
+Bands: ±1σ (dashes) and ±2σ (dots). Most useful in the afternoon once
+sufficient volume has accumulated to stabilise the band width.
+
+Largest retracements during the 2026-03-20 13:00-15:30 downtrend:
+  15.75 pts (13:05), 12.00 pts (14:23), 11.25 pts (13:48), 10.25 pts (14:57)
+  Median retracement: ~10.75 pts. Each bounce failed below both VWAP lines.
+
+Traditional indicators that kept a short through the retracements:
+  Reliable:   VWAP (price 20-50 pts below all day), EMA 21 and EMA 50
+              (both sloping down, price never reclaimed either)
+  Noisy:      Parabolic SAR (flipped long on each retracement), RSI (hit 70+
+              on two bounces), MACD histogram (turned positive on retracements)
+
+EMA period selection via volatility: with σ = 2.73 pts/bar (100-bar window),
+N = (target_pts / σ)² → target 15 pts ≈ N=30, target 20 pts ≈ N=54. Fixed
+periods (21, 50) are conventional; principled selection uses current σ.
+KAMA adapts automatically and spent most of the 2026-03-20 afternoon at
+equivalent EMA periods of 36–73 bars (choppy grind), tightening to 17–18
+bars when the sell-off accelerated at 14:45–15:00.
+
+
+VWAP × PL COMBINED SIZING BACKTEST (2026-03-20)
+-------------------------------------------------
+Script: src/backtest_vwap_pl.py
+
+Hypothesis: session VWAP position (price above/below VWAP, direction-adjusted)
+provides independent information on top of PL_aligned for confidence sizing.
+
+vwap_aligned = (close - session_vwap) × direction > 0
+  → +1 if signal direction matches VWAP flow (long above VWAP, short below)
+  → 0  if signal is counter to VWAP flow
+
+Session VWAP resets at 9:30 ET; pre-market signals excluded (no VWAP reference).
+Coverage: 592 of 1,091 triggers have both PL and VWAP features (NYSE hours only).
+
+KEY FINDING: 91% of NYSE-hours signals already fire VWAP-aligned (537/592).
+The CSR filter (requiring ≥1.5σ prior momentum in signal direction) captures
+nearly the same information as VWAP position. Only 55 signals fired counter-VWAP.
+
+2×2 matrix results:
+  PL ≥ +0.50  AND VWAP aligned:     n=145  P(tgt)=39.3%  EV=+0.392σ
+  PL ≥ +0.50  AND VWAP NOT aligned: n=17   P(tgt)=52.9%  EV=+1.118σ  (n too small)
+  PL <  +0.50 AND VWAP aligned:     n=392  P(tgt)=34.2%  EV=+0.215σ
+  PL <  +0.50 AND VWAP NOT aligned: n=38   P(tgt)=15.8%  EV=-0.324σ  (worst cell)
+
+Sizing comparison (ΔEV per unit vs 1× baseline):
+  PL only → 2×:          +0.047σ/unit  (best)
+  PL AND VWAP → 2×:      +0.028σ/unit
+  VWAP only → 2×:        +0.006σ/unit
+  PL OR VWAP → 2×:       +0.019σ/unit
+
+Combined PL+VWAP rule loses 19R vs PL-only across 8 years; worse in 6/8 years.
+
+CONCLUSION: VWAP adds no independent mechanical edge over PL+CSR. The CSR
+filter is a more precise, timescale-appropriate version of the same concept
+(VWAP asks "above/below session mean?"; CSR asks "directional momentum in the
+last 20–40 min aligned with this bar?"). VWAP remains valuable as a visual
+discretionary tool (Bookmap/TradingView) for reading session narrative, but
+not as a per-signal filter or sizing trigger.
+
+Most actionable finding: the low-PL + counter-VWAP combination (n=38,
+EV=-0.324σ) is the highest-risk signal type — both independent measures
+pointing against the trade. Worth particular scepticism in live trading.
+
+
+FUTURE RESEARCH — DATA ACCUMULATION REQUIRED
+---------------------------------------------
+Two datasets are being accumulated that will enable new research directions
+once sufficient history exists (estimated 6-12 months):
+
+5-SECOND BAR DATA (src/bar_recorder.py, LaunchAgent running continuously)
+  - Does the 3σ continuation signal have an analogue at 5-second timescales?
+    (5-sec bar moves 3σ predicting the next 30 seconds)
+  - Bar alignment study: does the clock-boundary effect hold at 1-min / 5-sec?
+  - Entry refinement: use 5-sec bars in the first 30 seconds after a 5-min
+    signal to confirm momentum before committing, rather than entering at
+    the 5-min bar close blindly.
+
+DOM RECORDER DATA (src/dom_client.py, LaunchAgent running continuously)
+  - S/R identification: large resting orders ("walls") near target price at
+    signal time as a predictor of reduced target-hit probability.
+  - Book imbalance at signal time as an additional sizing input alongside
+    PL_aligned — bid-side imbalance + 3σ long bar + high PL = highest
+    conviction combination.
+  - Pre-signal book dynamics: does liquidity being pulled on one side in
+    the 5 minutes before a signal predict the signal direction or strength?
+
+COMBINED (5-sec + DOM)
+  - 5-sec momentum burst at the moment a 5-min signal fires, confirmed by
+    book imbalance, with no wall near the target = three independent data
+    sources at different timescales pointing the same direction.
+
+
 WHAT REMAINS OPEN
 ------------------
 - MYM-specific backtest at the final parameters has not been run in isolation.
@@ -367,3 +640,4 @@ WHAT REMAINS OPEN
   accumulate real signal outcomes against the backtest predictions.
 - Dynamic CSR window out-of-sample validation: the two-tier rule was selected on
   in-sample data; live performance will provide the first true out-of-sample test.
+- DOM + 5-sec bar research: revisit once 6-12 months of data has accumulated.

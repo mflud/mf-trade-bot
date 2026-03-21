@@ -65,7 +65,18 @@
       "Bash(ls *.csv 2>/dev/null; ls /Users/marek/mf-trade-bot/*.csv 2>/dev/null)",
       "Bash(ls /Users/marek/mf-trade-bot/*.zip 2>/dev/null; ls /Users/marek/mf-trade-bot/*.gz 2>/dev/null)",
       "Bash(unzip -l GLBX-20260316-3SWPQEFJ8S.zip)",
-      "Bash(python src/backtest_csr_percentile.py 2>&1)"
+      "Bash(python src/backtest_csr_percentile.py 2>&1)",
+      "Bash(launchctl list:*)",
+      "Bash(launchctl stop:*)",
+      "Bash(launchctl unload:*)",
+      "Bash(kill 94334 94369 94383 94320 94319 94318 94316 2>/dev/null; echo \"cleaned up old verbose processes\")",
+      "Bash(find /Users/marek/mf-trade-bot -name \"*.csv\" -newer /Users/marek/mf-trade-bot/logs/dom_recorder.pid 2>/dev/null | head -20)",
+      "Bash(python3 -c \"\nimport csv\nwith open\\('/Users/marek/mf-trade-bot/mes_dom_snapshots.csv'\\) as f:\n    reader = csv.DictReader\\(f\\)\n    rows = list\\(reader\\)\n    last = rows[-1]\n    print\\('last:', last['last']\\)\n    print\\('best_bid:', last['best_bid']\\)\n    print\\('best_ask:', last['best_ask']\\)\n    print\\(\\)\n    for i in range\\(1, 6\\):\n        print\\(f'bid_price_{i}={last[f\\\\\"bid_price_{i}\\\\\"]}, bid_size_{i}={last[f\\\\\"bid_size_{i}\\\\\"]}   ask_price_{i}={last[f\\\\\"ask_price_{i}\\\\\"]}, ask_size_{i}={last[f\\\\\"ask_size_{i}\\\\\"]}'\\)\n\")",
+      "Bash(python3 - << 'EOF'\nimport re\n\nwith open\\('/tmp/dom_verbose.log'\\) as f:\n    lines = f.readlines\\(\\)\n\nlast_bid = last_ask = last_price = None\nfor line in lines[:300]:\n    if '[quote]' in line:\n        m = re.search\\(r\"bestBid['\\\\\"]:\\\\s*\\([0-9.]+\\)\", line\\)\n        m2 = re.search\\(r\"bestAsk['\\\\\"]:\\\\s*\\([0-9.]+\\)\", line\\)\n        if m: last_bid = float\\(m.group\\(1\\)\\)\n        if m2: last_ask = float\\(m2.group\\(1\\)\\)\n    if '[depth]' in line and last_bid and last_ask:\n        # Find non-zero, non-reset entries\n        entries = re.findall\\(r\"\\\\{'price': \\([0-9.]+\\), 'volume': \\([0-9]+\\)[^}]*'type': \\([0-9]+\\)\", line\\)\n        for p, v, t in entries[:8]:\n            p, v, t = float\\(p\\), int\\(v\\), int\\(t\\)\n            if v > 0 and t in \\(3, 4\\):\n                side = 'BID' if t==4 else 'ASK'\n                where = 'ABOVE' if p > last_ask else \\('BELOW' if p < last_bid else 'INSIDE'\\)\n                print\\(f\"type={t}={side}  price={p}  bid/ask={last_bid}/{last_ask}  → {where} market\"\\)\nEOF)",
+      "Bash(launchctl load:*)",
+      "Bash(python3 -c \"\nimport csv\nwith open\\('/Users/marek/mf-trade-bot/mes_dom_snapshots.csv'\\) as f:\n    r = list\\(csv.DictReader\\(f\\)\\)\nlast = r[-1]\nprint\\(f'last={last[\\\\\"last\\\\\"]}  best_bid={last[\\\\\"best_bid\\\\\"]}  best_ask={last[\\\\\"best_ask\\\\\"]}'\\)\nfor i in range\\(1,4\\):\n    print\\(f'  bid_price_{i}={last[f\\\\\"bid_price_{i}\\\\\"]}  ask_price_{i}={last[f\\\\\"ask_price_{i}\\\\\"]}'\\)\nprint\\(f'rows: {len\\(r\\)}'\\)\n\")",
+      "Read(//Users/marek/.claude/**)",
+      "Bash(python3 -c \"\nimport json\npath = '/Users/marek/.claude/settings.json'\nwith open\\(path\\) as f:\n    s = json.load\\(f\\)\nallows = s.setdefault\\('permissions', {}\\).setdefault\\('allow', []\\)\nfor entry in ['Bash\\(*\\)', 'Read\\(*\\)', 'Write\\(*\\)', 'Edit\\(*\\)', 'Glob\\(*\\)', 'Grep\\(*\\)']:\n    if entry not in allows:\n        allows.insert\\(0, entry\\)\nwith open\\(path, 'w'\\) as f:\n    json.dump\\(s, f, indent=2\\)\nprint\\('done'\\)\n\")"
     ]
   }
 }

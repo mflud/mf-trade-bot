@@ -66,6 +66,9 @@ VOL_RATIO_MIN = 1.5
 MAX_HOLD_MIN  = 25     # force-close after this many minutes
 POLL_SECONDS  = 30
 
+PL_N_BARS = 10    # 1-min bars to look back for PL computation
+PL_THRESH = 0.50  # PL_aligned ≥ this → 2× sizing
+
 ET = ZoneInfo("America/New_York")
 
 LOG_PATH = Path("logs/bot_trades.csv")
@@ -73,6 +76,7 @@ LOG_FIELDS = [
     "fired_at", "resolved_at", "symbol", "direction",
     "est_entry", "fill_price", "target", "stop",
     "sigma_pts", "scaled", "vol_ratio", "csr",
+    "pl_aligned", "contracts",
     "outcome", "pnl_pts", "pnl_sigma",
 ]
 
@@ -134,6 +138,8 @@ class ActiveTrade:
     vol_ratio:   float
     csr:         float
     fired_at:    datetime
+    pl_aligned:  float | None = None
+    contracts:   int = 1
     order_id:    int | None = None
     fill_price:  float | None = None
     expires_at:  datetime = field(init=False)
@@ -189,6 +195,8 @@ def _log_trade(trade: ActiveTrade, outcome: str, exit_price: float, now: datetim
         "scaled":      round(trade.scaled, 4),
         "vol_ratio":   round(trade.vol_ratio, 4),
         "csr":         round(trade.csr, 4),
+        "pl_aligned":  round(trade.pl_aligned, 4) if trade.pl_aligned is not None else "",
+        "contracts":   trade.contracts,
         "outcome":     outcome,
         "pnl_pts":     round(pnl_pts, 4),
         "pnl_sigma":   round(pnl_pts / trade.sigma_pts, 4) if trade.sigma_pts else 0.0,
@@ -229,6 +237,39 @@ def get_mom_bars(gk_ann_vol: float, csr_vol_windows: list) -> int:
         if gk_ann_vol < upper:
             return bars
     return csr_vol_windows[-1][1]
+
+
+# ── PL confidence sizing ─────────────────────────────────────────────────────
+
+def fetch_1min_pl(client: TopstepClient, contract_id: str,
+                  signal_bar_ts: datetime, direction: int) -> float | None:
+    """
+    Fetch PL_N_BARS 1-min bars ending just before the signal 5-min bar and
+    return PL_aligned = (signed path length) × direction.
+    +1 = 1-min flow perfectly aligned; ≥ PL_THRESH → 2× sizing.
+    Returns None on fetch error or insufficient data.
+    """
+    end   = signal_bar_ts
+    start = end - timedelta(minutes=PL_N_BARS + 5)
+    try:
+        raw = client.get_bars(
+            contract_id=contract_id, start=start, end=end,
+            unit=TopstepClient.MINUTE, unit_number=1,
+            limit=PL_N_BARS + 5,
+        )
+        raw = list(reversed(raw))
+    except Exception as e:
+        log.debug(f"fetch_1min_pl error for {contract_id}: {e}")
+        return None
+    if len(raw) < PL_N_BARS + 1:
+        return None
+    closes   = np.array([b["c"] for b in raw[-(PL_N_BARS + 1):]])
+    rets     = np.log(closes[1:] / closes[:-1])
+    sum_absr = float(np.abs(rets).sum())
+    if sum_absr == 0:
+        return None
+    pl = float(rets.sum()) / sum_absr
+    return pl * direction
 
 
 # ── Signal evaluation (identical logic to signal_monitor.py) ────────────────
@@ -335,13 +376,20 @@ def place_signal(client: TopstepClient, state: InstrumentState,
     side         = TopstepClient.BID if direction == 1 else TopstepClient.ASK
     dir_str      = "LONG" if direction == 1 else "SHORT"
 
+    n_contracts = sig.get("contracts", 1)
+    pl_aligned  = sig.get("pl_aligned")
+
     trade = ActiveTrade(
         instrument=inst, contract_id=state.contract_id,
         direction=direction, est_entry=sig["entry"],
         sigma_pts=sigma_pts, scaled=sig["scaled"],
         vol_ratio=sig["vol_ratio"], csr=sig["csr"],
         fired_at=sig["bar_ts"],
+        pl_aligned=pl_aligned, contracts=n_contracts,
     )
+
+    pl_note = f"  pl={pl_aligned:+.2f}" if pl_aligned is not None else ""
+    size_note = f"  [⚡ 2× SIZE]" if n_contracts == 2 else ""
 
     if paper:
         log.info(
@@ -349,12 +397,13 @@ def place_signal(client: TopstepClient, state: InstrumentState,
             f"stop={stop_ticks}t ({inst.stop_sigma}σ)  "
             f"target={target_ticks}t ({inst.target_sigma}σ)  "
             f"scaled={sig['scaled']:+.2f}σ  csr={sig['csr']:+.2f}σ"
+            f"{pl_note}  contracts={n_contracts}{size_note}"
         )
     else:
         resp = client.place_order(
             account_id=account_id,
             contract_id=state.contract_id,
-            side=side, size=1,
+            side=side, size=n_contracts,
             order_type=TopstepClient.ORDER_MARKET,
             stop_loss_ticks=stop_ticks,
             take_profit_ticks=target_ticks,
@@ -365,6 +414,7 @@ def place_signal(client: TopstepClient, state: InstrumentState,
             f"ORDER PLACED  {inst.symbol} {dir_str}  order_id={trade.order_id}  "
             f"entry≈{sig['entry']:.2f}  stop={stop_ticks}t  target={target_ticks}t  "
             f"scaled={sig['scaled']:+.2f}σ  csr={sig['csr']:+.2f}σ"
+            f"{pl_note}  contracts={n_contracts}{size_note}"
         )
 
     state.active_trade = trade
@@ -405,7 +455,15 @@ def handle_active_trade(client: TopstepClient, state: InstrumentState,
     if pos is None:
         # Position is gone — brackets closed it; cancel any residual OCO orders
         exit_price = _get_exit_price(client, account_id, trade, now)
-        outcome    = _classify_outcome(trade, exit_price)
+        if exit_price is not None:
+            # Actual fill from trade history — classify by proximity to brackets
+            if abs(exit_price - trade.target_price()) <= abs(exit_price - trade.stop_price()):
+                outcome = "TARGET"
+            else:
+                outcome = "STOPPED"
+        else:
+            # Lookup failed — infer from bar highs/lows (accurate to ~1 tick)
+            outcome, exit_price = _classify_outcome_from_bars(trade, state.bars)
         _log_trade(trade, outcome, exit_price, now)
         state.active_trade = None
         try:
@@ -446,11 +504,14 @@ def handle_active_trade(client: TopstepClient, state: InstrumentState,
 
 
 def _get_exit_price(client: TopstepClient, account_id: int,
-                    trade: ActiveTrade, now: datetime) -> float:
-    """Try to get actual exit price from trade history; fall back to bar close."""
+                    trade: ActiveTrade, now: datetime) -> float | None:
+    """
+    Try to get actual exit price from trade history.
+    Returns None if lookup fails or returns nothing useful — caller should
+    fall back to bracket prices rather than fill_price to avoid pnl=0.
+    """
     try:
         trades = client.search_trades(account_id, trade.fired_at, now)
-        # Closing trade: same contract, after signal fired, on opposite side
         closing = [
             t for t in trades
             if t.get("contractId") == trade.contract_id
@@ -458,19 +519,39 @@ def _get_exit_price(client: TopstepClient, account_id: int,
                 > trade.fired_at
         ]
         if closing:
-            return float(closing[-1].get("price", trade.fill_price or trade.est_entry))
+            price = float(closing[-1].get("price", 0))
+            if price > 0:
+                return price
     except Exception as e:
         log.warning(f"Could not fetch trade history for exit price: {e}")
-    return trade.fill_price or trade.est_entry
+    return None
 
 
-def _classify_outcome(trade: ActiveTrade, exit_price: float) -> str:
-    """Classify as TARGET or STOPPED based on which bracket is closer to exit."""
-    tgt_dist = abs(exit_price - trade.target_price())
-    stp_dist = abs(exit_price - trade.stop_price())
-    if tgt_dist <= stp_dist:
-        return "TARGET"
-    return "STOPPED"
+def _classify_outcome_from_bars(trade: ActiveTrade, bars: list[Bar]) -> tuple[str, float]:
+    """
+    Infer whether a bracket-closed trade hit target or stop by scanning bar
+    data since the signal fired.  Returns (outcome, exit_price) using the
+    bracket price as the exit, which is accurate to within one tick for
+    exchange-managed OCO orders.
+    """
+    for bar in bars:
+        if bar.ts <= trade.fired_at:
+            continue
+        if trade.direction == 1:   # long
+            if bar.high >= trade.target_price():
+                return "TARGET",  trade.target_price()
+            if bar.low  <= trade.stop_price():
+                return "STOPPED", trade.stop_price()
+        else:                      # short
+            if bar.low  <= trade.target_price():
+                return "TARGET",  trade.target_price()
+            if bar.high >= trade.stop_price():
+                return "STOPPED", trade.stop_price()
+    # No bracket found in available bars — classify by which is closer to last close
+    last_close = bars[-1].close if bars else (trade.fill_price or trade.est_entry)
+    if abs(last_close - trade.target_price()) <= abs(last_close - trade.stop_price()):
+        return "TARGET",  trade.target_price()
+    return "STOPPED", trade.stop_price()
 
 
 # ── Main loop ────────────────────────────────────────────────────────────────
@@ -555,6 +636,10 @@ def run(account_id: int | None, paper: bool):
                     last_bar_ts = state.bars[-1].ts if state.bars else None
                     if sig and last_bar_ts != state.last_evaluated_ts:
                         state.last_evaluated_ts = last_bar_ts
+                        pl = fetch_1min_pl(client, state.contract_id,
+                                           sig["bar_ts"], sig["direction"])
+                        sig["pl_aligned"] = pl
+                        sig["contracts"]  = 2 if (pl is not None and pl >= PL_THRESH) else 1
                         place_signal(client, state, sig, account_id, paper)
                     elif last_bar_ts != state.last_evaluated_ts:
                         state.last_evaluated_ts = last_bar_ts

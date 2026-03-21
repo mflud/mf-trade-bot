@@ -79,7 +79,7 @@ while true; do
     log "── Attempt $attempt ─────────────────────────────────────────────"
 
     # Run; capture exit code without triggering set -e
-    python src/dom_client.py $DOM_ARGS >> "$LOG_FILE" 2>&1 || true
+    python -u src/dom_client.py $DOM_ARGS >> "$LOG_FILE" 2>&1 || true
 
     exit_code=$?
     end_ts=$(date +%s)
