@@ -1,13 +1,13 @@
 MES/MYM Systematic Signal Research — Journey Summary
 ======================================================
-Written: 2026-03-15  |  Updated: 2026-03-20 (3)
+Written: 2026-03-15  |  Updated: 2026-03-23
 
 
 STARTING POINT
 --------------
-Goal: identify a repeatable, quantifiable signal on MES (Micro E-mini S&P 500) and
-MYM (Micro Dow) futures that predicts short-term price continuation, suitable for
-automated execution on a Topstep practice account.
+Goal: identify a repeatable, quantifiable signal on MES (Micro E-mini S&P 500),
+MYM (Micro Dow), and M2K (Micro E-mini Russell 2000) futures that predicts short-term
+price continuation, suitable for automated execution on a Topstep practice account.
 
 Data source: TopstepX REST API (api.topstepx.com), via a custom Python client
 (src/topstep_client.py). All analysis used 5-minute bars fetched live.
@@ -631,13 +631,225 @@ COMBINED (5-sec + DOM)
     sources at different timescales pointing the same direction.
 
 
+M2K EXPANSION (2026-03-21)
+--------------------------
+M2K (Micro E-mini Russell 2000, $5/pt, $0.10 tick) was added as a third instrument.
+Full 1-min history 2019-05-05 → 2026-03-18 extracted from Databento GLBX.MDP3 file
+via src/convert_databento.py (which now also supports NKD via second_friday expiry).
+
+CONTINUATION SIGNAL ON M2K (src/backtest_pl_sizing.py --sym M2K)
+  Baseline EV (all hours): -0.004σ (n=572) — near zero, masking strong session splits.
+  Session breakdown:
+    NYSE  (9:30–16:00 ET): EV = -0.013σ  n=338  (PL≥0 rescues to +0.107σ)
+    Euro  (7:00–13:30 UTC): EV = +0.163σ  n=145  (best session, no PL needed)
+    Asia  (0:00–6:30 UTC):  EV = -0.206σ  n=76   (poor; PL≥0.5 rescues n=24 only)
+
+  Key insight: M2K's 3σ signal requires PL as a near-mandatory filter, not a
+  fine-tuning tool. PL quartile EVs within NYSE hours:
+    Q1 (PL ≤ +0.10):  EV = -0.484σ  ← garbage tier
+    Q2 (+0.10–+0.28): EV = +0.017σ
+    Q3 (+0.28–+0.49): EV = +0.334σ  ← best quartile
+    Q4 (PL > +0.49):  EV = +0.086σ
+
+  The Euro session (pre-NYSE open) is the strongest M2K continuation window —
+  Russell trends well during institutional positioning ahead of the US open.
+  PL≥0.5 within Euro raises EV to +0.406σ (n=37).
+
+  M2K configuration: same 3σ + CSR + PL parameters as MES. Blackout 08:00–09:00 ET
+  conditional (same as MES). tick_size=0.10, point_value=5.00.
+
+NKD EVALUATION AND ABANDONMENT
+  NKD (E-mini Nikkei 225 dollar-denominated, CME) was initially considered.
+  Despite having 3.5M bars (2010–2026), the CME-calibrated signal parameters produced
+  only 22 signals total — the CSR threshold and vol filters eliminate nearly all bars
+  because NKD's primary liquidity is during US hours (13:00–17:00 UTC = 09:00–13:00 ET),
+  not Asian hours as expected. Additionally NKD is a full-size mini (not a micro), making
+  it too risky to trade on a practice account. NKD was dropped from the instrument set.
+
+M2K ORB STRATEGY (src/backtest_orb.py --sym M2K)
+  Same ORB methodology as MES. 679,265 RTH bars (2019–2026), 3,001 sessions.
+
+  Best setup: Wide ORB + morning breakout (9:45–10:30 ET) + σ-based stop/target.
+  "Wide" defined as top tertile of ORB width for each period.
+
+  Sigma-based stop (2σ), wide ORB, morning window EV at 2σ target:
+    ORB  5 min (wide > 9.9 pts):   n=135  EV=+0.644R  Total 7yr = +87.0R
+    ORB 10 min (wide > 12.5 pts):  n=179  EV=+0.650R  Total 7yr = +115.3R
+    ORB 15 min (wide > 14.3 pts):  n=280  EV=+0.612R  Total 7yr = +170.3R
+    ORB 30 min (wide > 18.1 pts):  n=206  EV=+0.456R  Total 7yr = +92.0R
+
+  M2K ORB outperforms MES ORB in the morning window (MES ~+0.3–0.4R; M2K +0.61–0.65R).
+  Russell 2000 trends more cleanly after opening range resolution — more momentum-driven
+  than S&P 500. Wide ORB longs in the morning are the strongest cell; in MES the wide
+  tier underperformed.
+
+  Power hour (13:30–16:00 ET) is marginal: 2σ target EV = +0.15–0.39R depending on
+  period. Worth monitoring but secondary to the morning setup.
+
+  Tight stop (at ORB high = breakout extension only) is consistently negative
+  (-0.08 to -0.38R) — same finding as MES. Σ-stop required.
+
+  M2K ORB parameters adopted:
+    ORB_BARS = 3  (3 × 5-min = 15-min range, same as MES)
+    orb_width_min = 14.30 pts  (wide tertile for 15-min M2K ORB)
+    stop = 2σ, target = 2σ  (same as MES)
+    windows: Morning 9:45–10:30 ET, Power hr 13:30–16:00 ET  (same as MES)
+
+PRODUCTION UPDATES (2026-03-21)
+  signal_monitor.py:
+    - M2K added as third instrument panel (same 3σ + PL display as MES/MYM)
+    - ORB panel enabled for M2K (orb_enabled=True, orb_width_min=14.30)
+    - ORB parameters made per-instrument: orb_enabled and orb_width_min fields
+      added to InstrumentConfig; ORB_WIDTH_MIN global replaced by state.cfg.orb_width_min
+    - ORB gate changed from symbol == "MES" to cfg.orb_enabled
+
+  trading_bot.py:
+    - M2K added to INSTRUMENTS (tick_size=0.10, point_value=5.00, orb_enabled=True)
+    - Full ORB execution added for both MES and M2K:
+        OrbSignal, OrbState, ActiveOrbTrade dataclasses
+        evaluate_orb(), place_orb_signal(), handle_active_orb_trade()
+        ORB trades logged to logs/orb_trades.csv (separate from bot_trades.csv)
+    - Position guard: bot won't enter ORB trade if continuation trade is open,
+      and won't enter continuation trade if ORB trade is open
+    - _get_exit_price() unified into a single function used by both trade types
+
+  convert_databento.py:
+    - Added M2K (third_friday expiry) and NKD (second_friday expiry) to instrument map
+    - Added --sym flag to extract specific instruments from a combined DBN file
+
+
+M2K EURO-SESSION DEEP DIVE (2026-03-21)
+-----------------------------------------
+Script: src/backtest_hours.py --sym M2K, plus inline CSR sweep and PL quartile analysis.
+
+CSR WINDOW SWEEP WITHIN EURO HOURS (n=145 baseline at CSR=8):
+  CSR=4:  n=103  EV=+0.161σ  (slightly fewer signals, nearly same EV)
+  CSR=8:  n=145  EV=+0.163σ  ← optimal, confirmed
+  CSR=10: n=161  EV=+0.108σ  (wider window degrades)
+  CSR=12: n=176  EV=+0.073σ  (degrading further)
+  CSR=16: n=194  EV=+0.044σ  (nearly no filter)
+Conclusion: CSR=8 is confirmed optimal for the Euro session. Shorter windows admit
+fewer signals but don't improve EV meaningfully; wider windows let in noise.
+
+PL QUARTILE BREAKDOWN (Euro session, CSR=8, n=145):
+  Q1 (PL ≤ +0.14):  EV = +0.152σ  (n=36)
+  Q2 (+0.14–+0.33): EV = +0.223σ  (n=37)
+  Q3 (+0.33–+0.50): EV = -0.057σ  ← worst quartile (grinding/stalling regimes)
+  Q4 (PL > +0.50):  EV = +0.333σ  (n=36)  ← best
+Non-monotonic pattern: Q3 underperforms Q1 (same as NYSE-hours finding). Q4 is
+cleanly the best cell.
+
+PL FILTER SWEEP (Euro):
+  No filter (PL≥-1.0):  n=145 (100%)  EV=+0.163σ
+  PL≥0.0:               n=125 (86%)   EV=+0.205σ  (+0.043σ lift)
+  PL≥0.25:              n=100 (69%)   EV=+0.241σ  (+0.078σ lift)
+  PL≥0.50:              n=38  (26%)   EV=+0.405σ  (+0.243σ lift)
+  PL≥0.75:              n=13  (9%)    EV=+0.453σ  (n too small)
+
+YEAR-BY-YEAR (Euro, no PL filter):
+  2020, 2021, 2023, 2025: positive EV
+  2022, 2024: negative EV
+Breadth concern: only 4/6 full years positive — Euro signal is real but not
+dominant in every regime.
+
+TAKEAWAY: For Euro-hours M2K signals, PL≥0.50 lifts EV from +0.163σ to +0.405σ
+while keeping 26% of signals (≈38/145). This is consistent with using PL≥0.50
+as the 2× sizing trigger (same threshold as MES). No parameter changes needed.
+
+
+MES vs M2K CROSS-INSTRUMENT CORRELATION (2026-03-21)
+------------------------------------------------------
+Script: src/cross_instrument_corr.py
+Period: 2019-05-05 – 2026-03-12  |  Aligned 5-min bars: 374,184
+
+OVERALL 5-MIN RETURN CORRELATION
+  r = 0.6651  — moderately correlated (compare: MES–MNQ = 0.907, MES–MYM = 0.899)
+
+BY SESSION:
+  NYSE:  n=134,966  r=0.7772  (highest — both instruments respond to same US data)
+  Euro:  n=113,864  r=0.6033  (lower — M2K follows EU small-cap flow more independently)
+  Asia:  n=81,221   r=0.5105  (lowest — M2K overnight less connected to S&P)
+  Other: n=44,133   r=0.4793
+
+ROLLING 90-DAY CORRELATION (window≈7,020 bars):
+  Min=0.1437  Max=0.9337  Mean=0.6788
+  Wide range shows regime-dependence: correlation collapses in risk-off or
+  sector-rotation periods (2023–2024 averaged 0.43–0.36) and spikes during
+  macro shocks when "all equities = one trade" (2020, 2022 ≈ 0.82–0.84).
+
+BY YEAR:
+  2019: 0.7555    2020: 0.8269    2021: 0.7376    2022: 0.8410
+  2023: 0.4340    2024: 0.3591 ← lowest (Russell diverged from S&P; value vs growth)
+  2025: 0.6283    2026: 0.8083
+
+DIVERSIFICATION ANALYSIS (equal-weight 50/50 combo):
+  σ_MES   = 0.000823/bar
+  σ_M2K   = 0.001389/bar  (M2K is ~69% more volatile per bar)
+  σ_combo = 0.001016/bar
+  Diversification ratio: 0.9184  (≈8% vol reduction vs simple average)
+  Return direction agreement: 83.86%  (random = 50%)
+
+SIGNAL CO-OCCURRENCE IMPLICATION:
+  With r=0.67 overall and 84% return-direction agreement, MES and M2K signals
+  are moderately correlated. Key implications:
+  1. Do NOT size up on both instruments simultaneously — a period when MES fires
+     a strong continuation signal is very likely to see M2K do the same. Double
+     positions in both is effectively 2× exposure to the same macro move.
+  2. During 2023–2024 (r=0.36–0.43), MES and M2K show meaningful divergence —
+     these are regimes where M2K provides real diversification vs the S&P.
+  3. The Euro and Asia sessions (r=0.50–0.60) offer better diversification than
+     NYSE hours. Euro-session M2K signals are partly driven by independent
+     small-cap institutional flow — less overlap with MES.
+  4. M2K's extra volatility (σ_M2K ≈ 1.69× σ_MES at 5-min) means per-signal
+     dollar P&L variance is larger despite the same $5/pt contract size as MES.
+
+RECOMMENDATION: Track both instruments but treat same-session co-firing signals
+as correlated risk. The strongest diversification case for M2K is Euro-session
+signals on days when MES is flat / not signalling.
+
+
+ORB STRATEGY — LIVE CONFIGURATION SUMMARY (2026-03-23)
+-------------------------------------------------------
+Records the high/low of the first 15 minutes of the RTH session (9:30–9:45 ET,
+3 × 5-min bars). If price closes above the ORB high in a valid window, fires a
+LONG entry. Short side not implemented — upside breakouts only.
+
+Entry filter — ORB width must be "wide" (wide tertile cutoff from backtest):
+  MES: ≥ 15.25 pts
+  M2K: ≥ 14.30 pts
+  MYM: orb_enabled=True but orb_width_min=0 (no filter; monitoring only)
+
+Trade levels (based on current σ_pts at time of breakout):
+  Target: entry + 2σ
+  Stop:   entry − 2σ
+  EV:     +0.61R (from backtest)
+
+Fire windows (ET) — one trade per window per day:
+  Morning:  9:45 – 10:30
+  Power hr: 13:30 – 16:00
+
+Fixed parameters (hardcoded in signal_monitor.py / trading_bot.py):
+  Range period: 15 min (ORB_BARS=3 × 5-min)
+  Stop:         2.0σ  (ORB_STOP_SIG)
+  Target:       2.0σ  (ORB_TGT_SIG)
+  Max hold:     shared MAX_HOLD_MIN with the continuation strategy (25 min)
+  Direction:    LONG only
+  Instruments:  MES and M2K active; MYM enabled but unfiltered
+
+ORB results used to set parameters (from backtest_orb.py, 7-year history):
+  MES 15-min wide ORB, morning, 2σ stop/target: EV ≈ +0.35–0.44R
+  M2K 15-min wide ORB, morning, 2σ stop/target: EV ≈ +0.61R  Total +170R
+
+
 WHAT REMAINS OPEN
 ------------------
-- MYM-specific backtest at the final parameters has not been run in isolation.
 - 5-second bar analysis: insufficient data yet; revisit after several weeks of
   continuous recording.
-- Live signal performance tracking: bot trades logged to logs/bot_trades.csv will
-  accumulate real signal outcomes against the backtest predictions.
+- Live signal performance tracking: bot trades logged to logs/bot_trades.csv and
+  logs/orb_trades.csv will accumulate real signal outcomes against backtest predictions.
 - Dynamic CSR window out-of-sample validation: the two-tier rule was selected on
   in-sample data; live performance will provide the first true out-of-sample test.
 - DOM + 5-sec bar research: revisit once 6-12 months of data has accumulated.
+- Co-firing position guard: consider adding logic to trading_bot.py to reduce
+  M2K size (or skip) when both MES and M2K signal in the same direction within
+  the same session, given the 0.67 correlation (particularly at NYSE hours r=0.78).

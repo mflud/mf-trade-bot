@@ -37,6 +37,7 @@ HIST = {
     "MES": "mes_hist_1min.csv",
     "MNQ": "mnq_hist_1min.csv",
     "MYM": "mym_hist_1min.csv",
+    "M2K": "m2k_hist_1min.csv",
 }
 
 

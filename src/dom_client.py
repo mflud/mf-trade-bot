@@ -19,8 +19,9 @@ import os
 import sys
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, time as dtime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from signalrcore.hub_connection_builder import HubConnectionBuilder
@@ -31,6 +32,21 @@ from topstep_client import TopstepClient
 load_dotenv()
 
 MARKET_HUB_BASE = "https://rtc.topstepx.com/hubs/market"
+
+_CT = ZoneInfo("America/Chicago")
+
+def is_cme_weekend_closure() -> bool:
+    """Return True during CME Globex weekend closure: Fri 16:00 CT – Sun 17:00 CT."""
+    now_ct = datetime.now(_CT)
+    wd = now_ct.weekday()   # 0=Mon … 4=Fri, 5=Sat, 6=Sun
+    t  = now_ct.time()
+    if wd == 4 and t >= dtime(16, 0):   # Friday after 4 PM CT
+        return True
+    if wd == 5:                          # All of Saturday
+        return True
+    if wd == 6 and t < dtime(17, 0):    # Sunday before 5 PM CT
+        return True
+    return False
 
 
 # ── DOM state ─────────────────────────────────────────────────────────────────
@@ -463,6 +479,16 @@ def main():
     def _run_hub():
         nonlocal hub
         while not _stop.is_set():
+            if is_cme_weekend_closure():
+                now_ct = datetime.now(_CT)
+                print(f"[dom] CME weekend closure — pausing until Sunday 17:00 CT "
+                      f"(now {now_ct.strftime('%a %H:%M %Z')})")
+                # Sleep 5 min at a time, checking stop_event
+                for _ in range(300):
+                    if _stop.is_set():
+                        return
+                    time.sleep(1)
+                continue
             try:
                 token = client.login()
                 book.bids.clear()   # clear stale levels before fresh subscribe

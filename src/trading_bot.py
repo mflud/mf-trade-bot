@@ -1,5 +1,5 @@
 """
-Automated trading bot for the 3σ MES/MYM continuation signal.
+Automated trading bot for the 3σ MES/MYM/M2K continuation signal.
 
 Monitors 5-min bars every 30 seconds, detects signals using the same criteria
 as signal_monitor.py, places market orders with native API bracket
@@ -36,7 +36,7 @@ import os
 import random
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -69,9 +69,24 @@ POLL_SECONDS  = 30
 PL_N_BARS = 10    # 1-min bars to look back for PL computation
 PL_THRESH = 0.50  # PL_aligned ≥ this → 2× sizing
 
+# ── ORB parameters (keep in sync with signal_monitor.py) ────────────────────
+ORB_BARS     = 3    # 3 × 5-min = 15-min opening range
+ORB_STOP_SIG = 2.0
+ORB_TGT_SIG  = 2.0  # 2σ:2σ → EV ≈ +0.61R
+ORB_WINDOWS  = [    # (start_h, start_m, end_h, end_m, label)
+    (9,  45, 10, 30, "Morning"),
+]
+
 ET = ZoneInfo("America/New_York")
 
 LOG_PATH = Path("logs/bot_trades.csv")
+ORB_LOG_PATH = Path("logs/orb_trades.csv")
+ORB_LOG_FIELDS = [
+    "fired_at", "resolved_at", "symbol", "direction",
+    "est_entry", "fill_price", "target", "stop",
+    "orb_high", "orb_low", "orb_width", "sigma_pts",
+    "window", "outcome", "pnl_pts", "pnl_r",
+]
 LOG_FIELDS = [
     "fired_at", "resolved_at", "symbol", "direction",
     "est_entry", "fill_price", "target", "stop",
@@ -98,6 +113,9 @@ class BotInstrument:
     # Per-instrument blackout windows: (start_h, start_m, end_h, end_m, conditional)
     # conditional=True: block only when CSR < threshold; False: always block.
     blackout_windows: list = field(default_factory=list)
+    # ORB: set orb_enabled=True and orb_width_min to wide-tertile cutoff from backtest.
+    orb_enabled:   bool  = False
+    orb_width_min: float = 0.0
 
 
 INSTRUMENTS = [
@@ -105,13 +123,20 @@ INSTRUMENTS = [
                   csr_vol_windows=[(0.08, 4), (1.0, 8)],
                   blackout_windows=[
                       (8, 0, 9, 0, True),   # econ releases: block only if CSR<1.5
-                  ]),
+                  ],
+                  orb_enabled=True, orb_width_min=15.25),
     BotInstrument("MYM", "MYM", tick_size=1.00, point_value=0.50,
                   csr_vol_windows=[(0.08, 4), (1.0, 8)],
                   blackout_windows=[
                       (9,  0,  9, 30, False),  # pre-open: EV=-0.076σ CSR-filtered
                       (15, 0, 16,  0, False),  # NYSE close: EV=-0.375σ CSR-filtered
                   ]),
+    BotInstrument("M2K", "M2K", tick_size=0.10, point_value=5.00,
+                  csr_vol_windows=[(0.08, 4), (1.0, 8)],
+                  blackout_windows=[
+                      (8, 0, 9, 0, True),   # econ releases: block only if CSR<1.5
+                  ],
+                  orb_enabled=True, orb_width_min=14.30),
 ]
 
 
@@ -157,6 +182,54 @@ class ActiveTrade:
 
 
 @dataclass
+class OrbSignal:
+    entry:     float
+    target:    float
+    stop:      float
+    orb_high:  float
+    orb_low:   float
+    sigma_pts: float
+    window:    str
+    bar_ts:    datetime
+
+    def target_pts(self): return abs(self.target - self.entry)
+    def stop_pts(self):   return abs(self.stop   - self.entry)
+    def risk_pts(self):   return self.stop_pts()
+
+
+@dataclass
+class OrbState:
+    session_date:    date | None = None
+    orb_high:        float = 0.0
+    orb_low:         float = 0.0
+    orb_bars_seen:   int   = 0
+    orb_complete:    bool  = False
+    morning_fired:   bool  = False
+
+
+@dataclass
+class ActiveOrbTrade:
+    instrument:  BotInstrument
+    contract_id: str
+    sig:         OrbSignal
+    fired_at:    datetime
+    order_id:    int | None = None
+    fill_price:  float | None = None
+    expires_at:  datetime = field(init=False)
+
+    def __post_init__(self):
+        self.expires_at = self.fired_at + timedelta(minutes=MAX_HOLD_MIN)
+
+    def target_price(self) -> float:
+        p = self.fill_price or self.sig.entry
+        return p + self.sig.target_pts()
+
+    def stop_price(self) -> float:
+        p = self.fill_price or self.sig.entry
+        return p - self.sig.stop_pts()
+
+
+@dataclass
 class InstrumentState:
     instrument:   BotInstrument
     contract_id:  str = ""
@@ -167,6 +240,8 @@ class InstrumentState:
     gk_ann_vol:         float = 0.0
     csr:                float = 0.0
     active_trade:       ActiveTrade | None = None
+    active_orb_trade:   ActiveOrbTrade | None = None
+    orb:                OrbState = field(default_factory=OrbState)
     last_evaluated_ts:  datetime | None = None
 
 
@@ -454,7 +529,8 @@ def handle_active_trade(client: TopstepClient, state: InstrumentState,
 
     if pos is None:
         # Position is gone — brackets closed it; cancel any residual OCO orders
-        exit_price = _get_exit_price(client, account_id, trade, now)
+        exit_price = _get_exit_price(client, account_id, trade.fired_at,
+                                     trade.contract_id, now)
         if exit_price is not None:
             # Actual fill from trade history — classify by proximity to brackets
             if abs(exit_price - trade.target_price()) <= abs(exit_price - trade.stop_price()):
@@ -503,28 +579,6 @@ def handle_active_trade(client: TopstepClient, state: InstrumentState,
             log.warning(f"{trade.instrument.symbol}: post-close cancel_all failed: {e}")
 
 
-def _get_exit_price(client: TopstepClient, account_id: int,
-                    trade: ActiveTrade, now: datetime) -> float | None:
-    """
-    Try to get actual exit price from trade history.
-    Returns None if lookup fails or returns nothing useful — caller should
-    fall back to bracket prices rather than fill_price to avoid pnl=0.
-    """
-    try:
-        trades = client.search_trades(account_id, trade.fired_at, now)
-        closing = [
-            t for t in trades
-            if t.get("contractId") == trade.contract_id
-            and datetime.fromisoformat(t.get("timestamp", "1970")).replace(tzinfo=timezone.utc)
-                > trade.fired_at
-        ]
-        if closing:
-            price = float(closing[-1].get("price", 0))
-            if price > 0:
-                return price
-    except Exception as e:
-        log.warning(f"Could not fetch trade history for exit price: {e}")
-    return None
 
 
 def _classify_outcome_from_bars(trade: ActiveTrade, bars: list[Bar]) -> tuple[str, float]:
@@ -549,6 +603,265 @@ def _classify_outcome_from_bars(trade: ActiveTrade, bars: list[Bar]) -> tuple[st
                 return "STOPPED", trade.stop_price()
     # No bracket found in available bars — classify by which is closer to last close
     last_close = bars[-1].close if bars else (trade.fill_price or trade.est_entry)
+    if abs(last_close - trade.target_price()) <= abs(last_close - trade.stop_price()):
+        return "TARGET",  trade.target_price()
+    return "STOPPED", trade.stop_price()
+
+
+# ── ORB log ───────────────────────────────────────────────────────────────────
+
+def _ensure_orb_log():
+    ORB_LOG_PATH.parent.mkdir(exist_ok=True)
+    if not ORB_LOG_PATH.exists():
+        with open(ORB_LOG_PATH, "w", newline="") as f:
+            csv.DictWriter(f, fieldnames=ORB_LOG_FIELDS).writeheader()
+
+
+def _log_orb_trade(trade: ActiveOrbTrade, outcome: str, exit_price: float, now: datetime):
+    fill = trade.fill_price or trade.sig.entry
+    pnl_pts = exit_price - fill      # ORB is always LONG
+    risk     = trade.sig.risk_pts()
+    row = {
+        "fired_at":    trade.fired_at.isoformat(),
+        "resolved_at": now.isoformat(),
+        "symbol":      trade.instrument.symbol,
+        "direction":   "LONG",
+        "est_entry":   round(trade.sig.entry, 4),
+        "fill_price":  round(fill, 4),
+        "target":      round(trade.target_price(), 4),
+        "stop":        round(trade.stop_price(), 4),
+        "orb_high":    round(trade.sig.orb_high, 4),
+        "orb_low":     round(trade.sig.orb_low, 4),
+        "orb_width":   round(trade.sig.orb_high - trade.sig.orb_low, 4),
+        "sigma_pts":   round(trade.sig.sigma_pts, 4),
+        "window":      trade.sig.window,
+        "outcome":     outcome,
+        "pnl_pts":     round(pnl_pts, 4),
+        "pnl_r":       round(pnl_pts / risk, 4) if risk else 0.0,
+    }
+    with open(ORB_LOG_PATH, "a", newline="") as f:
+        csv.DictWriter(f, fieldnames=ORB_LOG_FIELDS).writerow(row)
+    log.info(
+        f"ORB LOGGED  {trade.instrument.symbol} LONG  {outcome}  "
+        f"fill={fill:.2f}  exit={exit_price:.2f}  "
+        f"pnl={pnl_pts:+.2f}pts ({pnl_pts/risk:+.3f}R)" if risk else
+        f"ORB LOGGED  {trade.instrument.symbol} LONG  {outcome}"
+    )
+
+
+# ── ORB evaluation ────────────────────────────────────────────────────────────
+
+def _orb_window(bar_et: datetime) -> str | None:
+    hm = (bar_et.hour, bar_et.minute)
+    for sh, sm, eh, em, label in ORB_WINDOWS:
+        if (sh, sm) <= hm < (eh, em):
+            return label
+    return None
+
+
+def evaluate_orb(state: InstrumentState) -> OrbSignal | None:
+    """Update OrbState incrementally; return a new OrbSignal on qualifying breakout."""
+    if not state.bars:
+        return None
+
+    bar    = state.bars[-1]
+    bar_et = bar.ts.astimezone(ET)
+    today  = bar_et.date()
+    orb    = state.orb
+
+    if orb.session_date != today:
+        orb.session_date   = today
+        orb.orb_high       = 0.0
+        orb.orb_low        = 0.0
+        orb.orb_bars_seen  = 0
+        orb.orb_complete   = False
+        orb.morning_fired  = False
+
+    hm = (bar_et.hour, bar_et.minute)
+
+    if (9, 30) <= hm < (9, 30 + ORB_BARS * TF_MINUTES) and not orb.orb_complete:
+        if orb.orb_bars_seen == 0:
+            orb.orb_high = bar.high
+            orb.orb_low  = bar.low
+        else:
+            orb.orb_high = max(orb.orb_high, bar.high)
+            orb.orb_low  = min(orb.orb_low,  bar.low)
+        orb.orb_bars_seen += 1
+        if orb.orb_bars_seen >= ORB_BARS:
+            orb.orb_complete = True
+        return None
+
+    if not orb.orb_complete:
+        return None
+    if hm < (9, 30) or hm >= (16, 0):
+        return None
+
+    window = _orb_window(bar_et)
+    if window is None:
+        return None
+    if window == "Morning" and orb.morning_fired:
+        return None
+
+    orb_width = orb.orb_high - orb.orb_low
+    if orb_width < state.instrument.orb_width_min:
+        return None
+    if state.sigma_pts <= 0:
+        return None
+
+    if bar.close > orb.orb_high:
+        entry = bar.close
+        sig = OrbSignal(
+            entry=entry,
+            target=entry + ORB_TGT_SIG * state.sigma_pts,
+            stop=entry   - ORB_STOP_SIG * state.sigma_pts,
+            orb_high=orb.orb_high, orb_low=orb.orb_low,
+            sigma_pts=state.sigma_pts, window=window, bar_ts=bar.ts,
+        )
+        orb.morning_fired = True
+        return sig
+
+    return None
+
+
+# ── ORB order placement ───────────────────────────────────────────────────────
+
+def place_orb_signal(client: TopstepClient, state: InstrumentState,
+                     sig: OrbSignal, account_id: int, paper: bool) -> ActiveOrbTrade:
+    inst     = state.instrument
+    tick     = inst.tick_size
+    stop_mag   = max(1, round(sig.stop_pts()   / tick))
+    target_mag = max(1, round(sig.target_pts() / tick))
+    stop_ticks   = -stop_mag    # long: stop below entry
+    target_ticks =  target_mag  # long: target above entry
+
+    trade = ActiveOrbTrade(
+        instrument=inst, contract_id=state.contract_id,
+        sig=sig, fired_at=sig.bar_ts,
+    )
+
+    if paper:
+        log.info(
+            f"[PAPER] ORB {inst.symbol} LONG  entry≈{sig.entry:.2f}  "
+            f"target={sig.target:.2f} (+{sig.target_pts():.2f}pts)  "
+            f"stop={sig.stop:.2f} (-{sig.stop_pts():.2f}pts)  "
+            f"window={sig.window}  orb={sig.orb_low:.2f}–{sig.orb_high:.2f}"
+        )
+    else:
+        resp = client.place_order(
+            account_id=account_id,
+            contract_id=state.contract_id,
+            side=TopstepClient.BID,
+            size=1,
+            order_type=TopstepClient.ORDER_MARKET,
+            stop_loss_ticks=stop_ticks,
+            take_profit_ticks=target_ticks,
+            custom_tag=f"orb_{inst.symbol}_{sig.bar_ts.strftime('%Y%m%d%H%M%S')}",
+        )
+        trade.order_id = resp.get("orderId")
+        log.info(
+            f"ORB ORDER  {inst.symbol} LONG  order_id={trade.order_id}  "
+            f"entry≈{sig.entry:.2f}  stop={stop_ticks}t  target={target_ticks}t  "
+            f"window={sig.window}"
+        )
+
+    state.active_orb_trade = trade
+    return trade
+
+
+# ── ORB position monitoring ───────────────────────────────────────────────────
+
+def handle_active_orb_trade(client: TopstepClient, state: InstrumentState,
+                             account_id: int, now: datetime, paper: bool):
+    trade = state.active_orb_trade
+
+    if paper:
+        if now >= trade.expires_at:
+            exit_price = state.bars[-1].close if state.bars else trade.sig.entry
+            _log_orb_trade(trade, "TIME EXIT (paper)", exit_price, now)
+            state.active_orb_trade = None
+        return
+
+    try:
+        positions = client.get_open_positions(account_id)
+    except Exception as e:
+        log.warning(f"ORB {trade.instrument.symbol}: could not fetch positions: {e}")
+        return
+
+    pos = next(
+        (p for p in positions if p.get("contractId") == trade.contract_id),
+        None,
+    )
+
+    if pos and trade.fill_price is None:
+        trade.fill_price = pos.get("averagePrice")
+        log.info(f"ORB {trade.instrument.symbol} fill confirmed: {trade.fill_price:.2f}")
+
+    if pos is None:
+        exit_price = _get_exit_price(client, account_id, trade.fired_at,
+                                     trade.contract_id, now)
+        if exit_price is not None:
+            outcome = ("TARGET" if abs(exit_price - trade.target_price())
+                       <= abs(exit_price - trade.stop_price()) else "STOPPED")
+        else:
+            outcome, exit_price = _classify_orb_outcome(trade, state.bars)
+        _log_orb_trade(trade, outcome, exit_price, now)
+        state.active_orb_trade = None
+        try:
+            n = client.cancel_all_orders(account_id)
+            if n:
+                log.info(f"ORB {trade.instrument.symbol} {outcome}: cancelled {n} residual order(s)")
+        except Exception as e:
+            log.warning(f"ORB {trade.instrument.symbol}: cancel_all_orders failed: {e}")
+        return
+
+    if now >= trade.expires_at:
+        log.info(f"ORB {trade.instrument.symbol} max hold reached — closing")
+        try:
+            client.cancel_all_orders(account_id)
+        except Exception as e:
+            log.warning(f"ORB {trade.instrument.symbol}: pre-close cancel_all failed: {e}")
+        try:
+            client.close_position(account_id, trade.contract_id)
+        except Exception as e:
+            log.error(f"ORB {trade.instrument.symbol}: failed to close position: {e}")
+            return
+        exit_price = state.bars[-1].close if state.bars else (trade.fill_price or trade.sig.entry)
+        _log_orb_trade(trade, "TIME EXIT", exit_price, now)
+        state.active_orb_trade = None
+        try:
+            client.cancel_all_orders(account_id)
+        except Exception:
+            pass
+
+
+def _get_exit_price(client: TopstepClient, account_id: int,
+                    fired_at: datetime, contract_id: str, now: datetime) -> float | None:
+    try:
+        trades = client.search_trades(account_id, fired_at, now)
+        closing = [
+            t for t in trades
+            if t.get("contractId") == contract_id
+            and datetime.fromisoformat(t.get("timestamp", "1970")).replace(tzinfo=timezone.utc)
+                > fired_at
+        ]
+        if closing:
+            price = float(closing[-1].get("price", 0))
+            if price > 0:
+                return price
+    except Exception as e:
+        log.warning(f"Could not fetch trade history for exit price: {e}")
+    return None
+
+
+def _classify_orb_outcome(trade: ActiveOrbTrade, bars: list[Bar]) -> tuple[str, float]:
+    for bar in bars:
+        if bar.ts <= trade.fired_at:
+            continue
+        if bar.high >= trade.target_price():
+            return "TARGET",  trade.target_price()
+        if bar.low  <= trade.stop_price():
+            return "STOPPED", trade.stop_price()
+    last_close = bars[-1].close if bars else (trade.fill_price or trade.sig.entry)
     if abs(last_close - trade.target_price()) <= abs(last_close - trade.stop_price()):
         return "TARGET",  trade.target_price()
     return "STOPPED", trade.stop_price()
@@ -614,6 +927,7 @@ def run(account_id: int | None, paper: bool):
         log.warning(f"Could not check existing positions on startup: {e}")
 
     _ensure_log()
+    _ensure_orb_log()
     mode = "PAPER MODE" if paper else "LIVE"
     log.info(
         f"Bot running — {mode}  account={account_id}  "
@@ -631,9 +945,15 @@ def run(account_id: int | None, paper: bool):
                 if state.active_trade:
                     handle_active_trade(client, state, account_id, now, paper)
 
-                if not state.active_trade:
+                if state.active_orb_trade:
+                    handle_active_orb_trade(client, state, account_id, now, paper)
+
+                # Only enter new trades when no position is open on this instrument
+                no_position = not state.active_trade and not state.active_orb_trade
+                last_bar_ts = state.bars[-1].ts if state.bars else None
+
+                if no_position:
                     sig = evaluate(state)
-                    last_bar_ts = state.bars[-1].ts if state.bars else None
                     if sig and last_bar_ts != state.last_evaluated_ts:
                         state.last_evaluated_ts = last_bar_ts
                         pl = fetch_1min_pl(client, state.contract_id,
@@ -643,6 +963,11 @@ def run(account_id: int | None, paper: bool):
                         place_signal(client, state, sig, account_id, paper)
                     elif last_bar_ts != state.last_evaluated_ts:
                         state.last_evaluated_ts = last_bar_ts
+
+                if no_position and state.instrument.orb_enabled:
+                    orb_sig = evaluate_orb(state)
+                    if orb_sig:
+                        place_orb_signal(client, state, orb_sig, account_id, paper)
 
             except Exception as e:
                 log.error(f"{state.instrument.symbol}: {e}", exc_info=True)

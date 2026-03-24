@@ -55,6 +55,8 @@ INSTRUMENTS = {
     "MES": "mes_hist_1min.csv",
     "MNQ": "mnq_hist_1min.csv",
     "MYM": "mym_hist_1min.csv",
+    "M2K": "m2k_hist_1min.csv",
+    "NKD": "nkd_hist_1min.csv",
 }
 
 # ── Data (identical to backtest_pl_filter.py) ─────────────────────────────────
@@ -382,7 +384,7 @@ def analysis_sizing(records, base):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--sym", default="MES", choices=list(INSTRUMENTS.keys()))
+    parser.add_argument("--sym", default="MES", choices=sorted(INSTRUMENTS.keys()))
     args = parser.parse_args()
 
     path = INSTRUMENTS[args.sym]

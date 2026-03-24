@@ -21,8 +21,9 @@ import argparse
 import csv
 import logging
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, time as dtime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import sys
 sys.path.insert(0, "src")
@@ -46,6 +47,29 @@ INSTRUMENTS = {
 CSV_FIELDS = ["ts", "open", "high", "low", "close", "volume"]
 
 log = logging.getLogger("recorder")
+
+_CT = ZoneInfo("America/Chicago")
+
+def is_cme_weekend_closure() -> bool:
+    """Return True during CME Globex weekend closure: Fri 16:00 CT – Sun 17:00 CT."""
+    now_ct = datetime.now(_CT)
+    wd = now_ct.weekday()   # 0=Mon … 4=Fri, 5=Sat, 6=Sun
+    t  = now_ct.time()
+    if wd == 4 and t >= dtime(16, 0):   # Friday after 4 PM CT
+        return True
+    if wd == 5:                          # All of Saturday
+        return True
+    if wd == 6 and t < dtime(17, 0):    # Sunday before 5 PM CT
+        return True
+    return False
+
+def wait_for_market_open():
+    """Block (sleeping 5 min at a time) until CME weekend closure is over."""
+    while is_cme_weekend_closure():
+        now_ct = datetime.now(_CT)
+        log.info(f"CME weekend closure — sleeping until Sunday 17:00 CT "
+                 f"(now {now_ct.strftime('%a %H:%M %Z')})")
+        time.sleep(300)
 
 
 # ── CSV helpers ───────────────────────────────────────────────────────────────
@@ -99,6 +123,8 @@ def _append_bars(path: Path, bars: list[dict], after: datetime | None) -> int:
 # ── Recorder ─────────────────────────────────────────────────────────────────
 
 def record(symbols: list[str]):
+    wait_for_market_open()
+
     client = TopstepClient()
     client.login()
 
@@ -147,6 +173,12 @@ def record(symbols: list[str]):
     # Continuous polling loop
     log.info(f"Polling every {POLL_SECONDS}s …  Ctrl-C to stop")
     while True:
+        if is_cme_weekend_closure():
+            wait_for_market_open()
+            # Re-login after weekend so the token is fresh
+            log.info("Market reopened — re-logging in …")
+            client.login()
+
         time.sleep(POLL_SECONDS)
         now = datetime.now(timezone.utc)
 

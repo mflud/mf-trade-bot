@@ -1,0 +1,110 @@
+Opening Range Breakout (ORB) Strategy
+======================================
+
+Instruments:      MES (Micro E-mini S&P 500), M2K (Micro E-mini Russell 2000)
+Direction:        Long only
+Backtest period:  2019-2026 (7 years, ~1,500 RTH sessions per instrument)
+
+
+CONCEPT
+-------
+The Opening Range Breakout captures directional momentum after the market resolves
+its initial price discovery. The first 15 minutes of the RTH session (9:30-9:45 ET)
+establish the "opening range" -- a high/low band that the market frequently uses as
+a reference for the rest of the morning. When price breaks cleanly above that range
+in the follow-through window, it tends to continue.
+
+Only long (upside) breakouts are traded. Short breakouts have been consistently
+negative in backtesting and are not implemented.
+
+
+ENTRY RULES
+-----------
+
+1. Opening Range
+
+   Record the high and low across the first three 5-minute bars (9:30, 9:35, 9:40 ET,
+   i.e. bars closing at 9:35, 9:40, 9:45 ET).
+
+     ORB high  = highest high of those three bars
+     ORB low   = lowest low of those three bars
+     ORB width = ORB high - ORB low
+
+2. Width Filter
+
+   Only trade if the ORB is "wide" -- in the top third of historical ORB widths
+   for that instrument.
+
+     MES:  >= 15.25 pts
+     M2K:  >= 14.30 pts
+
+   Narrow opening ranges produce low-quality breakouts. The wide-tertile filter
+   eliminates roughly 2/3 of sessions and concentrates trades in the clearest setups.
+
+3. Fire Window
+
+   A breakout is only valid if it occurs in the morning fire window:
+   9:45 - 10:30 ET  (one trade per session).
+
+4. Breakout Trigger
+
+   When the 5-minute bar closes above the ORB high, enter long at the close of
+   that bar.
+
+
+EXIT RULES
+----------
+Exits use a 2-sigma stop and 2-sigma target, where sigma (s) is the rolling
+close-return standard deviation computed from the 20 most recent 5-minute bars
+(100 minutes), expressed in points.
+
+     Entry:   Close of trigger bar
+     Target:  Entry + 2s
+     Stop:    Entry - 2s
+     Time:    Force-close after 25 minutes if neither level is hit
+
+Stop and target are resting bracket orders (exchange-managed OCO); the time exit
+is a fallback only.
+
+
+BACKTEST RESULTS
+----------------
+Wide ORB, morning breakout (9:45-10:30 ET), 2s stop / 2s target:
+
+     Instrument   Trades (7yr)   Win rate   EV per trade   Total R
+     ----------   ------------   --------   ------------   -------
+     MES          ~280           ~53%       +0.35-0.44R    ~+100R
+     M2K          ~280           ~56%       +0.61R         +170R
+
+M2K outperforms MES in this setup -- Russell 2000 tends to trend more cleanly
+after opening range resolution.
+
+R = risk unit = 1x (2s stop distance).
+
+Tight stops placed at the ORB high (breakout extension only) were consistently
+negative (EV = -0.08 to -0.38R) and are not used. The sigma-based stop is required.
+
+
+PARAMETERS AT A GLANCE
+-----------------------
+  Range period    15 min (9:30-9:45 ET)
+  Bar timeframe   5-minute, clock-aligned
+  Volatility (s)  Rolling 20-bar close-return std dev
+  Stop            2.0s below entry
+  Target          2.0s above entry
+  Max hold        25 minutes
+  Direction       Long only
+  Trades per day  0 or 1 per instrument
+
+
+NOTES
+-----
+- The morning breakout window (9:45-10:30 ET) is the only active window. A "power
+  hour" afternoon window (14:30-15:00 range, 15:00-16:00 fire) was also tested but
+  showed negative expected value for both instruments and was not implemented.
+
+- Because sigma is computed live at the time of the breakout, the stop/target
+  distances adapt to the current session's volatility rather than using fixed points.
+
+- A position guard prevents the ORB trade and a separate momentum continuation
+  signal from being open simultaneously on the same instrument.

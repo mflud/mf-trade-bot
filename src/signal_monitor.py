@@ -9,8 +9,9 @@ side-by-side panels for each configured instrument:
   - If signal: entry, target, stop in points + expiry countdown
 
 Instruments and their optimal parameters (from backtest):
-  MYM  Micro Dow      stop=2.0σ  target=3.0σ  $0.50/pt
-  MES  Micro S&P 500  stop=2.0σ  target=3.0σ  $5.00/pt
+  MYM  Micro Dow          stop=2.0σ  target=3.0σ  $0.50/pt
+  MES  Micro S&P 500      stop=2.0σ  target=3.0σ  $5.00/pt
+  M2K  Micro Russell 2000 stop=2.0σ  target=3.0σ  $5.00/pt
 
 Run modes:
   python src/signal_monitor.py          # live (requires .env credentials)
@@ -61,12 +62,11 @@ ET = ZoneInfo("America/New_York")
 
 # ORB parameters (15-min ORB, wide-range LONG, morning + power-hour windows)
 ORB_BARS      = 3          # 3 × 5-min = 15-min opening range
-ORB_WIDTH_MIN = 15.25      # pts — wide tertile cutoff from backtest
+# Per-instrument ORB_WIDTH_MIN stored in InstrumentConfig.orb_width_min
 ORB_STOP_SIG  = 2.0
 ORB_TGT_SIG   = 2.0        # 2σ:2σ → EV ≈ +0.61R
 ORB_WINDOWS   = [          # (start_h, start_m, end_h, end_m, label)
     (9,  45, 10, 30, "Morning"),
-    (13, 30, 16,  0, "Power hr"),
 ]
 
 LOG_PATH = Path("logs/signals.csv")
@@ -108,6 +108,9 @@ class InstrumentConfig:
     # Per-instrument blackout windows: (start_h, start_m, end_h, end_m, conditional).
     # conditional=True: block only when CSR < threshold; False: always block.
     blackout_windows: list = field(default_factory=list)
+    # ORB: set orb_enabled=True and orb_width_min to the wide-tertile cutoff from backtest.
+    orb_enabled:   bool  = False
+    orb_width_min: float = 0.0
 
 
 INSTRUMENTS = [
@@ -116,7 +119,8 @@ INSTRUMENTS = [
                      csr_vol_windows=[(0.08, 4), (1.0, 8)],
                      blackout_windows=[
                          (8, 0, 9, 0, True),  # econ releases: block only if CSR<1.5
-                     ]),
+                     ],
+                     orb_enabled=True, orb_width_min=15.25),
     InstrumentConfig("MYM", "MYM", stop_sigma=2.0, target_sigma=3.0,
                      point_value=0.50, ev_sigma=0.073,
                      csr_vol_windows=[(0.08, 4), (1.0, 8)],
@@ -124,6 +128,13 @@ INSTRUMENTS = [
                          (9,  0,  9, 30, False),  # pre-open: EV=-0.076σ CSR-filtered
                          (15, 0, 16,  0, False),  # NYSE close: EV=-0.375σ CSR-filtered
                      ]),
+    InstrumentConfig("M2K", "M2K", stop_sigma=2.0, target_sigma=3.0,
+                     point_value=5.00, ev_sigma=0.107,
+                     csr_vol_windows=[(0.08, 4), (1.0, 8)],
+                     blackout_windows=[
+                         (8, 0, 9, 0, True),  # econ releases: block only if CSR<1.5
+                     ],
+                     orb_enabled=True, orb_width_min=14.30),
 ]
 
 ALERT_SOUND = "/System/Library/Sounds/Ping.aiff"
@@ -201,14 +212,23 @@ class OrbState:
     orb_bars_seen:   int   = 0
     orb_complete:    bool  = False
     morning_fired:   bool  = False
-    power_hr_fired:  bool  = False
     active_signal:   OrbSignal | None = None
+
+
+@dataclass
+class _HistSignal:
+    """Minimal signal record reconstructed from CSV for history display."""
+    bar_ts:    datetime
+    direction: int      # +1 long, -1 short, 0 = ORB
+    entry:     float
+    target:    float
+    stop:      float
 
 
 @dataclass
 class RecentSignal:
     symbol:  str
-    signal:  Signal
+    signal:  "Signal | OrbSignal | _HistSignal"
     outcome: str        # "TARGET", "STOPPED", "TIME EXIT", "OPEN"
     pnl_pts: float
 
@@ -221,11 +241,13 @@ class InstrumentState:
     bars:          list[Bar] = field(default_factory=list)
     sigma:         float = 0.0
     sigma_pts:     float = 0.0
+    sigma_bar_count: int = 0      # number of returns used in sigma calc
     gk_ann_vol:    float = 0.0
     csr:           float = 0.0   # cumulative scaled return (40 min, direction-adjusted)
     mean_vol:           float | None = None
     active_signal:      Signal | None = None
     current_pl:         float | None = None      # raw 1-min PL, refreshed every poll
+    live_bar:           Bar | None = None        # developing 5-min bar, refreshed every poll
     orb:                OrbState = field(default_factory=OrbState)
     history:            list[RecentSignal] = field(default_factory=list)
     error:              str | None = None
@@ -396,6 +418,22 @@ def build_signal_panel(state: InstrumentState, now: datetime) -> Panel:
 
         t.add_row("Scaled return:",
                   f"[yellow]{bar_sc}[/] {abs(scaled):.2f}σ / {SIGNAL_SIGMA:.0f}σ")
+
+        lb = state.live_bar
+        if lb is not None and sigma:
+            now_utc    = datetime.now(timezone.utc)
+            open_min   = int(now_utc.timestamp() // 60) // TF_MINUTES * TF_MINUTES
+            bar_open   = datetime.fromtimestamp(open_min * 60, tz=timezone.utc)
+            elapsed_m  = int((now_utc - bar_open).total_seconds() // 60)
+            lb_ret     = math.log(lb.close / lb.open) if lb.open else 0.0
+            lb_scaled  = lb_ret / sigma
+            lb_pct     = min(abs(lb_scaled) / SIGNAL_SIGMA * 100, 100)
+            lb_bar     = "█" * int(lb_pct / 5) + "░" * (20 - int(lb_pct / 5))
+            lb_style   = ("green" if lb_scaled > 0 else "red") if abs(lb_scaled) >= SIGNAL_SIGMA \
+                         else ("yellow" if abs(lb_scaled) >= SIGNAL_SIGMA * 0.7 else "dim")
+            t.add_row(f"Dev ({elapsed_m}m):",
+                      f"[{lb_style}]{lb_bar}[/] {lb_scaled:+.2f}σ")
+
         t.add_row("Volume ratio:",
                   f"[yellow]{bar_vr}[/] {vol_ratio:.2f}× / {VOL_RATIO_MIN:.1f}×"
                   if vol_ratio is not None else
@@ -513,7 +551,7 @@ def build_instrument_column(state: InstrumentState, now: datetime) -> Table:
     col.add_row(build_regime_panel(state))
     col.add_row(build_bar_panel(state))
     col.add_row(build_signal_panel(state, now))
-    if state.cfg.symbol == "MES":
+    if state.cfg.orb_enabled:
         col.add_row(build_orb_panel(state, now))
     return col
 
@@ -533,7 +571,10 @@ def build_history_table(history: list[RecentSignal]) -> Panel:
     for rs in reversed(history[-8:]):
         s  = rs.signal
         ts = s.bar_ts.astimezone(datetime.now().astimezone().tzinfo)
-        dir_str = "[green]LONG[/]" if s.direction == 1 else "[red]SHORT[/]"
+        if isinstance(s, OrbSignal) or (isinstance(s, _HistSignal) and s.direction == 0):
+            dir_str = "[green]ORB ↑[/]"
+        else:
+            dir_str = "[green]LONG[/]" if s.direction == 1 else "[red]SHORT[/]"
 
         if rs.outcome == "TARGET":
             out_str = "[green]HIT TARGET[/]"
@@ -578,6 +619,50 @@ def build_header(now: datetime) -> Panel:
     return Panel(t, border_style="dark_blue", padding=(0, 0))
 
 
+def build_sizing_table(states: list[InstrumentState]) -> Panel:
+    """Lot-size table: rows = $100/$200/$300 risk, columns = each instrument."""
+    RISKS = [100, 200, 300]
+
+    t = Table(box=box.SIMPLE_HEAD, show_header=True, padding=(0, 2))
+    t.add_column("", style="dim", justify="left")
+    for s in states:
+        t.add_column(s.cfg.symbol, justify="right", style="bold")
+
+    # Sigma row
+    sigma_vals = []
+    partial = False
+    for s in states:
+        if s.sigma_pts:
+            if s.sigma_bar_count < TRAILING_BARS:
+                sigma_vals.append(f"{s.sigma_pts:.2f}*")
+                partial = True
+            else:
+                sigma_vals.append(f"{s.sigma_pts:.2f}")
+        else:
+            sigma_vals.append("—")
+    sigma_label = "Sigma*" if partial else "Sigma"
+    t.add_row(sigma_label, *sigma_vals, style="cyan")
+
+    t.add_row("RISK", *[""] * len(states), style="dim")
+
+    # Risk rows
+    for risk in RISKS:
+        cells = []
+        for s in states:
+            if s.sigma_pts and s.sigma_pts > 0:
+                dollar_risk_per_lot = 2 * s.sigma_pts * s.cfg.point_value
+                lots = risk / dollar_risk_per_lot
+                cells.append(f"{lots:.1f}")
+            else:
+                cells.append("—")
+        t.add_row(f"${risk}", *cells)
+
+    title = "[bold]SIZING (2σ stop)[/]"
+    if partial:
+        title += "  [dim yellow]* partial — warming up[/]"
+    return Panel(t, title=title, border_style="dim", padding=(0, 1))
+
+
 def render(states: list[InstrumentState],
            history: list[RecentSignal],
            now: datetime) -> Table:
@@ -591,6 +676,8 @@ def render(states: list[InstrumentState],
         equal=True, padding=(0, 1),
     )
     root.add_row(cols)
+
+    root.add_row(build_sizing_table(states))
 
     if history:
         root.add_row(build_history_table(history))
@@ -676,7 +763,6 @@ def evaluate_orb(state: InstrumentState) -> OrbSignal | None:
         orb.orb_bars_seen  = 0
         orb.orb_complete   = False
         orb.morning_fired  = False
-        orb.power_hr_fired = False
         orb.active_signal  = None
 
     hm = (bar_et.hour, bar_et.minute)
@@ -701,13 +787,11 @@ def evaluate_orb(state: InstrumentState) -> OrbSignal | None:
     window = _orb_window(bar_et)
     if window is None:
         return None
-    if window == "Morning"  and orb.morning_fired:
-        return None
-    if window == "Power hr" and orb.power_hr_fired:
+    if window == "Morning" and orb.morning_fired:
         return None
 
     orb_width = orb.orb_high - orb.orb_low
-    if orb_width < ORB_WIDTH_MIN:
+    if orb_width < state.cfg.orb_width_min:
         return None
     if state.sigma_pts <= 0:
         return None
@@ -722,9 +806,7 @@ def evaluate_orb(state: InstrumentState) -> OrbSignal | None:
             sigma_pts=state.sigma_pts, window=window, bar_ts=bar.ts,
         )
         if window == "Morning":
-            orb.morning_fired  = True
-        else:
-            orb.power_hr_fired = True
+            orb.morning_fired = True
         orb.active_signal = sig
         return sig
 
@@ -752,8 +834,8 @@ def build_orb_panel(state: InstrumentState, now: datetime) -> Panel:
 
     if orb.orb_complete:
         width   = orb.orb_high - orb.orb_low
-        w_style = "green" if width >= ORB_WIDTH_MIN else "red"
-        w_flag  = " ✓" if width >= ORB_WIDTH_MIN else f" ✗ need>{ORB_WIDTH_MIN:.0f}"
+        w_style = "green" if width >= state.cfg.orb_width_min else "red"
+        w_flag  = " ✓" if width >= state.cfg.orb_width_min else f" ✗ need>{state.cfg.orb_width_min:.0f}"
         t.add_row("ORB high:", f"{orb.orb_high:,.2f}")
         t.add_row("ORB low:",  f"{orb.orb_low:,.2f}")
         t.add_row("ORB width:", f"[{w_style}]{width:.2f} pts{w_flag}[/]")
@@ -780,22 +862,18 @@ def build_orb_panel(state: InstrumentState, now: datetime) -> Panel:
     if orb.orb_complete:
         width  = orb.orb_high - orb.orb_low
         window = _orb_window(bar_et) if bar_et else None
-        if width < ORB_WIDTH_MIN:
+        if width < state.cfg.orb_width_min:
             status = "[dim]ORB too narrow[/]"
         elif window:
-            fired = (window == "Morning" and orb.morning_fired) or \
-                    (window == "Power hr" and orb.power_hr_fired)
+            fired  = window == "Morning" and orb.morning_fired
             status = "[dim]Already fired[/]" if fired else \
                      f"[yellow]Watch >{orb.orb_high:.2f}[/]"
         else:
-            remaining = [l for sh, sm, eh, em, l in ORB_WINDOWS
-                         if not ((l == "Morning" and orb.morning_fired) or
-                                 (l == "Power hr" and orb.power_hr_fired))]
-            status = f"[dim]Next: {remaining[0]}[/]" if remaining else "[dim]Done today[/]"
+            status = "[dim]Done today[/]" if orb.morning_fired else "[dim]Waiting for window[/]"
         t.add_row("Status:", status)
 
     border = "yellow" if (orb.orb_complete and _orb_window(bar_et) and
-                          not (orb.morning_fired and orb.power_hr_fired)) else "dim"
+                          not orb.morning_fired) else "dim"
     return Panel(t, title="[bold]ORB LONG[/]", border_style=border, padding=(0, 1))
 
 
@@ -853,6 +931,44 @@ def fetch_1min_pl(client, contract_id: str,
     return pl * direction
 
 
+def fetch_live_bar(client, state: "InstrumentState", now: datetime) -> Bar | None:
+    """
+    Aggregate 1-min bars since the current 5-min bar's clock-aligned open into a
+    partial bar.  Used for display only — no signal is fired from this value.
+    """
+    from topstep_client import TopstepClient
+    epoch_min  = int(now.timestamp() // 60)
+    open_min   = (epoch_min // TF_MINUTES) * TF_MINUTES
+    bar_open   = datetime.fromtimestamp(open_min * 60, tz=timezone.utc)
+    elapsed    = int((now - bar_open).total_seconds() // 60)
+    if elapsed == 0:
+        return None   # brand-new bar, nothing to show yet
+    try:
+        raw = client.get_bars(
+            contract_id=state.cid,
+            start=bar_open,
+            end=now,
+            unit=TopstepClient.MINUTE,
+            unit_number=1,
+            limit=TF_MINUTES + 1,
+        )
+        raw = list(reversed(raw))   # chronological order
+    except Exception:
+        return None
+    # Keep only bars whose timestamp is >= bar_open (guard against off-by-one)
+    mins = [b for b in raw if datetime.fromisoformat(b["t"]).replace(tzinfo=timezone.utc) >= bar_open]
+    if not mins:
+        return None
+    return Bar(
+        ts=bar_open,
+        open=mins[0]["o"],
+        high=max(b["h"] for b in mins),
+        low=min(b["l"]  for b in mins),
+        close=mins[-1]["c"],
+        volume=sum(b["v"] for b in mins),
+    )
+
+
 # ── Live mode ──────────────────────────────────────────────────────────────────
 
 def evaluate(state: InstrumentState) -> Signal | None:
@@ -869,8 +985,9 @@ def evaluate(state: InstrumentState) -> Signal | None:
     active_vols = prior_vols[prior_vols >= 10]
     mean_vol = float(np.median(active_vols)) if len(active_vols) >= 10 else None
 
-    state.sigma     = sigma
-    state.sigma_pts = sigma_pts
+    state.sigma           = sigma
+    state.sigma_pts       = sigma_pts
+    state.sigma_bar_count = len(trail)
     state.mean_vol  = mean_vol
     state.gk_ann_vol = gk_annualised_vol(bars)
 
@@ -908,6 +1025,141 @@ def evaluate(state: InstrumentState) -> Signal | None:
     return None
 
 
+def backfill_orb_state(state: InstrumentState, client) -> None:
+    """
+    Reconstruct today's ORB range and morning-fired flag from historical bars.
+
+    Called at startup and on session rollover so that starting signal_monitor
+    after 9:45 ET still shows the correct ORB range and doesn't re-fire a
+    morning signal that already happened.
+    """
+    if not state.cfg.orb_enabled:
+        return
+
+    now_et = datetime.now(ET)
+    today  = now_et.date()
+
+    # Nothing to backfill before the ORB window has closed
+    from datetime import time as _dtime
+    orb_end_et = datetime.combine(today, _dtime(9, 30 + ORB_BARS * TF_MINUTES), tzinfo=ET)
+    if datetime.now(ET) < orb_end_et:
+        return
+
+    # Already built for today
+    if state.orb.session_date == today and state.orb.orb_complete:
+        return
+
+    # Fetch from 9:30 ET today to now
+    session_open = datetime.combine(today, _dtime(9, 30), tzinfo=ET).astimezone(timezone.utc)
+    try:
+        raw = client.get_bars(
+            contract_id=state.cid,
+            start=session_open,
+            end=datetime.now(timezone.utc),
+            unit=client.MINUTE,
+            unit_number=TF_MINUTES,
+            limit=200,
+        )
+    except Exception:
+        return
+
+    if not raw:
+        return
+
+    bars = sorted(
+        [Bar(ts=datetime.fromisoformat(b["t"]),
+             open=b["o"], high=b["h"], low=b["l"],
+             close=b["c"], volume=b["v"]) for b in raw],
+        key=lambda b: b.ts,
+    )
+
+    orb  = state.orb
+    orb.session_date   = today
+    orb.orb_high       = 0.0
+    orb.orb_low        = 0.0
+    orb.orb_bars_seen  = 0
+    orb.orb_complete   = False
+    orb.morning_fired  = False
+    orb.active_signal  = None
+
+    for bar in bars:
+        bar_et = bar.ts.astimezone(ET)
+        hm     = (bar_et.hour, bar_et.minute)
+
+        # Build ORB range from 9:30–9:45
+        if (9, 30) <= hm < (9, 30 + ORB_BARS * TF_MINUTES) and not orb.orb_complete:
+            if orb.orb_bars_seen == 0:
+                orb.orb_high = bar.high
+                orb.orb_low  = bar.low
+            else:
+                orb.orb_high = max(orb.orb_high, bar.high)
+                orb.orb_low  = min(orb.orb_low,  bar.low)
+            orb.orb_bars_seen += 1
+            if orb.orb_bars_seen >= ORB_BARS:
+                orb.orb_complete = True
+            continue
+
+        if not orb.orb_complete:
+            continue
+
+        # Check if morning window already produced a breakout (don't re-fire)
+        morning_sh, morning_sm, morning_eh, morning_em = ORB_WINDOWS[0][:4]
+        if (morning_sh, morning_sm) <= hm < (morning_eh, morning_em):
+            if not orb.morning_fired and bar.close > orb.orb_high:
+                orb.morning_fired = True
+
+
+def _load_recent_history(hours: int = 24) -> list[RecentSignal]:
+    """Read signals.csv and orb_signals.csv and return entries from the past `hours`."""
+    cutoff  = datetime.now(timezone.utc) - timedelta(hours=hours)
+    entries: list[tuple[datetime, RecentSignal]] = []
+
+    if LOG_PATH.exists():
+        with open(LOG_PATH, newline="") as f:
+            for row in csv.DictReader(f):
+                try:
+                    fired_at = datetime.fromisoformat(row["fired_at"])
+                    if fired_at.tzinfo is None:
+                        fired_at = fired_at.replace(tzinfo=timezone.utc)
+                    if fired_at < cutoff:
+                        continue
+                    sig = _HistSignal(
+                        bar_ts=fired_at,
+                        direction=int(row["direction"]),
+                        entry=float(row["entry"]),
+                        target=float(row["target"]),
+                        stop=float(row["stop"]),
+                    )
+                    entries.append((fired_at, RecentSignal(
+                        row["symbol"], sig, row["outcome"], float(row["pnl_pts"]))))
+                except Exception:
+                    continue
+
+    if ORB_LOG_PATH.exists():
+        with open(ORB_LOG_PATH, newline="") as f:
+            for row in csv.DictReader(f):
+                try:
+                    fired_at = datetime.fromisoformat(row["fired_at"])
+                    if fired_at.tzinfo is None:
+                        fired_at = fired_at.replace(tzinfo=timezone.utc)
+                    if fired_at < cutoff:
+                        continue
+                    sig = _HistSignal(
+                        bar_ts=fired_at,
+                        direction=0,    # ORB is always long breakout
+                        entry=float(row["entry"]),
+                        target=float(row["target"]),
+                        stop=float(row["stop"]),
+                    )
+                    entries.append((fired_at, RecentSignal(
+                        row["symbol"], sig, row["outcome"], float(row["pnl_pts"]))))
+                except Exception:
+                    continue
+
+    entries.sort(key=lambda x: x[0])
+    return [rs for _, rs in entries]
+
+
 def run_live():
     from topstep_client import TopstepClient
 
@@ -925,7 +1177,7 @@ def run_live():
         states.append(st)
         console.print(f"  {cfg.symbol}: {c['name']}  id={c['id']}")
 
-    combined_history: list[RecentSignal] = []
+    combined_history: list[RecentSignal] = _load_recent_history(hours=24)
     _ensure_log()
 
     def fetch_bars(state: InstrumentState):
@@ -951,6 +1203,13 @@ def run_live():
         _log_trade(state.cfg.symbol, sig, outcome, pnl_pts, now)
         state.active_signal = None
 
+    # Backfill ORB state once at startup so power-hour works even if
+    # signal_monitor was started after the 9:30–9:45 ORB window.
+    for state in states:
+        fetch_bars(state)
+        if state.cfg.orb_enabled:
+            backfill_orb_state(state, client)
+
     with Live(console=console, refresh_per_second=1, screen=True) as live:
         while True:
             now = datetime.now(timezone.utc)
@@ -960,12 +1219,13 @@ def run_live():
                 if not state.bars:
                     continue
 
-                # Refresh 1-min PL for watching display
+                # Refresh 1-min PL and developing bar for watching display
                 state.current_pl = fetch_1min_pl(client, state.cid, now, 1)
+                state.live_bar   = fetch_live_bar(client, state, now)
 
                 # Update display metrics and check for signal
                 new_sig = evaluate(state)
-                new_orb = evaluate_orb(state) if state.cfg.symbol == "MES" else None
+                new_orb = evaluate_orb(state) if state.cfg.orb_enabled else None
 
                 # Only act on a signal from a bar we haven't seen before
                 last_bar_ts = state.bars[-1].ts
@@ -1002,11 +1262,15 @@ def run_live():
                     if hit:
                         _log_orb(state.cfg.symbol, state.orb.active_signal,
                                  hit[0], hit[1], now)
+                        combined_history.append(RecentSignal(
+                            state.cfg.symbol, state.orb.active_signal, hit[0], hit[1]))
                         state.orb.active_signal = None
                     elif now >= state.orb.active_signal.bar_ts + timedelta(minutes=MAX_HOLD_MIN):
                         pnl = state.bars[-1].close - state.orb.active_signal.entry
                         _log_orb(state.cfg.symbol, state.orb.active_signal,
                                  "TIME EXIT", pnl, now)
+                        combined_history.append(RecentSignal(
+                            state.cfg.symbol, state.orb.active_signal, "TIME EXIT", pnl))
                         state.orb.active_signal = None
 
                 if new_orb and state.orb.active_signal is None:
