@@ -78,6 +78,9 @@ ORB_WINDOWS  = [    # (start_h, start_m, end_h, end_m, label)
 ]
 
 ET = ZoneInfo("America/New_York")
+CT = ZoneInfo("America/Chicago")
+
+TRADING_CUTOFF_CT = (15, 10)   # TopstepX closes at 15:10 CT; no new entries after this
 
 LOG_PATH = Path("logs/bot_trades.csv")
 ORB_LOG_PATH = Path("logs/orb_trades.csv")
@@ -952,7 +955,11 @@ def run(account_id: int | None, paper: bool):
                 no_position = not state.active_trade and not state.active_orb_trade
                 last_bar_ts = state.bars[-1].ts if state.bars else None
 
-                if no_position:
+                # Don't enter new trades after TopstepX daily cutoff
+                now_ct = now.astimezone(CT)
+                past_cutoff = (now_ct.hour, now_ct.minute) >= TRADING_CUTOFF_CT
+
+                if no_position and not past_cutoff:
                     sig = evaluate(state)
                     if sig and last_bar_ts != state.last_evaluated_ts:
                         state.last_evaluated_ts = last_bar_ts
@@ -964,7 +971,7 @@ def run(account_id: int | None, paper: bool):
                     elif last_bar_ts != state.last_evaluated_ts:
                         state.last_evaluated_ts = last_bar_ts
 
-                if no_position and state.instrument.orb_enabled:
+                if no_position and not past_cutoff and state.instrument.orb_enabled:
                     orb_sig = evaluate_orb(state)
                     if orb_sig:
                         place_orb_signal(client, state, orb_sig, account_id, paper)

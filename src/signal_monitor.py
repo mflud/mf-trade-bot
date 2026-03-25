@@ -316,6 +316,38 @@ def _pl_bar(pl: float, width: int = 20) -> str:
     return "".join(parts)
 
 
+def _signal_bar(val: float, threshold: float, max_val: float, width: int = 20) -> str:
+    """
+    Centered signed bar for scaled return, CSR, etc.
+    - Red   ░ region left  of -threshold
+    - Green ░ region right of +threshold
+    - Dim   ─ neutral zone between ±threshold
+    - Dim   │ at centre (val=0)
+    - Bold  █ marker coloured green (val>0) / red (val<0)
+    """
+    half    = width // 2
+    clamped = max(-max_val, min(max_val, val))
+    marker  = max(0, min(width - 1, half + int(round(clamped / max_val * half))))
+    thr_off = max(1, int(round(threshold / max_val * half)))
+    thr_lo  = half - thr_off   # left threshold position
+    thr_hi  = half + thr_off   # right threshold position
+
+    parts = []
+    for i in range(width):
+        if i == marker:
+            style = "bold green" if val > 0 else ("bold red" if val < 0 else "bold white")
+            parts.append(f"[{style}]█[/]")
+        elif i == half:
+            parts.append("[dim]│[/]")
+        elif i < thr_lo:
+            parts.append("[red]░[/]")
+        elif i >= thr_hi:
+            parts.append("[green]░[/]")
+        else:
+            parts.append("[dim]─[/]")
+    return "".join(parts)
+
+
 def _next_bar_close(now: datetime) -> datetime:
     epoch_min = int(now.timestamp() // 60)
     next_close_min = ((epoch_min // TF_MINUTES) + 1) * TF_MINUTES
@@ -400,39 +432,37 @@ def build_signal_panel(state: InstrumentState, now: datetime) -> Panel:
         sigma  = state.sigma
         scaled = math.log(bar.close / bar.open) / sigma if sigma and bar.open else 0.0
         vol_ratio = (bar.volume / state.mean_vol) if state.mean_vol is not None else None
-        sc_pct = min(abs(scaled) / SIGNAL_SIGMA * 100, 100)
-        vr_pct = min(vol_ratio   / VOL_RATIO_MIN * 100, 100) if vol_ratio is not None else 0.0
-        bar_sc = "█" * int(sc_pct / 5) + "░" * (20 - int(sc_pct / 5))
-        bar_vr = "█" * int(vr_pct / 5) + "░" * (20 - int(vr_pct / 5))
+        vr_pct  = min(vol_ratio / VOL_RATIO_MIN * 100, 100) if vol_ratio is not None else 0.0
+        bar_vr  = "█" * int(vr_pct / 5) + "░" * (20 - int(vr_pct / 5))
 
         t = Table.grid(padding=(0, 1))
         t.add_column(style="dim", width=16)
         t.add_column()
         csr       = state.csr
-        csr_pct   = min(abs(csr) / CSR_THRESHOLD * 100, 100)
-        bar_csr   = "█" * int(csr_pct / 5) + "░" * (20 - int(csr_pct / 5))
         csr_style = "green" if csr >= CSR_THRESHOLD else \
                     ("yellow" if csr > 0 else "red")
         csr_check = "✓" if csr >= CSR_THRESHOLD else \
                     ("~" if csr > 0 else "✗")
+        sc_style  = "green" if scaled > 0 else "red"
 
         t.add_row("Scaled return:",
-                  f"[yellow]{bar_sc}[/] {abs(scaled):.2f}σ / {SIGNAL_SIGMA:.0f}σ")
+                  f"{_signal_bar(scaled, SIGNAL_SIGMA, MAX_SCALED)} "
+                  f"[{sc_style}]{scaled:+.2f}σ[/] / {SIGNAL_SIGMA:.0f}σ")
 
+        now_utc   = datetime.now(timezone.utc)
+        open_min  = int(now_utc.timestamp() // 60) // TF_MINUTES * TF_MINUTES
+        bar_open  = datetime.fromtimestamp(open_min * 60, tz=timezone.utc)
+        elapsed_m = int((now_utc - bar_open).total_seconds() // 60)
         lb = state.live_bar
         if lb is not None and sigma:
-            now_utc    = datetime.now(timezone.utc)
-            open_min   = int(now_utc.timestamp() // 60) // TF_MINUTES * TF_MINUTES
-            bar_open   = datetime.fromtimestamp(open_min * 60, tz=timezone.utc)
-            elapsed_m  = int((now_utc - bar_open).total_seconds() // 60)
-            lb_ret     = math.log(lb.close / lb.open) if lb.open else 0.0
-            lb_scaled  = lb_ret / sigma
-            lb_pct     = min(abs(lb_scaled) / SIGNAL_SIGMA * 100, 100)
-            lb_bar     = "█" * int(lb_pct / 5) + "░" * (20 - int(lb_pct / 5))
-            lb_style   = ("green" if lb_scaled > 0 else "red") if abs(lb_scaled) >= SIGNAL_SIGMA \
-                         else ("yellow" if abs(lb_scaled) >= SIGNAL_SIGMA * 0.7 else "dim")
+            lb_ret    = math.log(lb.close / lb.open) if lb.open else 0.0
+            lb_scaled = lb_ret / sigma
+            num_style = "green" if lb_scaled > 0 else "red"
             t.add_row(f"Dev ({elapsed_m}m):",
-                      f"[{lb_style}]{lb_bar}[/] {lb_scaled:+.2f}σ")
+                      f"{_signal_bar(lb_scaled, SIGNAL_SIGMA, MAX_SCALED)} "
+                      f"[{num_style}]{lb_scaled:+.2f}σ[/]")
+        else:
+            t.add_row(f"Dev ({elapsed_m}m):", _signal_bar(0.0, SIGNAL_SIGMA, MAX_SCALED))
 
         t.add_row("Volume ratio:",
                   f"[yellow]{bar_vr}[/] {vol_ratio:.2f}× / {VOL_RATIO_MIN:.1f}×"
@@ -440,7 +470,8 @@ def build_signal_panel(state: InstrumentState, now: datetime) -> Panel:
                   f"[dim]{bar_vr}[/] warming up")
         mom_bars = get_mom_bars(state.gk_ann_vol, state.cfg.csr_vol_windows)
         t.add_row(f"Momentum({mom_bars * TF_MINUTES}m):",
-                  f"[{csr_style}]{bar_csr}[/] {csr:+.2f}σ / {CSR_THRESHOLD:.1f}σ {csr_check}")
+                  f"{_signal_bar(csr, CSR_THRESHOLD, CSR_THRESHOLD * 2)} "
+                  f"[{csr_style}]{csr:+.2f}σ[/] / {CSR_THRESHOLD:.1f}σ {csr_check}")
 
         pl = state.current_pl
         if pl is not None:
@@ -1125,7 +1156,7 @@ def _load_recent_history(hours: int = 24) -> list[RecentSignal]:
                         continue
                     sig = _HistSignal(
                         bar_ts=fired_at,
-                        direction=int(row["direction"]),
+                        direction=1 if row["direction"] == "LONG" else -1,
                         entry=float(row["entry"]),
                         target=float(row["target"]),
                         stop=float(row["stop"]),
