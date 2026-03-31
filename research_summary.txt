@@ -1,6 +1,6 @@
 MES/MYM Systematic Signal Research — Journey Summary
 ======================================================
-Written: 2026-03-15  |  Updated: 2026-03-23
+Written: 2026-03-15  |  Updated: 2026-03-31
 
 
 STARTING POINT
@@ -162,8 +162,15 @@ src/trading_bot.py
   Automated execution layer. Reads the same signal logic as signal_monitor but places
   real market orders on the Topstep practice account. Places orders with native API
   brackets so stop/target management is exchange-side. Monitors open positions and
-  force-closes any position held longer than 15 minutes. Classifies exits as TARGET,
-  STOPPED, or TIME EXIT, and logs all trades to logs/bot_trades.csv.
+  force-closes any position held longer than MAX_HOLD_MIN. Classifies exits as TARGET,
+  STOPPED, TRAIL STOP, or TIME EXIT, and logs all trades to separate CSV files by
+  signal type (logs/bot_trades.csv, logs/orb_trades.csv, logs/vwaslr_trades.csv).
+
+  Three signal types run in parallel; only one position per instrument at a time
+  (all types share the per-instrument lock):
+    - CSR 3σ continuation: 2σ API bracket (safety net) + 0.5σ software trailing stop
+    - ORB: 2σ bracket, LONG only, wide ORB filter
+    - VWASLR: 2σ bracket (safety net) + 1.5σ software trailing stop
 
   Safety: hardcoded to account PRAC-V2-88916-19336808 (id=10634862). The account name
   string is verified at startup; the bot will not run against any other account.
@@ -841,15 +848,166 @@ ORB results used to set parameters (from backtest_orb.py, 7-year history):
   M2K 15-min wide ORB, morning, 2σ stop/target: EV ≈ +0.61R  Total +170R
 
 
+VWASLR STRATEGY (2026-03-23)
+------------------------------
+A third signal type — Volume-Weighted Average Scaled Log Return — was developed and
+added to both signal_monitor.py and trading_bot.py.
+
+DEFINITION
+  VWASLR = Σ(volume_i × log_return_i) / (Σvolume_i × σ)
+  over the last N 5-min bars. σ is computed from a slow 500-min (100 × 5-min) trailing
+  window to provide a stable normalisation. The result is a signed value in σ/bar units;
+  positive = volume-weighted upward drift, negative = downward drift.
+
+SIGNAL RULE
+  A LONG signal fires when VWASLR crosses above +threshold (from below); SHORT when it
+  crosses below -threshold (from above). The signal represents sustained momentum in a
+  direction that is confirmed by volume weighting — not a single spike bar, but a
+  directional trend with volume behind it.
+
+  RTH only: 9:30–16:00 ET (blackout windows inherited from per-instrument config).
+
+PARAMETERS (from backtest optimisation)
+  MES: N=10 bars (50 min), threshold=1.0σ/bar, EV=+0.091σ
+  MYM: N=10 bars (50 min), threshold=0.5σ/bar, EV=+0.066σ
+
+  σ-window: 100 bars = 500 min (chosen for stability; calibrated on 5-min bars only).
+  Same 2σ stop / 3σ target structure as the CSR momentum signal.
+  VWASLR trades logged to logs/vwaslr_trades.csv (separate from bot_trades.csv).
+
+DISPLAY
+  signal_monitor.py shows a dedicated VWASLR panel per instrument (below the main
+  signal panel) with: current value vs ±threshold, a bar chart, and — when a signal
+  is active — the entry price and live trailing stop level.
+
+
+OVERNIGHT GLOBEX EVALUATION (2026-03-23)
+-----------------------------------------
+CSR and VWASLR strategies were tested during overnight Globex hours (roughly 18:00 ET
+to 09:30 ET). Finding: not viable for drift-following strategies.
+
+MECHANISM: During overnight hours, the order book is thin. What appears as sustained
+directional momentum (VWASLR crossing threshold, CSR building) is partly an artefact
+of low liquidity — a relatively small order causes a price spike that looks like a
+signal, but the position immediately attracts adverse flow once the book refills. This
+is order book fragility, not genuine price discovery.
+
+RESULT: Overnight blackout windows were added to both instruments:
+  MES: 18:00–08:00 ET unconditional (overnight Globex + pre-open)
+  MYM: 18:00–09:00 ET unconditional (same, with an extended pre-open)
+
+TWO POSSIBLE EXCEPTIONS (not yet implemented — require purpose-built approach):
+  1. Sunday open: genuine price discovery after the weekend gap; real order flow.
+  2. Post-NYSE-close news momentum: news-driven moves have actual order flow, not just
+     drift. Different from intraday momentum in both mechanism and required response time.
+  Any future Globex strategy must account for thin book depth throughout.
+
+
+MFE / MAE ANALYSIS (2026-03-31)
+---------------------------------
+Script: src/analyze_mfe.py
+
+For each logged trade (CSR, ORB, VWASLR), the script fetches 1-min bars over the hold
+period and computes:
+  MFE — Max Favourable Excursion: best price achievable from entry (peak unrealised gain)
+  MAE — Max Adverse  Excursion:   worst drawdown seen from entry (peak unrealised loss)
+  Capture % = actual_pnl / MFE  (how much of the peak profit was kept)
+
+KEY FINDING: All three strategies show positive average MFE — the signal direction is
+correct — but negative or near-zero actual P&L. The problem is exits, not signals.
+
+Sample results at the time of analysis (live trades, small sample):
+  VWASLR: avg MFE ≈ +42 pts  actual avg ≈ -19 pts  capture ≈ negative
+  CSR:    avg MFE ≈ +65 pts  actual avg ≈ -10 pts  capture ≈ low
+
+The gap between MFE and actual P&L motivated the trailing stop research below: if
+the trade gets to its peak and then retraces all the way to the stop, the fixed stop
+captures nothing. A trailing stop that locks in part of the peak gain addresses this.
+
+
+TRAILING STOP BACKTEST (2026-03-31)
+--------------------------------------
+Script: src/backtest_trailing.py
+
+Methodology: for each logged trade, fetches 1-min bars over the MAX_HOLD_MIN window
+and simulates fixed-stop vs trailing stop outcomes. Trail distances swept: 0.5σ, 1.0σ,
+1.5σ, 2.0σ (in σ_pts units). Conservative OHLC simulation used throughout: adverse
+side (stop) tested before peak update within each bar — same convention as all other
+bar-scan functions.
+
+Bar cache (logs/trailing_bar_cache.json) avoids re-fetching on reruns. 429 rate-limit
+handling added: 1.0s pause between requests, retry with 10s×attempt backoff.
+
+RESULTS BY STRATEGY:
+
+  CSR (34 trades):
+    Best trail: 0.5σ  →  +146 pts total vs fixed -593 pts  (Δ+739 pts)
+    The CSR momentum signal is a spike — price moves sharply, then fades quickly.
+    A tight trail locks in the initial spike gain rather than waiting for the fixed stop.
+
+  ORB (small sample):
+    Fixed stop best. ORB trades are wide-range breakouts; the move needs room.
+    A trailing stop tightened too early exits breakouts that would have continued.
+
+  VWASLR (16 trades, limited sample):
+    Fixed stop marginally better in the small sample. One bad day dominated results.
+    Sample too small to be conclusive; 1.5σ chosen conservatively (wider than CSR).
+
+TRAILING STOP IMPLEMENTATION
+  CSR:    0.5σ software trail + 2σ API bracket safety net
+  VWASLR: 1.5σ software trail + 2σ API bracket safety net
+  ORB:    no trailing stop (fixed bracket only)
+
+  The API bracket (2σ) remains on the exchange at all times as a hard safety net for
+  connectivity loss. The software trail (checked every 30s poll cycle) fires first
+  under normal conditions. When trail fires: cancel brackets → close_position →
+  log "TRAIL STOP" outcome.
+
+  ActiveTrade and ActiveVwasrlTrade dataclasses both carry trail_peak and
+  trail_stop_level fields updated each poll cycle. signal_monitor.py shows the
+  live trail stop level and peak price in the signal/VWASLR panels.
+
+
+OUTCOME CLASSIFICATION FIX (2026-03-31)
+-----------------------------------------
+A systematic bug was found in all bar-scan outcome classifiers: target was checked
+before stop within each bar (optimistic ordering). In a volatile bar that touches
+both target and stop in the same candle, this incorrectly recorded TARGET when the
+stop actually fired first.
+
+Evidence: multiple VWASLR trades in logs/vwaslr_trades.csv showed pnl_sigma = exactly
+3.0 (the theoretical target multiple) despite the practice account showing a loss. This
+pattern indicates _get_exit_price() returned None and the bar-scan fallback was used,
+returning trade.target_price() from the optimistic check.
+
+FIX: All four bar-scan functions updated to check stop first (conservative/adverse-first
+OHLC ordering):
+  trading_bot.py:    _classify_vwaslr_outcome, _classify_orb_outcome
+  signal_monitor.py: _check_resolution (CSR), _check_orb_resolution
+
+This is now consistent with backtest_trailing.py and _check_csr_trail_resolution, which
+already used adverse-first ordering.
+
+The primary path (_get_exit_price → direction-aware check) was already correct from an
+earlier fix; this closes the fallback path.
+
+
 WHAT REMAINS OPEN
 ------------------
 - 5-second bar analysis: insufficient data yet; revisit after several weeks of
   continuous recording.
-- Live signal performance tracking: bot trades logged to logs/bot_trades.csv and
-  logs/orb_trades.csv will accumulate real signal outcomes against backtest predictions.
+- Live signal performance tracking: bot trades logged to logs/bot_trades.csv,
+  logs/orb_trades.csv, and logs/vwaslr_trades.csv will accumulate real signal
+  outcomes against backtest predictions.
 - Dynamic CSR window out-of-sample validation: the two-tier rule was selected on
   in-sample data; live performance will provide the first true out-of-sample test.
+- VWASLR trailing stop validation: 1.5σ chosen conservatively (backtest sample too
+  small at 16 trades). Revisit when more live VWASLR trades have accumulated.
+- ORB trailing stop: backtest showed fixed bracket is better, but sample was small.
+  Worth re-evaluating once the ORB trade log has grown.
 - DOM + 5-sec bar research: revisit once 6-12 months of data has accumulated.
 - Co-firing position guard: consider adding logic to trading_bot.py to reduce
   M2K size (or skip) when both MES and M2K signal in the same direction within
   the same session, given the 0.67 correlation (particularly at NYSE hours r=0.78).
+- Sunday open / post-close Globex strategy: may have genuine edge (real order flow)
+  but requires a purpose-built approach accounting for thin book depth.
