@@ -6,21 +6,24 @@ as signal_monitor.py, places market orders with native API bracket
 stops/targets, force-closes at 15-minute expiry if brackets not hit, and
 logs every trade outcome to logs/bot_trades.csv.
 
-Signal criteria (identical to signal_monitor.py):
+Signal types:
+
+  Primary (3σ CSR momentum) — 2σ bracket stop (safety net) + 0.5σ software trailing stop:
   1. |bar_return / σ| ≥ 3.0   (σ = trailing 100-min close-return std dev)
   2. Volume ≥ 1.5× trailing mean volume
   3. 40-min CSR ≥ 1.5σ aligned with signal direction (momentum filter)
-  4. Not in instrument-specific blackout window (DST-aware, per-instrument):
-       MES: 08:00–09:00 ET conditional (block only if CSR<1.5; tech earnings pre-mkt)
-       MYM: 09:00–09:30 ET unconditional; 15:00–16:00 ET unconditional
+  4. Not in instrument-specific blackout window
   5. |scaled| ≤ 5.0 (extreme event filter)
 
-Execution:
-  - 1 contract market order per signal, per instrument
-  - Native API bracket: stop = 2σ below entry, target = 3σ above entry
-    (both in ticks, OCO-managed server-side)
-  - Force-close at market after 25 minutes if neither bracket is hit
-  - Only one position per instrument at a time
+  ORB (opening range breakout, MES/MYM/M2K):
+  - 15-min opening range (9:30–9:45 ET); breakout in morning window (9:45–10:30 ET)
+  - ORB width ≥ instrument-specific wide-range cutoff (from backtest)
+
+  VWASLR (volume-weighted avg scaled log return, MES/MYM only):
+  - VWASLR(50min, σ=500min) crosses ±threshold; RTH only (9:30–16:00 ET)
+  - MES: threshold=1.0σ/bar (EV=+0.091σ)  MYM: threshold=0.5σ/bar (EV=+0.066σ)
+
+Only one position per instrument at a time (all signal types share the lock).
 
 Usage:
   python src/trading_bot.py                  # live trading (requires .env)
@@ -34,7 +37,9 @@ import logging
 import math
 import os
 import random
+import subprocess
 import time
+import threading
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -69,6 +74,18 @@ POLL_SECONDS  = 30
 PL_N_BARS = 10    # 1-min bars to look back for PL computation
 PL_THRESH = 0.50  # PL_aligned ≥ this → 2× sizing
 
+# ── VWASLR parameters (keep in sync with signal_monitor.py) ─────────────────
+VWASLR_SIGMA_BARS   = 100   # 100 × 5-min = 500-min σ window (slow/stable)
+VWASLR_STOP_SIGMA   = 2.0
+VWASLR_TARGET_SIGMA = 3.0
+
+# ── Trailing stops (keep in sync with signal_monitor.py) ────────────────────
+# Software trailing stops replace fixed targets/stops for signal monitoring.
+# The bracket stop (stop_sigma=2σ) stays as a hard safety net on the API.
+# Trail fires when price retraces TRAIL_SIGMA * sigma_pts from its peak.
+CSR_TRAIL_SIGMA    = 0.5   # tight — CSR momentum fades quickly after initial spike
+VWASLR_TRAIL_SIGMA = 1.5   # wider — VWASLR moves tend to run longer
+
 # ── ORB parameters (keep in sync with signal_monitor.py) ────────────────────
 ORB_BARS     = 3    # 3 × 5-min = 15-min opening range
 ORB_STOP_SIG = 2.0
@@ -82,8 +99,14 @@ CT = ZoneInfo("America/Chicago")
 
 TRADING_CUTOFF_CT = (15, 10)   # TopstepX closes at 15:10 CT; no new entries after this
 
-LOG_PATH = Path("logs/bot_trades.csv")
-ORB_LOG_PATH = Path("logs/orb_trades.csv")
+LOG_PATH      = Path("logs/bot_trades.csv")
+ORB_LOG_PATH  = Path("logs/orb_trades.csv")
+VWAS_LOG_PATH = Path("logs/vwaslr_trades.csv")
+VWAS_LOG_FIELDS = [
+    "fired_at", "resolved_at", "symbol", "direction",
+    "est_entry", "fill_price", "target", "stop",
+    "sigma_pts", "vwaslr", "outcome", "pnl_pts", "pnl_sigma",
+]
 ORB_LOG_FIELDS = [
     "fired_at", "resolved_at", "symbol", "direction",
     "est_entry", "fill_price", "target", "stop",
@@ -99,6 +122,15 @@ LOG_FIELDS = [
 ]
 
 log = logging.getLogger("bot")
+
+TRADE_SOUND = "/System/Library/Sounds/Hero.aiff"
+
+def play_trade_sound():
+    """Play trade-execution sound non-blocking."""
+    threading.Thread(
+        target=lambda: subprocess.run(["afplay", TRADE_SOUND], check=False),
+        daemon=True,
+    ).start()
 
 
 # ── Instrument config ────────────────────────────────────────────────────────
@@ -116,30 +148,42 @@ class BotInstrument:
     # Per-instrument blackout windows: (start_h, start_m, end_h, end_m, conditional)
     # conditional=True: block only when CSR < threshold; False: always block.
     blackout_windows: list = field(default_factory=list)
-    # ORB: set orb_enabled=True and orb_width_min to wide-tertile cutoff from backtest.
-    orb_enabled:   bool  = False
-    orb_width_min: float = 0.0
+    # ORB: set orb_enabled=True and orb_width_pct_min to wide-tertile cutoff from backtest.
+    # Width threshold is a fraction of ORB midpoint price (e.g. 0.00354 = 0.354%).
+    orb_enabled:       bool  = False
+    orb_width_pct_min: float = 0.0
+    # VWASLR: 0 = disabled. n = look-back bars; threshold = signal level in σ/bar units.
+    vwaslr_n:         int   = 0
+    vwaslr_threshold: float = 1.0
 
 
 INSTRUMENTS = [
     BotInstrument("MES", "MES", tick_size=0.25, point_value=5.00,
                   csr_vol_windows=[(0.08, 4), (1.0, 8)],
                   blackout_windows=[
-                      (8, 0, 9, 0, True),   # econ releases: block only if CSR<1.5
+                      (18,  0,  8,  0, False),  # overnight Globex: no edge, unvalidated
+                      (8,   0,  9,  0, True),   # econ releases: block only if CSR<1.5
+                      (15, 45, 18,  0, False),  # EOD volatility + daily break until Globex open
                   ],
-                  orb_enabled=True, orb_width_min=15.25),
+                  orb_enabled=True, orb_width_pct_min=0.00354,
+                  vwaslr_n=10, vwaslr_threshold=1.0),   # N=10/thr=1.0 → EV=+0.091σ
     BotInstrument("MYM", "MYM", tick_size=1.00, point_value=0.50,
                   csr_vol_windows=[(0.08, 4), (1.0, 8)],
                   blackout_windows=[
-                      (9,  0,  9, 30, False),  # pre-open: EV=-0.076σ CSR-filtered
-                      (15, 0, 16,  0, False),  # NYSE close: EV=-0.375σ CSR-filtered
-                  ]),
+                      (18,  0,  9,  0, False),  # overnight Globex + pre-open
+                      (9,   0,  9, 30, False),  # pre-open RTH gap: EV=-0.076σ
+                      (15, 45, 18,  0, False),  # EOD volatility + daily break until Globex open
+                  ],
+                  orb_enabled=True, orb_width_pct_min=0.00402,
+                  vwaslr_n=10, vwaslr_threshold=0.5),   # N=10/thr=0.5 → EV=+0.066σ
     BotInstrument("M2K", "M2K", tick_size=0.10, point_value=5.00,
                   csr_vol_windows=[(0.08, 4), (1.0, 8)],
                   blackout_windows=[
-                      (8, 0, 9, 0, True),   # econ releases: block only if CSR<1.5
+                      (18,  0,  8,  0, False),  # overnight Globex: no edge, unvalidated
+                      (8,   0,  9,  0, True),   # econ releases: block only if CSR<1.5
+                      (15, 45, 18,  0, False),  # EOD volatility + daily break until Globex open
                   ],
-                  orb_enabled=True, orb_width_min=14.30),
+                  orb_enabled=True, orb_width_pct_min=0.00715),
 ]
 
 
@@ -166,11 +210,13 @@ class ActiveTrade:
     vol_ratio:   float
     csr:         float
     fired_at:    datetime
-    pl_aligned:  float | None = None
-    contracts:   int = 1
-    order_id:    int | None = None
-    fill_price:  float | None = None
-    expires_at:  datetime = field(init=False)
+    pl_aligned:       float | None = None
+    contracts:        int = 1
+    order_id:         int | None = None
+    fill_price:       float | None = None
+    trail_peak:       float | None = None   # most favourable price seen since fill
+    trail_stop_level: float | None = None   # current trailing stop price
+    expires_at:       datetime = field(init=False)
 
     def __post_init__(self):
         self.expires_at = self.fired_at + timedelta(minutes=MAX_HOLD_MIN)
@@ -194,6 +240,7 @@ class OrbSignal:
     sigma_pts: float
     window:    str
     bar_ts:    datetime
+    direction: int = 1    # 1 = LONG, -1 = SHORT
 
     def target_pts(self): return abs(self.target - self.entry)
     def stop_pts(self):   return abs(self.stop   - self.entry)
@@ -211,6 +258,44 @@ class OrbState:
 
 
 @dataclass
+class VwasrlSignal:
+    entry:     float
+    target:    float
+    stop:      float
+    sigma_pts: float
+    vwaslr:    float
+    bar_ts:    datetime
+    direction: int = 1
+
+    def target_pts(self): return abs(self.target - self.entry)
+    def stop_pts(self):   return abs(self.stop   - self.entry)
+
+
+@dataclass
+class ActiveVwasrlTrade:
+    instrument:  BotInstrument
+    contract_id: str
+    sig:         VwasrlSignal
+    fired_at:    datetime
+    order_id:         int | None = None
+    fill_price:       float | None = None
+    trail_peak:       float | None = None   # most favourable price seen since fill
+    trail_stop_level: float | None = None   # current trailing stop price
+    expires_at:       datetime = field(init=False)
+
+    def __post_init__(self):
+        self.expires_at = self.fired_at + timedelta(minutes=MAX_HOLD_MIN)
+
+    def target_price(self) -> float:
+        p = self.fill_price or self.sig.entry
+        return p + self.sig.direction * self.sig.target_pts()
+
+    def stop_price(self) -> float:
+        p = self.fill_price or self.sig.entry
+        return p - self.sig.direction * self.sig.stop_pts()
+
+
+@dataclass
 class ActiveOrbTrade:
     instrument:  BotInstrument
     contract_id: str
@@ -225,11 +310,11 @@ class ActiveOrbTrade:
 
     def target_price(self) -> float:
         p = self.fill_price or self.sig.entry
-        return p + self.sig.target_pts()
+        return p + self.sig.direction * self.sig.target_pts()
 
     def stop_price(self) -> float:
         p = self.fill_price or self.sig.entry
-        return p - self.sig.stop_pts()
+        return p - self.sig.direction * self.sig.stop_pts()
 
 
 @dataclass
@@ -242,10 +327,12 @@ class InstrumentState:
     mean_vol:           float | None = None
     gk_ann_vol:         float = 0.0
     csr:                float = 0.0
-    active_trade:       ActiveTrade | None = None
-    active_orb_trade:   ActiveOrbTrade | None = None
-    orb:                OrbState = field(default_factory=OrbState)
-    last_evaluated_ts:  datetime | None = None
+    active_trade:         ActiveTrade | None = None
+    active_orb_trade:     ActiveOrbTrade | None = None
+    active_vwaslr_trade:  ActiveVwasrlTrade | None = None
+    orb:                  OrbState = field(default_factory=OrbState)
+    last_evaluated_ts:    datetime | None = None
+    vwaslr_last_ts:       datetime | None = None
 
 
 # ── Trade logging ────────────────────────────────────────────────────────────
@@ -289,6 +376,16 @@ def _log_trade(trade: ActiveTrade, outcome: str, exit_price: float, now: datetim
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
+
+def _in_blackout(bar_hm: tuple[int, int],
+                 sh: int, sm: int, eh: int, em: int) -> bool:
+    """Return True if bar_hm falls inside the [start, end) window.
+    Handles overnight windows where start > end (e.g. 18:00–09:00)."""
+    s = sh * 60 + sm
+    e = eh * 60 + em
+    b = bar_hm[0] * 60 + bar_hm[1]
+    return (s <= b < e) if s < e else (b >= s or b < e)
+
 
 GK_VOL_BARS   = 20
 BARS_PER_YEAR = 252 * 23 * 60
@@ -394,7 +491,7 @@ def evaluate(state: InstrumentState) -> dict | None:
     bar_et = last.ts.astimezone(ET)
     bar_hm = (bar_et.hour, bar_et.minute)
     for sh, sm, eh, em, conditional in state.instrument.blackout_windows:
-        if (sh, sm) <= bar_hm < (eh, em):
+        if _in_blackout(bar_hm, sh, sm, eh, em):
             if not conditional or csr < CSR_THRESHOLD:
                 return None
 
@@ -419,7 +516,9 @@ def evaluate(state: InstrumentState) -> dict | None:
 def fetch_bars(client: TopstepClient, state: InstrumentState):
     end      = datetime.now(timezone.utc)
     max_mom  = max(bars for inst in INSTRUMENTS for _, bars in inst.csr_vol_windows)
-    lookback = TRAILING_BARS + max_mom + 10
+    csr_lookback   = TRAILING_BARS + max_mom + 10
+    vwaslr_lookback = VWASLR_SIGMA_BARS + 15   # 100 σ-bars + n_win + margin
+    lookback = max(csr_lookback, vwaslr_lookback)
     start    = end - timedelta(minutes=TF_MINUTES * lookback)
     raw = client.get_bars(
         contract_id=state.contract_id,
@@ -529,6 +628,56 @@ def handle_active_trade(client: TopstepClient, state: InstrumentState,
     if pos and trade.fill_price is None:
         trade.fill_price = pos.get("averagePrice")
         log.info(f"{trade.instrument.symbol} fill confirmed: {trade.fill_price:.2f}")
+        play_trade_sound()
+
+    # Software trailing stop for CSR trades.
+    # The bracket stop at 2σ remains as a safety net; this fires earlier.
+    if pos and trade.fill_price is not None and state.bars:
+        fill       = trade.fill_price
+        trail_dist = CSR_TRAIL_SIGMA * trade.sigma_pts
+        bars_after = [b for b in state.bars if b.ts >= trade.fired_at]
+        if bars_after:
+            if trade.direction == 1:   # LONG — track highest high
+                new_peak = max(b.high for b in bars_after)
+                trade.trail_peak = max(new_peak, fill)
+                trade.trail_stop_level = trade.trail_peak - trail_dist
+            else:                      # SHORT — track lowest low
+                new_peak = min(b.low for b in bars_after)
+                trade.trail_peak = min(new_peak, fill)
+                trade.trail_stop_level = trade.trail_peak + trail_dist
+
+            last_bar   = state.bars[-1]
+            trail_stop = trade.trail_stop_level
+            trail_hit  = (
+                last_bar.ts > trade.fired_at and trail_stop is not None and (
+                    (trade.direction ==  1 and last_bar.low  <= trail_stop) or
+                    (trade.direction == -1 and last_bar.high >= trail_stop)
+                )
+            )
+            if trail_hit:
+                log.info(
+                    f"{trade.instrument.symbol} TRAIL STOP  "
+                    f"trail_stop={trail_stop:.2f}  peak={trade.trail_peak:.2f}  "
+                    f"trail={CSR_TRAIL_SIGMA}σ={trail_dist:.2f}pts"
+                )
+                try:
+                    n = client.cancel_all_orders(account_id)
+                    if n:
+                        log.info(f"{trade.instrument.symbol}: cancelled {n} bracket(s) before trail close")
+                except Exception as e:
+                    log.warning(f"{trade.instrument.symbol}: pre-trail cancel failed: {e}")
+                try:
+                    client.close_position(account_id, trade.contract_id)
+                except Exception as e:
+                    log.error(f"{trade.instrument.symbol}: trail close_position failed: {e}")
+                    return
+                _log_trade(trade, "TRAIL STOP", trail_stop, now)
+                state.active_trade = None
+                try:
+                    client.cancel_all_orders(account_id)
+                except Exception:
+                    pass
+                return
 
     if pos is None:
         # Position is gone — brackets closed it; cancel any residual OCO orders
@@ -536,10 +685,11 @@ def handle_active_trade(client: TopstepClient, state: InstrumentState,
                                      trade.contract_id, now)
         if exit_price is not None:
             # Actual fill from trade history — classify by proximity to brackets
-            if abs(exit_price - trade.target_price()) <= abs(exit_price - trade.stop_price()):
-                outcome = "TARGET"
-            else:
-                outcome = "STOPPED"
+            # Direction-aware: for LONG target > entry, for SHORT target < entry
+            d = trade.direction
+            outcome = ("TARGET" if (d == 1 and exit_price >= trade.target_price()) or
+                                   (d == -1 and exit_price <= trade.target_price())
+                       else "STOPPED")
         else:
             # Lookup failed — infer from bar highs/lows (accurate to ~1 tick)
             outcome, exit_price = _classify_outcome_from_bars(trade, state.bars)
@@ -622,13 +772,13 @@ def _ensure_orb_log():
 
 def _log_orb_trade(trade: ActiveOrbTrade, outcome: str, exit_price: float, now: datetime):
     fill = trade.fill_price or trade.sig.entry
-    pnl_pts = exit_price - fill      # ORB is always LONG
+    pnl_pts = (exit_price - fill) * trade.sig.direction
     risk     = trade.sig.risk_pts()
     row = {
         "fired_at":    trade.fired_at.isoformat(),
         "resolved_at": now.isoformat(),
         "symbol":      trade.instrument.symbol,
-        "direction":   "LONG",
+        "direction":   "LONG" if trade.sig.direction == 1 else "SHORT",
         "est_entry":   round(trade.sig.entry, 4),
         "fill_price":  round(fill, 4),
         "target":      round(trade.target_price(), 4),
@@ -705,8 +855,10 @@ def evaluate_orb(state: InstrumentState) -> OrbSignal | None:
     if window == "Morning" and orb.morning_fired:
         return None
 
-    orb_width = orb.orb_high - orb.orb_low
-    if orb_width < state.instrument.orb_width_min:
+    orb_width     = orb.orb_high - orb.orb_low
+    orb_mid       = (orb.orb_high + orb.orb_low) / 2.0
+    orb_width_pct = orb_width / orb_mid if orb_mid > 0 else 0.0
+    if orb_width_pct < state.instrument.orb_width_pct_min:
         return None
     if state.sigma_pts <= 0:
         return None
@@ -719,6 +871,20 @@ def evaluate_orb(state: InstrumentState) -> OrbSignal | None:
             stop=entry   - ORB_STOP_SIG * state.sigma_pts,
             orb_high=orb.orb_high, orb_low=orb.orb_low,
             sigma_pts=state.sigma_pts, window=window, bar_ts=bar.ts,
+            direction=1,
+        )
+        orb.morning_fired = True
+        return sig
+
+    if bar.close < orb.orb_low:
+        entry = bar.close
+        sig = OrbSignal(
+            entry=entry,
+            target=entry - ORB_TGT_SIG * state.sigma_pts,
+            stop=entry   + ORB_STOP_SIG * state.sigma_pts,
+            orb_high=orb.orb_high, orb_low=orb.orb_low,
+            sigma_pts=state.sigma_pts, window=window, bar_ts=bar.ts,
+            direction=-1,
         )
         orb.morning_fired = True
         return sig
@@ -730,12 +896,16 @@ def evaluate_orb(state: InstrumentState) -> OrbSignal | None:
 
 def place_orb_signal(client: TopstepClient, state: InstrumentState,
                      sig: OrbSignal, account_id: int, paper: bool) -> ActiveOrbTrade:
-    inst     = state.instrument
-    tick     = inst.tick_size
+    inst      = state.instrument
+    tick      = inst.tick_size
+    is_long   = sig.direction == 1
+    dir_label = "LONG" if is_long else "SHORT"
     stop_mag   = max(1, round(sig.stop_pts()   / tick))
     target_mag = max(1, round(sig.target_pts() / tick))
-    stop_ticks   = -stop_mag    # long: stop below entry
-    target_ticks =  target_mag  # long: target above entry
+    # For LONG:  stop below entry (negative ticks), target above (positive ticks)
+    # For SHORT: stop above entry (positive ticks), target below (negative ticks)
+    stop_ticks   = -stop_mag   if is_long else  stop_mag
+    target_ticks =  target_mag if is_long else -target_mag
 
     trade = ActiveOrbTrade(
         instrument=inst, contract_id=state.contract_id,
@@ -744,16 +914,17 @@ def place_orb_signal(client: TopstepClient, state: InstrumentState,
 
     if paper:
         log.info(
-            f"[PAPER] ORB {inst.symbol} LONG  entry≈{sig.entry:.2f}  "
-            f"target={sig.target:.2f} (+{sig.target_pts():.2f}pts)  "
-            f"stop={sig.stop:.2f} (-{sig.stop_pts():.2f}pts)  "
+            f"[PAPER] ORB {inst.symbol} {dir_label}  entry≈{sig.entry:.2f}  "
+            f"target={sig.target:.2f} ({sig.target_pts():.2f}pts)  "
+            f"stop={sig.stop:.2f} ({sig.stop_pts():.2f}pts)  "
             f"window={sig.window}  orb={sig.orb_low:.2f}–{sig.orb_high:.2f}"
         )
     else:
+        order_side = TopstepClient.BID if is_long else TopstepClient.ASK
         resp = client.place_order(
             account_id=account_id,
             contract_id=state.contract_id,
-            side=TopstepClient.BID,
+            side=order_side,
             size=1,
             order_type=TopstepClient.ORDER_MARKET,
             stop_loss_ticks=stop_ticks,
@@ -762,7 +933,7 @@ def place_orb_signal(client: TopstepClient, state: InstrumentState,
         )
         trade.order_id = resp.get("orderId")
         log.info(
-            f"ORB ORDER  {inst.symbol} LONG  order_id={trade.order_id}  "
+            f"ORB ORDER  {inst.symbol} {dir_label}  order_id={trade.order_id}  "
             f"entry≈{sig.entry:.2f}  stop={stop_ticks}t  target={target_ticks}t  "
             f"window={sig.window}"
         )
@@ -798,13 +969,16 @@ def handle_active_orb_trade(client: TopstepClient, state: InstrumentState,
     if pos and trade.fill_price is None:
         trade.fill_price = pos.get("averagePrice")
         log.info(f"ORB {trade.instrument.symbol} fill confirmed: {trade.fill_price:.2f}")
+        play_trade_sound()
 
     if pos is None:
         exit_price = _get_exit_price(client, account_id, trade.fired_at,
                                      trade.contract_id, now)
         if exit_price is not None:
-            outcome = ("TARGET" if abs(exit_price - trade.target_price())
-                       <= abs(exit_price - trade.stop_price()) else "STOPPED")
+            d = trade.sig.direction
+            outcome = ("TARGET" if (d == 1 and exit_price >= trade.target_price()) or
+                                   (d == -1 and exit_price <= trade.target_price())
+                       else "STOPPED")
         else:
             outcome, exit_price = _classify_orb_outcome(trade, state.bars)
         _log_orb_trade(trade, outcome, exit_price, now)
@@ -844,7 +1018,7 @@ def _get_exit_price(client: TopstepClient, account_id: int,
         closing = [
             t for t in trades
             if t.get("contractId") == contract_id
-            and datetime.fromisoformat(t.get("timestamp", "1970")).replace(tzinfo=timezone.utc)
+            and datetime.fromisoformat(t.get("timestamp", "1970-01-01T00:00:00")).replace(tzinfo=timezone.utc)
                 > fired_at
         ]
         if closing:
@@ -857,13 +1031,305 @@ def _get_exit_price(client: TopstepClient, account_id: int,
 
 
 def _classify_orb_outcome(trade: ActiveOrbTrade, bars: list[Bar]) -> tuple[str, float]:
+    # Conservative (adverse-first): check stop before target within each bar.
     for bar in bars:
         if bar.ts <= trade.fired_at:
             continue
-        if bar.high >= trade.target_price():
-            return "TARGET",  trade.target_price()
-        if bar.low  <= trade.stop_price():
-            return "STOPPED", trade.stop_price()
+        if trade.sig.direction == 1:   # LONG
+            if bar.low  <= trade.stop_price():
+                return "STOPPED", trade.stop_price()
+            if bar.high >= trade.target_price():
+                return "TARGET",  trade.target_price()
+        else:                          # SHORT
+            if bar.high >= trade.stop_price():
+                return "STOPPED", trade.stop_price()
+            if bar.low  <= trade.target_price():
+                return "TARGET",  trade.target_price()
+    last_close = bars[-1].close if bars else (trade.fill_price or trade.sig.entry)
+    if abs(last_close - trade.target_price()) <= abs(last_close - trade.stop_price()):
+        return "TARGET",  trade.target_price()
+    return "STOPPED", trade.stop_price()
+
+
+# ── VWASLR signal ────────────────────────────────────────────────────────────
+
+def _ensure_vwaslr_log():
+    VWAS_LOG_PATH.parent.mkdir(exist_ok=True)
+    if not VWAS_LOG_PATH.exists():
+        with open(VWAS_LOG_PATH, "w", newline="") as f:
+            csv.DictWriter(f, fieldnames=VWAS_LOG_FIELDS).writeheader()
+
+
+def _log_vwaslr_trade(trade: ActiveVwasrlTrade, outcome: str,
+                      exit_price: float, now: datetime):
+    fill    = trade.fill_price or trade.sig.entry
+    pnl_pts = (exit_price - fill) * trade.sig.direction
+    row = {
+        "fired_at":    trade.fired_at.isoformat(),
+        "resolved_at": now.isoformat(),
+        "symbol":      trade.instrument.symbol,
+        "direction":   "LONG" if trade.sig.direction == 1 else "SHORT",
+        "est_entry":   round(trade.sig.entry, 4),
+        "fill_price":  round(fill, 4),
+        "target":      round(trade.target_price(), 4),
+        "stop":        round(trade.stop_price(), 4),
+        "sigma_pts":   round(trade.sig.sigma_pts, 4),
+        "vwaslr":      round(trade.sig.vwaslr, 4),
+        "outcome":     outcome,
+        "pnl_pts":     round(pnl_pts, 4),
+        "pnl_sigma":   round(pnl_pts / trade.sig.sigma_pts, 4) if trade.sig.sigma_pts else 0.0,
+    }
+    with open(VWAS_LOG_PATH, "a", newline="") as f:
+        csv.DictWriter(f, fieldnames=VWAS_LOG_FIELDS).writerow(row)
+    dir_s = "LONG" if trade.sig.direction == 1 else "SHORT"
+    log.info(
+        f"VWASLR LOGGED  {trade.instrument.symbol} {dir_s}  {outcome}  "
+        f"fill={fill:.2f}  exit={exit_price:.2f}  "
+        f"pnl={pnl_pts:+.2f}pts ({pnl_pts / trade.sig.sigma_pts:+.3f}σ)"
+        if trade.sig.sigma_pts else
+        f"VWASLR LOGGED  {trade.instrument.symbol} {dir_s}  {outcome}"
+    )
+
+
+def evaluate_vwaslr(state: InstrumentState) -> VwasrlSignal | None:
+    """
+    Compute VWASLR for the last completed bar.  Returns a VwasrlSignal if the
+    value crosses ±threshold and the bar is within RTH (09:30–16:00 ET).
+    Respects instrument blackout windows.
+    """
+    inst = state.instrument
+    bars = state.bars
+    needed = inst.vwaslr_n + VWASLR_SIGMA_BARS + 1
+    if len(bars) < needed:
+        return None
+
+    closes  = np.array([b.close  for b in bars], dtype=float)
+    volumes = np.array([b.volume for b in bars], dtype=float)
+    i = len(bars) - 1
+
+    # σ from the slow 500-min window
+    trail = np.log(closes[i - VWASLR_SIGMA_BARS + 1: i + 1]
+                 / closes[i - VWASLR_SIGMA_BARS:     i    ])
+    sigma = float(np.std(trail, ddof=1))
+    if sigma == 0:
+        return None
+
+    sigma_pts = sigma * closes[i]
+
+    # VWASLR over last n_win bars
+    ret_win = np.log(closes[i - inst.vwaslr_n + 1: i + 1]
+                   / closes[i - inst.vwaslr_n:     i    ])
+    vol_win = volumes[i - inst.vwaslr_n: i]
+    sum_vol = float(vol_win.sum())
+    if sum_vol == 0:
+        return None
+    vwaslr = float((ret_win / sigma * vol_win).sum() / sum_vol)
+
+    if abs(vwaslr) < inst.vwaslr_threshold:
+        return None
+
+    # RTH filter: 09:30–16:00 ET only
+    last   = bars[-1]
+    bar_et = last.ts.astimezone(ET)
+    bar_hm = (bar_et.hour, bar_et.minute)
+    if bar_hm < (9, 30) or bar_hm >= (16, 0):
+        return None
+
+    # Respect shared blackout windows
+    for sh, sm, eh, em, conditional in inst.blackout_windows:
+        if _in_blackout(bar_hm, sh, sm, eh, em):
+            if not conditional or state.csr < CSR_THRESHOLD:
+                return None
+
+    direction = 1 if vwaslr > 0 else -1
+    entry     = last.close
+    target    = entry + direction * VWASLR_TARGET_SIGMA * sigma_pts
+    stop      = entry - direction * VWASLR_STOP_SIGMA   * sigma_pts
+    return VwasrlSignal(entry=entry, target=target, stop=stop,
+                        sigma_pts=sigma_pts, vwaslr=vwaslr,
+                        bar_ts=last.ts, direction=direction)
+
+
+def place_vwaslr_signal(client: TopstepClient, state: InstrumentState,
+                        sig: VwasrlSignal, account_id: int,
+                        paper: bool) -> ActiveVwasrlTrade:
+    inst      = state.instrument
+    tick      = inst.tick_size
+    is_long   = sig.direction == 1
+    dir_label = "LONG" if is_long else "SHORT"
+    stop_mag   = max(1, round(sig.stop_pts()   / tick))
+    target_mag = max(1, round(sig.target_pts() / tick))
+    stop_ticks   = -stop_mag   if is_long else  stop_mag
+    target_ticks =  target_mag if is_long else -target_mag
+
+    trade = ActiveVwasrlTrade(
+        instrument=inst, contract_id=state.contract_id,
+        sig=sig, fired_at=sig.bar_ts,
+    )
+
+    if paper:
+        log.info(
+            f"[PAPER] VWASLR {inst.symbol} {dir_label}  entry≈{sig.entry:.2f}  "
+            f"target={sig.target:.2f} ({sig.target_pts():.2f}pts)  "
+            f"stop={sig.stop:.2f} ({sig.stop_pts():.2f}pts)  "
+            f"vwaslr={sig.vwaslr:+.3f}σ/bar"
+        )
+    else:
+        order_side = TopstepClient.BID if is_long else TopstepClient.ASK
+        resp = client.place_order(
+            account_id=account_id,
+            contract_id=state.contract_id,
+            side=order_side,
+            size=1,
+            order_type=TopstepClient.ORDER_MARKET,
+            stop_loss_ticks=stop_ticks,
+            take_profit_ticks=target_ticks,
+            custom_tag=f"vwas_{inst.symbol}_{sig.bar_ts.strftime('%Y%m%d%H%M%S')}",
+        )
+        trade.order_id = resp.get("orderId")
+        log.info(
+            f"VWASLR ORDER  {inst.symbol} {dir_label}  order_id={trade.order_id}  "
+            f"entry≈{sig.entry:.2f}  stop={stop_ticks}t  target={target_ticks}t  "
+            f"vwaslr={sig.vwaslr:+.3f}σ/bar"
+        )
+
+    state.active_vwaslr_trade = trade
+    return trade
+
+
+def handle_active_vwaslr_trade(client: TopstepClient, state: InstrumentState,
+                                account_id: int, now: datetime, paper: bool):
+    trade = state.active_vwaslr_trade
+
+    if paper:
+        if now >= trade.expires_at:
+            exit_price = state.bars[-1].close if state.bars else trade.sig.entry
+            _log_vwaslr_trade(trade, "TIME EXIT (paper)", exit_price, now)
+            state.active_vwaslr_trade = None
+        return
+
+    try:
+        positions = client.get_open_positions(account_id)
+    except Exception as e:
+        log.warning(f"VWASLR {trade.instrument.symbol}: could not fetch positions: {e}")
+        return
+
+    pos = next(
+        (p for p in positions if p.get("contractId") == trade.contract_id),
+        None,
+    )
+
+    if pos and trade.fill_price is None:
+        trade.fill_price = pos.get("averagePrice")
+        log.info(f"VWASLR {trade.instrument.symbol} fill confirmed: {trade.fill_price:.2f}")
+        play_trade_sound()
+
+    # Software trailing stop for VWASLR trades.
+    # The bracket stop at 2σ remains as a safety net; this fires earlier.
+    if pos and trade.fill_price is not None and state.bars:
+        fill       = trade.fill_price
+        trail_dist = VWASLR_TRAIL_SIGMA * trade.sig.sigma_pts
+        bars_after = [b for b in state.bars if b.ts >= trade.fired_at]
+        if bars_after:
+            if trade.sig.direction == 1:   # LONG — track highest high
+                new_peak = max(b.high for b in bars_after)
+                trade.trail_peak = max(new_peak, fill)
+                trade.trail_stop_level = trade.trail_peak - trail_dist
+            else:                          # SHORT — track lowest low
+                new_peak = min(b.low for b in bars_after)
+                trade.trail_peak = min(new_peak, fill)
+                trade.trail_stop_level = trade.trail_peak + trail_dist
+
+            last_bar   = state.bars[-1]
+            trail_stop = trade.trail_stop_level
+            trail_hit  = (
+                last_bar.ts > trade.fired_at and trail_stop is not None and (
+                    (trade.sig.direction ==  1 and last_bar.low  <= trail_stop) or
+                    (trade.sig.direction == -1 and last_bar.high >= trail_stop)
+                )
+            )
+            if trail_hit:
+                log.info(
+                    f"VWASLR {trade.instrument.symbol} TRAIL STOP  "
+                    f"trail_stop={trail_stop:.2f}  peak={trade.trail_peak:.2f}  "
+                    f"trail={VWASLR_TRAIL_SIGMA}σ={trail_dist:.2f}pts"
+                )
+                try:
+                    n = client.cancel_all_orders(account_id)
+                    if n:
+                        log.info(f"VWASLR {trade.instrument.symbol}: cancelled {n} bracket(s) before trail close")
+                except Exception as e:
+                    log.warning(f"VWASLR {trade.instrument.symbol}: pre-trail cancel failed: {e}")
+                try:
+                    client.close_position(account_id, trade.contract_id)
+                except Exception as e:
+                    log.error(f"VWASLR {trade.instrument.symbol}: trail close_position failed: {e}")
+                    return
+                _log_vwaslr_trade(trade, "TRAIL STOP", trail_stop, now)
+                state.active_vwaslr_trade = None
+                try:
+                    client.cancel_all_orders(account_id)
+                except Exception:
+                    pass
+                return
+
+    if pos is None:
+        exit_price = _get_exit_price(client, account_id, trade.fired_at,
+                                     trade.contract_id, now)
+        if exit_price is not None:
+            d = trade.sig.direction
+            outcome = ("TARGET" if (d == 1 and exit_price >= trade.target_price()) or
+                                   (d == -1 and exit_price <= trade.target_price())
+                       else "STOPPED")
+        else:
+            outcome, exit_price = _classify_vwaslr_outcome(trade, state.bars)
+        _log_vwaslr_trade(trade, outcome, exit_price, now)
+        state.active_vwaslr_trade = None
+        try:
+            n = client.cancel_all_orders(account_id)
+            if n:
+                log.info(f"VWASLR {trade.instrument.symbol} {outcome}: cancelled {n} residual order(s)")
+        except Exception as e:
+            log.warning(f"VWASLR {trade.instrument.symbol}: cancel_all_orders failed: {e}")
+        return
+
+    if now >= trade.expires_at:
+        log.info(f"VWASLR {trade.instrument.symbol} max hold reached — closing")
+        try:
+            client.cancel_all_orders(account_id)
+        except Exception as e:
+            log.warning(f"VWASLR {trade.instrument.symbol}: pre-close cancel_all failed: {e}")
+        try:
+            client.close_position(account_id, trade.contract_id)
+        except Exception as e:
+            log.error(f"VWASLR {trade.instrument.symbol}: failed to close position: {e}")
+            return
+        exit_price = state.bars[-1].close if state.bars else (trade.fill_price or trade.sig.entry)
+        _log_vwaslr_trade(trade, "TIME EXIT", exit_price, now)
+        state.active_vwaslr_trade = None
+        try:
+            client.cancel_all_orders(account_id)
+        except Exception:
+            pass
+
+
+def _classify_vwaslr_outcome(trade: ActiveVwasrlTrade,
+                              bars: list[Bar]) -> tuple[str, float]:
+    # Conservative (adverse-first) OHLC ordering: check stop before target within
+    # each bar so that if a single bar touches both levels we record the loss.
+    for bar in bars:
+        if bar.ts <= trade.fired_at:
+            continue
+        if trade.sig.direction == 1:   # LONG: low → stop, high → target
+            if bar.low  <= trade.stop_price():
+                return "STOPPED", trade.stop_price()
+            if bar.high >= trade.target_price():
+                return "TARGET",  trade.target_price()
+        else:                          # SHORT: high → stop, low → target
+            if bar.high >= trade.stop_price():
+                return "STOPPED", trade.stop_price()
+            if bar.low  <= trade.target_price():
+                return "TARGET",  trade.target_price()
     last_close = bars[-1].close if bars else (trade.fill_price or trade.sig.entry)
     if abs(last_close - trade.target_price()) <= abs(last_close - trade.stop_price()):
         return "TARGET",  trade.target_price()
@@ -931,6 +1397,7 @@ def run(account_id: int | None, paper: bool):
 
     _ensure_log()
     _ensure_orb_log()
+    _ensure_vwaslr_log()
     mode = "PAPER MODE" if paper else "LIVE"
     log.info(
         f"Bot running — {mode}  account={account_id}  "
@@ -951,8 +1418,13 @@ def run(account_id: int | None, paper: bool):
                 if state.active_orb_trade:
                     handle_active_orb_trade(client, state, account_id, now, paper)
 
+                if state.active_vwaslr_trade:
+                    handle_active_vwaslr_trade(client, state, account_id, now, paper)
+
                 # Only enter new trades when no position is open on this instrument
-                no_position = not state.active_trade and not state.active_orb_trade
+                no_position = (not state.active_trade
+                               and not state.active_orb_trade
+                               and not state.active_vwaslr_trade)
                 last_bar_ts = state.bars[-1].ts if state.bars else None
 
                 # Don't enter new trades after TopstepX daily cutoff
@@ -975,6 +1447,12 @@ def run(account_id: int | None, paper: bool):
                     orb_sig = evaluate_orb(state)
                     if orb_sig:
                         place_orb_signal(client, state, orb_sig, account_id, paper)
+
+                if no_position and not past_cutoff and state.instrument.vwaslr_n > 0:
+                    vwas_sig = evaluate_vwaslr(state)
+                    if vwas_sig and last_bar_ts != state.vwaslr_last_ts:
+                        state.vwaslr_last_ts = last_bar_ts
+                        place_vwaslr_signal(client, state, vwas_sig, account_id, paper)
 
             except Exception as e:
                 log.error(f"{state.instrument.symbol}: {e}", exc_info=True)

@@ -25,6 +25,7 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -58,6 +59,13 @@ BARS_PER_YEAR = 252 * 23 * 60
 PL_N_BARS = 10    # 1-min bars to look back for PL computation
 PL_THRESH = 0.50  # PL_aligned ≥ this → 2× sizing
 
+# Trailing stop sigmas (keep in sync with trading_bot.py)
+CSR_TRAIL_SIGMA    = 0.5
+VWASLR_TRAIL_SIGMA = 1.5
+
+# VWASLR parameters (Volume-Weighted Average Scaled Log Return)
+VWASLR_SIGMA_BARS = 100   # 100 × 5-min = 500-min σ window (slow/stable; matches backtest)
+
 ET = ZoneInfo("America/New_York")
 
 # ORB parameters (15-min ORB, wide-range LONG, morning + power-hour windows)
@@ -69,8 +77,9 @@ ORB_WINDOWS   = [          # (start_h, start_m, end_h, end_m, label)
     (9,  45, 10, 30, "Morning"),
 ]
 
-LOG_PATH = Path("logs/signals.csv")
-ORB_LOG_PATH = Path("logs/orb_signals.csv")
+LOG_PATH      = Path("logs/signals.csv")
+ORB_LOG_PATH  = Path("logs/orb_signals.csv")
+VWAS_LOG_PATH = Path("logs/vwaslr_trades.csv")
 ORB_LOG_FIELDS = [
     "fired_at", "resolved_at", "symbol", "direction",
     "entry", "target", "stop",
@@ -108,9 +117,15 @@ class InstrumentConfig:
     # Per-instrument blackout windows: (start_h, start_m, end_h, end_m, conditional).
     # conditional=True: block only when CSR < threshold; False: always block.
     blackout_windows: list = field(default_factory=list)
-    # ORB: set orb_enabled=True and orb_width_min to the wide-tertile cutoff from backtest.
-    orb_enabled:   bool  = False
-    orb_width_min: float = 0.0
+    # ORB: set orb_enabled=True and orb_width_pct_min to the wide-tertile cutoff from backtest.
+    # Width threshold is a fraction of ORB midpoint price (e.g. 0.00354 = 0.354%).
+    # Using percentage rather than fixed points keeps the filter consistent as prices change.
+    orb_enabled:       bool  = False
+    orb_width_pct_min: float = 0.0
+    # VWASLR: 0 = disabled. n = look-back bars for the volume-weighted avg scaled return.
+    # threshold = signal trigger level in σ/bar units (from backtest optimisation).
+    vwaslr_n:         int   = 0
+    vwaslr_threshold: float = 1.0
 
 
 INSTRUMENTS = [
@@ -118,23 +133,31 @@ INSTRUMENTS = [
                      point_value=5.00, ev_sigma=0.073,
                      csr_vol_windows=[(0.08, 4), (1.0, 8)],
                      blackout_windows=[
-                         (8, 0, 9, 0, True),  # econ releases: block only if CSR<1.5
+                         (18,  0,  8,  0, False),  # overnight Globex: no edge, unvalidated
+                         (8,   0,  9,  0, True),   # econ releases: block only if CSR<1.5
+                         (15, 45, 18,  0, False),  # EOD volatility + daily break until Globex open
                      ],
-                     orb_enabled=True, orb_width_min=15.25),
+                     orb_enabled=True, orb_width_pct_min=0.00354,
+                     vwaslr_n=10, vwaslr_threshold=1.0),   # best: N=10, thr=1.0 (EV=+0.091σ)
     InstrumentConfig("MYM", "MYM", stop_sigma=2.0, target_sigma=3.0,
                      point_value=0.50, ev_sigma=0.073,
                      csr_vol_windows=[(0.08, 4), (1.0, 8)],
                      blackout_windows=[
-                         (9,  0,  9, 30, False),  # pre-open: EV=-0.076σ CSR-filtered
-                         (15, 0, 16,  0, False),  # NYSE close: EV=-0.375σ CSR-filtered
-                     ]),
+                         (18,  0,  9,  0, False),  # overnight Globex + pre-open
+                         (9,   0,  9, 30, False),  # pre-open RTH gap: EV=-0.076σ
+                         (15, 45, 18,  0, False),  # EOD volatility + daily break until Globex open
+                     ],
+                     orb_enabled=True, orb_width_pct_min=0.00402,
+                     vwaslr_n=10, vwaslr_threshold=0.5),   # best: N=10, thr=0.5 (EV=+0.066σ)
     InstrumentConfig("M2K", "M2K", stop_sigma=2.0, target_sigma=3.0,
                      point_value=5.00, ev_sigma=0.107,
                      csr_vol_windows=[(0.08, 4), (1.0, 8)],
                      blackout_windows=[
-                         (8, 0, 9, 0, True),  # econ releases: block only if CSR<1.5
+                         (18,  0,  8,  0, False),  # overnight Globex: no edge, unvalidated
+                         (8,   0,  9,  0, True),   # econ releases: block only if CSR<1.5
+                         (15, 45, 18,  0, False),  # EOD volatility + daily break until Globex open
                      ],
-                     orb_enabled=True, orb_width_min=14.30),
+                     orb_enabled=True, orb_width_pct_min=0.00715),
 ]
 
 ALERT_SOUND = "/System/Library/Sounds/Ping.aiff"
@@ -198,6 +221,7 @@ class OrbSignal:
     sigma_pts:  float
     window:     str
     bar_ts:     datetime
+    direction:  int = 1    # 1 = LONG, -1 = SHORT
 
     def target_pts(self): return abs(self.target - self.entry)
     def stop_pts(self):   return abs(self.stop   - self.entry)
@@ -223,6 +247,7 @@ class _HistSignal:
     entry:     float
     target:    float
     stop:      float
+    kind:      str = ""   # "ORB", "VWASLR", or "" (CSR momentum)
 
 
 @dataclass
@@ -247,6 +272,11 @@ class InstrumentState:
     mean_vol:           float | None = None
     active_signal:      Signal | None = None
     current_pl:         float | None = None      # raw 1-min PL, refreshed every poll
+    current_ha_streak:  int = 0                  # 5-min HA streak: +k green, -k red, 0 = flat
+    current_vwaslr:     float = 0.0             # VWASLR value (0.0 = not computed / warming up)
+    vwaslr_entry:       float | None = None     # close price when VWASLR first crossed threshold
+    csr_trail_peak:     float | None = None     # most favourable price seen since CSR signal
+    csr_trail_stop:     float | None = None     # current trailing stop level for CSR signal
     live_bar:           Bar | None = None        # developing 5-min bar, refreshed every poll
     orb:                OrbState = field(default_factory=OrbState)
     history:            list[RecentSignal] = field(default_factory=list)
@@ -255,6 +285,15 @@ class InstrumentState:
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
+
+def _in_blackout(bar_hm: tuple[int, int],
+                 sh: int, sm: int, eh: int, em: int) -> bool:
+    """Return True if bar_hm falls inside the [start, end) window.
+    Handles overnight windows where start > end (e.g. 18:00–09:00)."""
+    s = sh * 60 + sm
+    e = eh * 60 + em
+    b = bar_hm[0] * 60 + bar_hm[1]
+    return (s <= b < e) if s < e else (b >= s or b < e)
 
 def annualised_vol(sigma: float) -> float:
     return sigma * math.sqrt(BARS_PER_YEAR / TF_MINUTES)
@@ -354,6 +393,79 @@ def _next_bar_close(now: datetime) -> datetime:
     return datetime.fromtimestamp(next_close_min * 60, tz=timezone.utc)
 
 
+def _ha_streak(bars: list[Bar]) -> int:
+    """
+    Compute the current 5-min Heiken-Ashi streak from state.bars.
+    Returns +k for k consecutive green bars, -k for k consecutive red bars.
+    HA state is reset at each ET calendar date boundary.
+    Returns 0 if the current session has fewer than 2 bars.
+    """
+    if not bars:
+        return 0
+    session_date = bars[-1].ts.astimezone(ET).date()
+    # Find first bar of current session
+    session_start = len(bars) - 1
+    for i in range(len(bars) - 1, -1, -1):
+        if bars[i].ts.astimezone(ET).date() == session_date:
+            session_start = i
+        else:
+            break
+    sb = bars[session_start:]
+    if len(sb) < 2:
+        return 0
+    n = len(sb)
+    ha_open  = np.zeros(n)
+    ha_close = np.zeros(n)
+    ha_close[0] = (sb[0].open + sb[0].high + sb[0].low + sb[0].close) / 4
+    ha_open[0]  = (sb[0].open + sb[0].close) / 2
+    for i in range(1, n):
+        b = sb[i]
+        ha_close[i] = (b.open + b.high + b.low + b.close) / 4
+        ha_open[i]  = (ha_open[i - 1] + ha_close[i - 1]) / 2
+    green = ha_close[-1] >= ha_open[-1]
+    streak = 1
+    for i in range(n - 2, -1, -1):
+        if (ha_close[i] >= ha_open[i]) == green:
+            streak += 1
+        else:
+            break
+    return streak if green else -streak
+
+
+def _compute_vwaslr(bars: list[Bar], n_win: int,
+                    sigma_bars: int = VWASLR_SIGMA_BARS) -> float:
+    """
+    Compute VWASLR_n (Volume-Weighted Average Scaled Log Return) for the most
+    recent completed bar.
+
+      VWASLR = Σ(ret_j / σ × vol_j) / Σ(vol_j)   for j in [i-n_win+1 .. i]
+
+    σ is estimated from the trailing `sigma_bars` log-returns (slow 500-min window).
+    Returns 0.0 if there are insufficient bars.
+    """
+    needed = max(n_win, sigma_bars) + 1
+    if len(bars) < needed:
+        return 0.0
+    closes  = np.array([b.close  for b in bars], dtype=float)
+    volumes = np.array([b.volume for b in bars], dtype=float)
+    i = len(bars) - 1
+
+    trail_rets = np.log(closes[i - sigma_bars + 1: i + 1]
+                      / closes[i - sigma_bars:     i    ])
+    sigma = float(np.std(trail_rets, ddof=1))
+    if sigma == 0:
+        return 0.0
+
+    ret_win = np.log(closes[i - n_win + 1: i + 1]
+                   / closes[i - n_win:     i    ])
+    vol_win = volumes[i - n_win: i]
+    sum_vol = float(vol_win.sum())
+    if sum_vol == 0:
+        return 0.0
+
+    return float((ret_win / sigma * vol_win).sum() / sum_vol)
+
+
 # ── Panel builders ─────────────────────────────────────────────────────────────
 
 def build_regime_panel(state: InstrumentState) -> Panel:
@@ -438,9 +550,9 @@ def build_signal_panel(state: InstrumentState, now: datetime) -> Panel:
         t = Table.grid(padding=(0, 1))
         t.add_column(style="dim", width=16)
         t.add_column()
-        csr       = state.csr
-        csr_style = "green" if csr >= CSR_THRESHOLD else \
-                    ("yellow" if csr > 0 else "red")
+        csr       = state.csr                           # direction-adjusted: used for ✓ check
+        raw_csr   = csr if scaled > 0 else -csr        # raw directional: +ve = market up
+        csr_style = "green" if raw_csr > 0 else "red"
         csr_check = "✓" if csr >= CSR_THRESHOLD else \
                     ("~" if csr > 0 else "✗")
         sc_style  = "green" if scaled > 0 else "red"
@@ -464,15 +576,10 @@ def build_signal_panel(state: InstrumentState, now: datetime) -> Panel:
         else:
             t.add_row(f"Dev ({elapsed_m}m):", _signal_bar(0.0, SIGNAL_SIGMA, MAX_SCALED))
 
-        t.add_row("Volume ratio:",
-                  f"[yellow]{bar_vr}[/] {vol_ratio:.2f}× / {VOL_RATIO_MIN:.1f}×"
-                  if vol_ratio is not None else
-                  f"[dim]{bar_vr}[/] warming up")
         mom_bars = get_mom_bars(state.gk_ann_vol, state.cfg.csr_vol_windows)
         t.add_row(f"Momentum({mom_bars * TF_MINUTES}m):",
-                  f"{_signal_bar(csr, CSR_THRESHOLD, CSR_THRESHOLD * 2)} "
-                  f"[{csr_style}]{csr:+.2f}σ[/] / {CSR_THRESHOLD:.1f}σ {csr_check}")
-
+                  f"{_signal_bar(raw_csr, CSR_THRESHOLD, CSR_THRESHOLD * 2)} "
+                  f"[{csr_style}]{raw_csr:+.2f}σ[/] / {CSR_THRESHOLD:.1f}σ {csr_check}")
         pl = state.current_pl
         if pl is not None:
             val_style = "green" if pl >= PL_THRESH else ("red" if pl <= -PL_THRESH else "white")
@@ -480,15 +587,31 @@ def build_signal_panel(state: InstrumentState, now: datetime) -> Panel:
                       f"{_pl_bar(pl)} [{val_style}]{pl:+.2f}[/]")
         else:
             t.add_row("1-min PL:", "[dim]fetching…[/]")
+        ha = state.current_ha_streak
+        if ha != 0:
+            abs_ha  = abs(ha)
+            ha_col  = "green" if ha > 0 else "red"
+            ha_dir  = "▲" if ha > 0 else "▼"
+            ha_word = "green" if ha > 0 else "red"
+            t.add_row("5-min HA:",
+                      f"[{ha_col}]{ha_dir} {abs_ha} {ha_word} bar{'s' if abs_ha > 1 else ''}[/]")
+        else:
+            t.add_row("5-min HA:", "[dim]—[/]")
+        t.add_row("", "")
+        t.add_row("Volume ratio:",
+                  f"[yellow]{bar_vr}[/] {vol_ratio:.2f}× / {VOL_RATIO_MIN:.1f}×"
+                  if vol_ratio is not None else
+                  f"[dim]{bar_vr}[/] warming up")
 
         bar_et = state.bars[-1].ts.astimezone(ET)
         bar_hm = (bar_et.hour, bar_et.minute)
         in_active_blackout = any(
-            (sh, sm) <= bar_hm < (eh, em) and (not conditional or csr < CSR_THRESHOLD)
+            _in_blackout(bar_hm, sh, sm, eh, em) and (not conditional or csr < CSR_THRESHOLD)
             for sh, sm, eh, em, conditional in state.cfg.blackout_windows
         )
         blackout_note = "  [bold red]BLACKOUT[/]" if in_active_blackout else ""
-        t.add_row("", f"[dim]Need ≥{SIGNAL_SIGMA:.0f}σ + ≥{VOL_RATIO_MIN:.1f}× vol + CSR≥{CSR_THRESHOLD:.1f}σ[/]{blackout_note}")
+        if in_active_blackout:
+            t.add_row("", blackout_note.strip())
 
         # NOTRADE: show indicative SL/TP based on current price and σ
         price     = bar.close
@@ -533,14 +656,28 @@ def build_signal_panel(state: InstrumentState, now: datetime) -> Panel:
     t.add_column(style="dim", width=10)
     t.add_column()
 
+    trail_stop = state.csr_trail_stop
+    trail_peak = state.csr_trail_peak
+
     t.add_row("Entry:",
               f"[bold]{signal.entry:,.2f}[/]")
     t.add_row("Target:",
               f"[bold {color}]{signal.target:,.2f}[/]  "
               f"([{color}]+{signal.target_pts():.2f} pts[/] │ +{cfg.target_sigma:.1f}σ)")
-    t.add_row("Stop:",
-              f"[bold red]{signal.stop:,.2f}[/]  "
-              f"([red]−{signal.stop_pts():.2f} pts[/] │ −{cfg.stop_sigma:.1f}σ)")
+    if trail_stop is not None:
+        trail_pnl = (trail_stop - signal.entry) * signal.direction
+        trail_col = "green" if trail_pnl >= 0 else "red"
+        peak_str  = f"  [dim](peak {trail_peak:,.2f})[/]" if trail_peak else ""
+        t.add_row("Trail stop:",
+                  f"[bold {trail_col}]{trail_stop:,.2f}[/]  "
+                  f"([{trail_col}]{trail_pnl:+.2f} pts[/] │ {CSR_TRAIL_SIGMA}σ trail)"
+                  f"{peak_str}")
+        t.add_row("Hard stop:",
+                  f"[dim]{signal.stop:,.2f}  (safety net, {cfg.stop_sigma:.1f}σ)[/]")
+    else:
+        t.add_row("Stop:",
+                  f"[bold red]{signal.stop:,.2f}[/]  "
+                  f"([red]−{signal.stop_pts():.2f} pts[/] │ −{cfg.stop_sigma:.1f}σ)")
     t.add_row("R:R / EV:",
               f"{rr:.2f}:1  (EV ≈ +{cfg.ev_sigma:.2f}σ / signal)")
     t.add_row("Expires:",
@@ -564,6 +701,65 @@ def build_signal_panel(state: InstrumentState, now: datetime) -> Panel:
                  border_style=border, padding=(0, 2))
 
 
+def build_vwaslr_panel(state: InstrumentState) -> Panel:
+    """
+    Small panel showing the current VWASLR value for the instrument.
+    Lights green/red when above/below ±threshold.
+    """
+    v   = state.current_vwaslr
+    thr = state.cfg.vwaslr_threshold
+    n   = state.cfg.vwaslr_n
+
+    is_long  = v >= thr
+    is_short = v <= -thr
+    max_disp = max(thr * 2.0, abs(v) * 1.05)
+
+    t = Table.grid(padding=(0, 1))
+    t.add_column(style="dim", width=16)
+    t.add_column()
+
+    sig_min   = n * TF_MINUTES
+    sigma_min = VWASLR_SIGMA_BARS * TF_MINUTES
+
+    if v == 0.0:
+        t.add_row(f"VWASLR({sig_min}m):", "[dim]warming up…[/]")
+    else:
+        v_style = "bold green" if is_long else ("bold red" if is_short else "white")
+        t.add_row(f"VWASLR({sig_min}m):",
+                  f"{_signal_bar(v, thr, max_disp)} "
+                  f"[{v_style}]{v:+.3f}[/]  / ±{thr:.1f}σ")
+    t.add_row("σ-window:", f"[dim]{sigma_min}min ({VWASLR_SIGMA_BARS} bars)[/]")
+    if state.vwaslr_entry is not None:
+        entry_style = "bold green" if is_long else "bold red"
+        t.add_row("Entry:", f"[{entry_style}]{state.vwaslr_entry:,.2f}[/]")
+
+        # Compute trailing stop from bars since entry
+        direction  = 1 if is_long else -1
+        trail_dist = VWASLR_TRAIL_SIGMA * state.sigma_pts
+        if trail_dist > 0 and state.bars:
+            if direction == 1:
+                peak = max(max(b.high for b in state.bars), state.vwaslr_entry)
+                trail_stop = peak - trail_dist
+            else:
+                peak = min(min(b.low for b in state.bars), state.vwaslr_entry)
+                trail_stop = peak + trail_dist
+            trail_pnl = (trail_stop - state.vwaslr_entry) * direction
+            trail_col = "green" if trail_pnl >= 0 else "yellow"
+            t.add_row("Trail stop:",
+                      f"[bold {trail_col}]{trail_stop:,.2f}[/]  "
+                      f"([{trail_col}]{trail_pnl:+.1f} pts[/] │ {VWASLR_TRAIL_SIGMA}σ trail)  "
+                      f"[dim](peak {peak:,.2f})[/]")
+
+    border = "green" if is_long else ("red" if is_short else "dim")
+    if is_long:
+        title = "[bold green]⬤  VWASLR  ▲ LONG[/]"
+    elif is_short:
+        title = "[bold red]⬤  VWASLR  ▼ SHORT[/]"
+    else:
+        title = "[dim]VWASLR[/]"
+    return Panel(t, title=title, border_style=border, padding=(0, 1))
+
+
 def build_instrument_column(state: InstrumentState, now: datetime) -> Table:
     """Vertical stack of panels for one instrument."""
     col = Table.grid(padding=(0, 0))
@@ -582,6 +778,8 @@ def build_instrument_column(state: InstrumentState, now: datetime) -> Table:
     col.add_row(build_regime_panel(state))
     col.add_row(build_bar_panel(state))
     col.add_row(build_signal_panel(state, now))
+    if state.cfg.vwaslr_n > 0:
+        col.add_row(build_vwaslr_panel(state))
     if state.cfg.orb_enabled:
         col.add_row(build_orb_panel(state, now))
     return col
@@ -602,25 +800,31 @@ def build_history_table(history: list[RecentSignal]) -> Panel:
     for rs in reversed(history[-8:]):
         s  = rs.signal
         ts = s.bar_ts.astimezone(datetime.now().astimezone().tzinfo)
-        if isinstance(s, OrbSignal) or (isinstance(s, _HistSignal) and s.direction == 0):
+        kind = s.kind if isinstance(s, _HistSignal) else (
+            "ORB" if isinstance(s, OrbSignal) else "")
+        if kind == "ORB" or (isinstance(s, _HistSignal) and s.direction == 0):
             dir_str = "[green]ORB ↑[/]"
+        elif kind == "VWASLR":
+            dir_str = "[green]VWA ↑[/]" if s.direction == 1 else "[red]VWA ↓[/]"
         else:
             dir_str = "[green]LONG[/]" if s.direction == 1 else "[red]SHORT[/]"
 
+        pnl_col = "green" if rs.pnl_pts >= 0 else "red"
+        pnl_sign = "+" if rs.pnl_pts >= 0 else "−"
+        pnl_str = f"[{pnl_col}]{pnl_sign}{abs(rs.pnl_pts):.2f}[/]"
         if rs.outcome == "TARGET":
             out_str = "[green]HIT TARGET[/]"
-            pnl_str = f"[green]+{rs.pnl_pts:.2f}[/]"
         elif rs.outcome == "STOPPED":
             out_str = "[red]STOPPED[/]"
-            pnl_str = f"[red]−{abs(rs.pnl_pts):.2f}[/]"
+        elif rs.outcome in ("TRAIL STOP", "TRAIL"):
+            out_str = "[yellow]TRAIL STOP[/]"
         elif rs.outcome == "TIME EXIT":
-            pnl_col = "green" if rs.pnl_pts >= 0 else "red"
-            sign    = "+" if rs.pnl_pts >= 0 else "−"
             out_str = "[yellow]TIME EXIT[/]"
-            pnl_str = f"[{pnl_col}]{sign}{abs(rs.pnl_pts):.2f}[/]"
-        else:
+        elif rs.outcome == "OPEN":
             out_str = "[bold yellow]OPEN[/]"
             pnl_str = "[dim]—[/]"
+        else:
+            out_str = f"[dim]{rs.outcome}[/]"
 
         t.add_row(
             ts.strftime("%H:%M"),
@@ -634,20 +838,20 @@ def build_history_table(history: list[RecentSignal]) -> Panel:
         )
 
     return Panel(t, title="[bold]RECENT SIGNALS[/]",
-                 border_style="dim", padding=(0, 1))
+                 border_style="dim", padding=(0, 1), expand=False)
 
 
 def build_header(now: datetime) -> Panel:
     local = now.astimezone(datetime.now().astimezone().tzinfo)
     t = Text(justify="center")
     t.append("  SIGNAL MONITOR  ", style="bold white on dark_blue")
-    t.append("  MES & MYM  ", style="bold cyan")
+    t.append("  MES, MYM & M2K  ", style="bold cyan")
     t.append("│  ")
     t.append(local.strftime("%a %Y-%m-%d  %H:%M:%S %Z"), style="dim")
     t.append("  │  next bar: ")
     nb_local = _next_bar_close(now).astimezone(datetime.now().astimezone().tzinfo)
     t.append(nb_local.strftime("%H:%M:%S"), style="yellow")
-    return Panel(t, border_style="dark_blue", padding=(0, 0))
+    return Panel(t, border_style="dark_blue", padding=(0, 0), expand=False)
 
 
 def build_sizing_table(states: list[InstrumentState]) -> Panel:
@@ -691,7 +895,7 @@ def build_sizing_table(states: list[InstrumentState]) -> Panel:
     title = "[bold]SIZING (2σ stop)[/]"
     if partial:
         title += "  [dim yellow]* partial — warming up[/]"
-    return Panel(t, title=title, border_style="dim", padding=(0, 1))
+    return Panel(t, title=title, border_style="dim", padding=(0, 1), expand=False)
 
 
 def render(states: list[InstrumentState],
@@ -750,20 +954,52 @@ def _log_trade(sym: str, sig: Signal, outcome: str,
 
 
 def _check_resolution(sig: Signal, bars: list[Bar]) -> tuple[str, float] | None:
-    """Scan bars after the signal bar for target/stop hit. Returns (outcome, pnl_pts) or None."""
+    """Scan bars after the signal bar for target/stop hit. Returns (outcome, pnl_pts) or None.
+    Conservative (adverse-first) ordering: stop checked before target within each bar."""
     for bar in bars:
         if bar.ts <= sig.bar_ts:
             continue
-        if sig.direction == 1:
-            if bar.high >= sig.target:
-                return "TARGET",  sig.target_pts()
+        if sig.direction == 1:   # LONG: low → stop, high → target
             if bar.low  <= sig.stop:
                 return "STOPPED", -sig.stop_pts()
-        else:
-            if bar.low  <= sig.target:
+            if bar.high >= sig.target:
                 return "TARGET",  sig.target_pts()
+        else:                    # SHORT: high → stop, low → target
             if bar.high >= sig.stop:
                 return "STOPPED", -sig.stop_pts()
+            if bar.low  <= sig.target:
+                return "TARGET",  sig.target_pts()
+    return None
+
+
+def _check_csr_trail_resolution(sig: Signal, bars: list[Bar],
+                                 trail_sigma: float) -> tuple[str, float] | None:
+    """
+    Simulate a trailing stop through bars after the signal.
+    Conservative OHLC ordering: adverse side tested before peak update within each bar.
+    Returns (outcome, pnl_pts) or None if still open.
+    """
+    entry      = sig.entry
+    d          = sig.direction
+    trail_dist = trail_sigma * sig.sigma_pts
+    peak       = entry
+    trail_stop = entry - d * trail_dist
+
+    for bar in bars:
+        if bar.ts <= sig.bar_ts:
+            continue
+        if d == 1:   # LONG
+            if bar.low <= trail_stop:
+                return "TRAIL STOP", trail_stop - entry
+            if bar.high > peak:
+                peak       = bar.high
+                trail_stop = peak - trail_dist
+        else:        # SHORT
+            if bar.high >= trail_stop:
+                return "TRAIL STOP", entry - trail_stop
+            if bar.low < peak:
+                peak       = bar.low
+                trail_stop = peak + trail_dist
     return None
 
 
@@ -821,20 +1057,38 @@ def evaluate_orb(state: InstrumentState) -> OrbSignal | None:
     if window == "Morning" and orb.morning_fired:
         return None
 
-    orb_width = orb.orb_high - orb.orb_low
-    if orb_width < state.cfg.orb_width_min:
+    orb_width     = orb.orb_high - orb.orb_low
+    orb_mid       = (orb.orb_high + orb.orb_low) / 2.0
+    orb_width_pct = orb_width / orb_mid if orb_mid > 0 else 0.0
+    if orb_width_pct < state.cfg.orb_width_pct_min:
         return None
     if state.sigma_pts <= 0:
         return None
 
     if bar.close > orb.orb_high:
-        entry  = bar.close
+        entry = bar.close
         sig = OrbSignal(
             entry=entry,
             target=entry + ORB_TGT_SIG * state.sigma_pts,
             stop=entry   - ORB_STOP_SIG * state.sigma_pts,
             orb_high=orb.orb_high, orb_low=orb.orb_low,
             sigma_pts=state.sigma_pts, window=window, bar_ts=bar.ts,
+            direction=1,
+        )
+        if window == "Morning":
+            orb.morning_fired = True
+        orb.active_signal = sig
+        return sig
+
+    if bar.close < orb.orb_low:
+        entry = bar.close
+        sig = OrbSignal(
+            entry=entry,
+            target=entry - ORB_TGT_SIG * state.sigma_pts,
+            stop=entry   + ORB_STOP_SIG * state.sigma_pts,
+            orb_high=orb.orb_high, orb_low=orb.orb_low,
+            sigma_pts=state.sigma_pts, window=window, bar_ts=bar.ts,
+            direction=-1,
         )
         if window == "Morning":
             orb.morning_fired = True
@@ -845,13 +1099,20 @@ def evaluate_orb(state: InstrumentState) -> OrbSignal | None:
 
 
 def _check_orb_resolution(sig: OrbSignal, bars: list[Bar]) -> tuple[str, float] | None:
+    # Conservative (adverse-first): stop checked before target within each bar.
     for bar in bars:
         if bar.ts <= sig.bar_ts:
             continue
-        if bar.high >= sig.target:
-            return "TARGET",  sig.target_pts()
-        if bar.low  <= sig.stop:
-            return "STOPPED", -sig.stop_pts()
+        if sig.direction == 1:   # LONG: low → stop, high → target
+            if bar.low  <= sig.stop:
+                return "STOPPED", -sig.stop_pts()
+            if bar.high >= sig.target:
+                return "TARGET",   sig.target_pts()
+        else:                    # SHORT: high → stop, low → target
+            if bar.high >= sig.stop:
+                return "STOPPED", -sig.stop_pts()
+            if bar.low  <= sig.target:
+                return "TARGET",   sig.target_pts()
     return None
 
 
@@ -864,12 +1125,17 @@ def build_orb_panel(state: InstrumentState, now: datetime) -> Panel:
     t.add_column()
 
     if orb.orb_complete:
-        width   = orb.orb_high - orb.orb_low
-        w_style = "green" if width >= state.cfg.orb_width_min else "red"
-        w_flag  = " ✓" if width >= state.cfg.orb_width_min else f" ✗ need>{state.cfg.orb_width_min:.0f}"
+        width     = orb.orb_high - orb.orb_low
+        orb_mid   = (orb.orb_high + orb.orb_low) / 2.0
+        width_pct = width / orb_mid if orb_mid > 0 else 0.0
+        pct_min   = state.cfg.orb_width_pct_min
+        pts_min   = pct_min * orb_mid
+        wide      = width_pct >= pct_min
+        w_style   = "green" if wide else "red"
+        w_flag    = " ✓" if wide else f" ✗ need>{pts_min:.1f}"
         t.add_row("ORB high:", f"{orb.orb_high:,.2f}")
         t.add_row("ORB low:",  f"{orb.orb_low:,.2f}")
-        t.add_row("ORB width:", f"[{w_style}]{width:.2f} pts{w_flag}[/]")
+        t.add_row("ORB width:", f"[{w_style}]{width:.2f} pts ({width_pct*100:.3f}%){w_flag}[/]")
     elif orb.session_date == (bar_et.date() if bar_et else None):
         t.add_row("ORB:", f"[yellow]Building… {orb.orb_bars_seen}/{ORB_BARS} bars[/]")
     else:
@@ -877,35 +1143,47 @@ def build_orb_panel(state: InstrumentState, now: datetime) -> Panel:
 
     if orb.active_signal:
         sig   = orb.active_signal
+        is_long = sig.direction == 1
         rem   = (sig.bar_ts + timedelta(minutes=MAX_HOLD_MIN)) - now
         rem_s = int(rem.total_seconds())
         rem_str = f"{rem_s // 60}m {rem_s % 60:02d}s" if rem_s > 0 else "[blink]EXPIRED[/]"
+        tgt_sign = "+" if is_long else "−"
+        stp_sign = "−" if is_long else "+"
+        ev_r     = 0.66 if is_long else 0.44
         t.add_row("", "")
         t.add_row("Entry:",  f"[bold]{sig.entry:,.2f}[/]  [dim]({sig.window})[/]")
         t.add_row("Target:", f"[bold green]{sig.target:,.2f}[/]  "
-                              f"([green]+{sig.target_pts():.2f} pts[/] │ +{ORB_TGT_SIG:.1f}σ)")
+                              f"([green]{tgt_sign}{sig.target_pts():.2f} pts[/] │ {tgt_sign}{ORB_TGT_SIG:.1f}σ)")
         t.add_row("Stop:",   f"[bold red]{sig.stop:,.2f}[/]  "
-                              f"([red]−{sig.stop_pts():.2f} pts[/] │ −{ORB_STOP_SIG:.1f}σ)")
-        t.add_row("EV:",     f"+0.61R ≈ +{0.61*sig.risk_pts():.1f} pts  [{rem_str}]")
-        return Panel(t, title="[bold green]⬤  ORB LONG ▲[/]",
-                     border_style="green", padding=(0, 1))
+                              f"([red]{stp_sign}{sig.stop_pts():.2f} pts[/] │ {stp_sign}{ORB_STOP_SIG:.1f}σ)")
+        t.add_row("EV:",     f"+{ev_r:.2f}R ≈ +{ev_r*sig.risk_pts():.1f} pts  [{rem_str}]")
+        title = "[bold green]⬤  ORB LONG ▲[/]" if is_long else "[bold red]⬤  ORB SHORT ▼[/]"
+        border = "green" if is_long else "red"
+        return Panel(t, title=title, border_style=border, padding=(0, 1))
 
     if orb.orb_complete:
-        width  = orb.orb_high - orb.orb_low
-        window = _orb_window(bar_et) if bar_et else None
-        if width < state.cfg.orb_width_min:
+        width     = orb.orb_high - orb.orb_low
+        orb_mid_s = (orb.orb_high + orb.orb_low) / 2.0
+        width_pct = width / orb_mid_s if orb_mid_s > 0 else 0.0
+        window    = _orb_window(bar_et) if bar_et else None
+        if width_pct < state.cfg.orb_width_pct_min:
             status = "[dim]ORB too narrow[/]"
         elif window:
             fired  = window == "Morning" and orb.morning_fired
             status = "[dim]Already fired[/]" if fired else \
-                     f"[yellow]Watch >{orb.orb_high:.2f}[/]"
+                     f"[yellow]Watch >{orb.orb_high:.2f} or <{orb.orb_low:.2f}[/]"
         else:
-            status = "[dim]Done today[/]" if orb.morning_fired else "[dim]Waiting for window[/]"
+            # All windows have passed (window is None and we're past the last one)
+            last_window_end = max((eh * 60 + em) for _, _, eh, em, _ in ORB_WINDOWS)
+            hm_mins = bar_et.hour * 60 + bar_et.minute if bar_et else 0
+            all_windows_passed = hm_mins >= last_window_end
+            status = "[dim]Done today[/]" if (orb.morning_fired or all_windows_passed) \
+                     else "[dim]Waiting for window[/]"
         t.add_row("Status:", status)
 
     border = "yellow" if (orb.orb_complete and _orb_window(bar_et) and
                           not orb.morning_fired) else "dim"
-    return Panel(t, title="[bold]ORB LONG[/]", border_style=border, padding=(0, 1))
+    return Panel(t, title="[bold]ORB[/]", border_style=border, padding=(0, 1))
 
 
 def _log_orb(sym: str, sig: OrbSignal, outcome: str,
@@ -916,7 +1194,7 @@ def _log_orb(sym: str, sig: OrbSignal, outcome: str,
             csv.DictWriter(f, fieldnames=ORB_LOG_FIELDS).writeheader()
     row = {
         "fired_at": sig.bar_ts.isoformat(), "resolved_at": resolved_at.isoformat(),
-        "symbol": sym, "direction": "LONG",
+        "symbol": sym, "direction": "LONG" if sig.direction == 1 else "SHORT",
         "entry": round(sig.entry, 4), "target": round(sig.target, 4),
         "stop": round(sig.stop, 4),
         "orb_high": round(sig.orb_high, 4), "orb_low": round(sig.orb_low, 4),
@@ -1040,7 +1318,7 @@ def evaluate(state: InstrumentState) -> Signal | None:
     bar_et = last.ts.astimezone(ET)
     bar_hm = (bar_et.hour, bar_et.minute)
     for sh, sm, eh, em, conditional in state.cfg.blackout_windows:
-        if (sh, sm) <= bar_hm < (eh, em):
+        if _in_blackout(bar_hm, sh, sm, eh, em):
             if not conditional or state.csr < CSR_THRESHOLD:
                 return None
 
@@ -1181,6 +1459,29 @@ def _load_recent_history(hours: int = 24) -> list[RecentSignal]:
                         entry=float(row["entry"]),
                         target=float(row["target"]),
                         stop=float(row["stop"]),
+                        kind="ORB",
+                    )
+                    entries.append((fired_at, RecentSignal(
+                        row["symbol"], sig, row["outcome"], float(row["pnl_pts"]))))
+                except Exception:
+                    continue
+
+    if VWAS_LOG_PATH.exists():
+        with open(VWAS_LOG_PATH, newline="") as f:
+            for row in csv.DictReader(f):
+                try:
+                    fired_at = datetime.fromisoformat(row["fired_at"])
+                    if fired_at.tzinfo is None:
+                        fired_at = fired_at.replace(tzinfo=timezone.utc)
+                    if fired_at < cutoff:
+                        continue
+                    sig = _HistSignal(
+                        bar_ts=fired_at,
+                        direction=1 if row["direction"] == "LONG" else -1,
+                        entry=float(row.get("fill_price") or row["est_entry"]),
+                        target=float(row["target"]),
+                        stop=float(row["stop"]),
+                        kind="VWASLR",
                     )
                     entries.append((fired_at, RecentSignal(
                         row["symbol"], sig, row["outcome"], float(row["pnl_pts"]))))
@@ -1189,6 +1490,41 @@ def _load_recent_history(hours: int = 24) -> list[RecentSignal]:
 
     entries.sort(key=lambda x: x[0])
     return [rs for _, rs in entries]
+
+
+def _poll_vwaslr_new(since: datetime) -> tuple[list[RecentSignal], datetime]:
+    """
+    Return any VWASLR trades written to vwaslr_trades.csv with fired_at > since,
+    plus the updated max timestamp (to pass as `since` on the next call).
+    """
+    if not VWAS_LOG_PATH.exists():
+        return [], since
+    new_entries: list[tuple[datetime, RecentSignal]] = []
+    max_ts = since
+    with open(VWAS_LOG_PATH, newline="") as f:
+        for row in csv.DictReader(f):
+            try:
+                fired_at = datetime.fromisoformat(row["fired_at"])
+                if fired_at.tzinfo is None:
+                    fired_at = fired_at.replace(tzinfo=timezone.utc)
+                if fired_at <= since:
+                    continue
+                sig = _HistSignal(
+                    bar_ts=fired_at,
+                    direction=1 if row["direction"] == "LONG" else -1,
+                    entry=float(row.get("fill_price") or row["est_entry"]),
+                    target=float(row["target"]),
+                    stop=float(row["stop"]),
+                    kind="VWASLR",
+                )
+                new_entries.append((fired_at, RecentSignal(
+                    row["symbol"], sig, row["outcome"], float(row["pnl_pts"]))))
+                if fired_at > max_ts:
+                    max_ts = fired_at
+            except Exception:
+                continue
+    new_entries.sort(key=lambda x: x[0])
+    return [rs for _, rs in new_entries], max_ts
 
 
 def run_live():
@@ -1211,10 +1547,19 @@ def run_live():
     combined_history: list[RecentSignal] = _load_recent_history(hours=24)
     _ensure_log()
 
+    # Track the latest VWASLR fired_at we've already loaded, so the live-poll
+    # only picks up trades that arrive *after* startup.
+    vwas_last_ts = datetime.min.replace(tzinfo=timezone.utc)
+    for rs in combined_history:
+        if isinstance(rs.signal, _HistSignal) and rs.signal.kind == "VWASLR":
+            if rs.signal.bar_ts > vwas_last_ts:
+                vwas_last_ts = rs.signal.bar_ts
+
     def fetch_bars(state: InstrumentState):
         end   = datetime.now(timezone.utc)
         max_mom  = max(bars for cfg in INSTRUMENTS for _, bars in cfg.csr_vol_windows)
-        lookback = TRAILING_BARS + max_mom + 10
+        vwaslr_lookback = VWASLR_SIGMA_BARS + max(cfg.vwaslr_n for cfg in INSTRUMENTS) + 5
+        lookback = max(TRAILING_BARS + max_mom + 10, vwaslr_lookback)
         start = end - timedelta(minutes=TF_MINUTES * lookback)
         try:
             raw = client.get_bars(contract_id=state.cid, start=start, end=end,
@@ -1245,14 +1590,31 @@ def run_live():
         while True:
             now = datetime.now(timezone.utc)
 
-            for state in states:
+            # Fetch all instruments in parallel (I/O-bound; threads suffice)
+            def _fetch(state: InstrumentState):
                 fetch_bars(state)
                 if not state.bars:
-                    continue
+                    return
+                state.current_pl        = fetch_1min_pl(client, state.cid, now, 1)
+                state.current_ha_streak = _ha_streak(state.bars)
+                state.live_bar          = fetch_live_bar(client, state, now)
+                if state.cfg.vwaslr_n > 0:
+                    prev_vwaslr = state.current_vwaslr
+                    state.current_vwaslr = _compute_vwaslr(state.bars, state.cfg.vwaslr_n)
+                    thr = state.cfg.vwaslr_threshold
+                    was_active = abs(prev_vwaslr) >= thr
+                    now_active = abs(state.current_vwaslr) >= thr
+                    if now_active and not was_active:
+                        state.vwaslr_entry = state.bars[-1].close
+                    elif not now_active and was_active:
+                        state.vwaslr_entry = None
 
-                # Refresh 1-min PL and developing bar for watching display
-                state.current_pl = fetch_1min_pl(client, state.cid, now, 1)
-                state.live_bar   = fetch_live_bar(client, state, now)
+            with ThreadPoolExecutor(max_workers=len(states)) as ex:
+                list(ex.map(_fetch, states))
+
+            for state in states:
+                if not state.bars:
+                    continue
 
                 # Update display metrics and check for signal
                 new_sig = evaluate(state)
@@ -1268,18 +1630,41 @@ def run_live():
 
                 # Check momentum signal for target/stop hit or expiry
                 if state.active_signal:
-                    hit = _check_resolution(state.active_signal, state.bars)
+                    sig = state.active_signal
+
+                    # Update trailing stop display state
+                    trail_dist  = CSR_TRAIL_SIGMA * sig.sigma_pts
+                    bars_after  = [b for b in state.bars if b.ts > sig.bar_ts]
+                    if bars_after:
+                        if sig.direction == 1:
+                            state.csr_trail_peak = max(b.high for b in bars_after)
+                        else:
+                            state.csr_trail_peak = min(b.low for b in bars_after)
+                        state.csr_trail_stop = (
+                            state.csr_trail_peak - sig.direction * trail_dist
+                        )
+                    else:
+                        state.csr_trail_peak = sig.entry
+                        state.csr_trail_stop = sig.entry - sig.direction * trail_dist
+
+                    hit = _check_csr_trail_resolution(sig, state.bars, CSR_TRAIL_SIGMA)
                     if hit:
                         resolve(state, hit[0], hit[1], now)
-                    elif now >= state.active_signal.expires_at:
+                        state.csr_trail_peak = None
+                        state.csr_trail_stop = None
+                    elif now >= sig.expires_at:
                         last_close = state.bars[-1].close
-                        pnl = (last_close - state.active_signal.entry) * state.active_signal.direction
+                        pnl = (last_close - sig.entry) * sig.direction
                         resolve(state, "TIME EXIT", pnl, now)
+                        state.csr_trail_peak = None
+                        state.csr_trail_stop = None
 
                 if new_sig and (state.active_signal is None or
                                 new_sig.bar_ts != state.active_signal.bar_ts):
                     if state.active_signal:
                         resolve(state, "SUPERSEDED", 0.0, now)
+                        state.csr_trail_peak = None
+                        state.csr_trail_stop = None
                     state.active_signal = new_sig
                     pl = fetch_1min_pl(client, state.cid,
                                        new_sig.bar_ts, new_sig.direction)
@@ -1297,7 +1682,8 @@ def run_live():
                             state.cfg.symbol, state.orb.active_signal, hit[0], hit[1]))
                         state.orb.active_signal = None
                     elif now >= state.orb.active_signal.bar_ts + timedelta(minutes=MAX_HOLD_MIN):
-                        pnl = state.bars[-1].close - state.orb.active_signal.entry
+                        pnl = ((state.bars[-1].close - state.orb.active_signal.entry)
+                               * state.orb.active_signal.direction)
                         _log_orb(state.cfg.symbol, state.orb.active_signal,
                                  "TIME EXIT", pnl, now)
                         combined_history.append(RecentSignal(
@@ -1307,6 +1693,12 @@ def run_live():
                 if new_orb and state.orb.active_signal is None:
                     state.orb.active_signal = new_orb
                     play_alert()
+
+            # Pick up any VWASLR trades logged by trading_bot since last poll
+            new_vwas, vwas_last_ts = _poll_vwaslr_new(vwas_last_ts)
+            if new_vwas:
+                combined_history.extend(new_vwas)
+                combined_history.sort(key=lambda r: r.signal.bar_ts)
 
             live.update(render(states, combined_history, now))
             time.sleep(30)
@@ -1332,6 +1724,8 @@ def run_demo():
     mes_state.bars = [Bar(ts=now - timedelta(minutes=5),
                           open=6_622.0, high=6_627.5, low=6_620.5,
                           close=6_625.0, volume=6_820)]
+    mes_state.current_ha_streak = 3           # demo: 3 green bars
+    mes_state.current_vwaslr    = 0.72       # demo: building toward threshold
     mes_state.orb.session_date  = now_et.date()
     mes_state.orb.orb_high      = 6_618.0
     mes_state.orb.orb_low       = 6_594.0   # width = 24 pts ✓
@@ -1351,6 +1745,8 @@ def run_demo():
     mym_state.bars = [Bar(ts=now - timedelta(minutes=5),
                           open=46_430, high=46_560, low=46_415,
                           close=46_500, volume=9_800)]
+    mym_state.current_vwaslr = 0.63          # demo: above threshold (thr=0.5)
+    mym_state.vwaslr_entry   = 46_500
     mym_state.active_signal = Signal(
         cfg=mym_cfg, direction=1, entry=46_500,
         sigma=mym_sigma, sigma_pts=mym_sp,
@@ -1386,6 +1782,8 @@ def run_demo():
     mes_state2.bars = [Bar(ts=now - timedelta(minutes=5),
                            open=6_640.0, high=6_641.0, low=6_618.5,
                            close=6_620.0, volume=21_800)]
+    mes_state2.current_vwaslr = -1.18        # demo: SHORT signal (below -1.0)
+    mes_state2.vwaslr_entry   = 6_620.0
     mes_state2.active_signal = Signal(
         cfg=mes_cfg, direction=-1, entry=6_620.0,
         sigma=mes_sigma, sigma_pts=mes_sp,
@@ -1397,10 +1795,11 @@ def run_demo():
     mes_state2.orb.orb_complete = True
 
     mym_state2 = InstrumentState(cfg=mym_cfg, cname="MYMH6")
-    mym_state2.sigma      = mym_sigma
-    mym_state2.sigma_pts  = mym_sp
-    mym_state2.gk_ann_vol = 0.198
-    mym_state2.mean_vol   = 4_200.0
+    mym_state2.sigma        = mym_sigma
+    mym_state2.sigma_pts    = mym_sp
+    mym_state2.gk_ann_vol   = 0.198
+    mym_state2.mean_vol     = 4_200.0
+    mym_state2.current_vwaslr = -0.38       # demo: below threshold (thr=0.5), watching
     mym_state2.bars = [Bar(ts=now - timedelta(minutes=5),
                            open=46_490, high=46_505, low=46_475,
                            close=46_490, volume=3_100)]
