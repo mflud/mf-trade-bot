@@ -141,7 +141,7 @@ INSTRUMENTS = [
                          (15, 45, 18,  0, False),  # EOD volatility + daily break until Globex open
                      ],
                      orb_enabled=True, orb_width_pct_min=0.00354,
-                     vwaslr_n=50, vwaslr_threshold=1.0),   # 1-min N=50, thr=1.0 (EV=+0.293σ)
+                     vwaslr_n=50, vwaslr_threshold=0.8),   # 1-min N=50, thr=0.8 (EV=+0.312σ)
     InstrumentConfig("MYM", "MYM", stop_sigma=2.0, target_sigma=3.0,
                      point_value=0.50, ev_sigma=0.073,
                      csr_vol_windows=[(0.08, 4), (1.0, 8)],
@@ -151,7 +151,7 @@ INSTRUMENTS = [
                          (15, 45, 18,  0, False),  # EOD volatility + daily break until Globex open
                      ],
                      orb_enabled=True, orb_width_pct_min=0.00402,
-                     vwaslr_n=50, vwaslr_threshold=0.5),   # 1-min N=50, thr=0.5 (EV=+0.211σ)
+                     vwaslr_n=50, vwaslr_threshold=0.8),   # 1-min N=50, thr=0.8 (EV=+0.309σ)
     InstrumentConfig("M2K", "M2K", stop_sigma=2.0, target_sigma=3.0,
                      point_value=5.00, ev_sigma=0.107,
                      csr_vol_windows=[(0.08, 4), (1.0, 8)],
@@ -161,7 +161,7 @@ INSTRUMENTS = [
                          (15, 45, 18,  0, False),  # EOD volatility + daily break until Globex open
                      ],
                      orb_enabled=True, orb_width_pct_min=0.00715,
-                     vwaslr_n=50, vwaslr_threshold=1.0),  # 1-min N=50/thr=1.0 → EV=+0.470σ
+                     vwaslr_n=50, vwaslr_threshold=0.8),  # 1-min N=50/thr=0.8 → EV=+0.492σ
 ]
 
 ALERT_SOUND = "/System/Library/Sounds/Ping.aiff"
