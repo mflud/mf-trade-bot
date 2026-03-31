@@ -723,8 +723,7 @@ def build_vwaslr_panel(state: InstrumentState) -> Panel:
     t.add_column(style="dim", width=16)
     t.add_column()
 
-    sig_min   = n * 1   # 1-min bars → sig_min = n minutes
-    sigma_min = VWASLR_SIGMA_BARS * 1
+    sig_min = n * 1   # 1-min bars → sig_min = n minutes
 
     if v == 0.0:
         t.add_row(f"VWASLR({sig_min}m):", "[dim]warming up…[/]")
@@ -733,7 +732,24 @@ def build_vwaslr_panel(state: InstrumentState) -> Panel:
         t.add_row(f"VWASLR({sig_min}m):",
                   f"{_signal_bar(v, thr, max_disp)} "
                   f"[{v_style}]{v:+.3f}[/]  / ±{thr:.1f}σ")
-    t.add_row("σ-window:", f"[dim]{sigma_min}min ({VWASLR_SIGMA_BARS} 1-min bars)[/]")
+
+    # Three most recent 1-min VWASLR values
+    if len(state.vwaslr_bars) >= VWASLR_SIGMA_BARS + n + 1:
+        tz_local = datetime.now().astimezone().tzinfo
+        for offset in range(3):
+            slice_end = len(state.vwaslr_bars) - offset
+            recent_v  = _compute_vwaslr(state.vwaslr_bars[:slice_end], n, VWASLR_SIGMA_BARS)
+            bar_ts    = state.vwaslr_bars[slice_end - 1].ts.astimezone(tz_local)
+            lbl       = f"  {'now' if offset == 0 else f'-{offset}m'}:"
+            if recent_v == 0.0:
+                t.add_row(lbl, "[dim]—[/]")
+            else:
+                rv_style = ("bold green" if recent_v >= thr else
+                            "bold red"   if recent_v <= -thr else "dim")
+                t.add_row(lbl,
+                          f"[{rv_style}]{recent_v:+.3f}[/]"
+                          f"  [dim]{bar_ts.strftime('%H:%M')}[/]")
+
     if state.vwaslr_entry is not None:
         entry_style = "bold green" if is_long else "bold red"
         t.add_row("Entry:", f"[{entry_style}]{state.vwaslr_entry:,.2f}[/]")
@@ -784,14 +800,14 @@ def build_instrument_column(state: InstrumentState, now: datetime) -> Table:
     col.add_row(build_regime_panel(state))
     col.add_row(build_bar_panel(state))
     col.add_row(build_signal_panel(state, now))
-    if state.cfg.vwaslr_n > 0:
-        col.add_row(build_vwaslr_panel(state))
     if state.cfg.orb_enabled:
         col.add_row(build_orb_panel(state, now))
+    if state.cfg.vwaslr_n > 0:
+        col.add_row(build_vwaslr_panel(state))
     return col
 
 
-def build_history_table(history: list[RecentSignal]) -> Panel:
+def build_history_table(history: list[RecentSignal], max_rows: int = 6) -> Panel:
     t = Table(box=box.SIMPLE, padding=(0, 1), show_header=True,
               header_style="bold dim")
     t.add_column("Time",    width=8)
@@ -804,7 +820,7 @@ def build_history_table(history: list[RecentSignal]) -> Panel:
     t.add_column("Outcome", width=12)
     t.add_column("P&L",     width=10, justify="right")
 
-    for rs in reversed(history[-8:]):
+    for rs in reversed(history[-max_rows:]):
         s  = rs.signal
         ts = s.bar_ts.astimezone(datetime.now().astimezone().tzinfo)
         kind = s.kind if isinstance(s, _HistSignal) else (
@@ -869,8 +885,8 @@ def build_header(now: datetime) -> Panel:
 
 
 def build_sizing_table(states: list[InstrumentState]) -> Panel:
-    """Lot-size table: rows = $100/$200/$300 risk, columns = each instrument."""
-    RISKS = [100, 200, 300]
+    """Lot-size table: rows = $100/$200/$300/$400 risk, columns = each instrument."""
+    RISKS = [100, 200, 300, 400]
 
     t = Table(box=box.SIMPLE_HEAD, show_header=True, padding=(0, 2))
     t.add_column("", style="dim", justify="left")
@@ -926,10 +942,12 @@ def render(states: list[InstrumentState],
     )
     root.add_row(cols)
 
-    root.add_row(build_sizing_table(states))
-
-    if history:
-        root.add_row(build_history_table(history))
+    bottom = Table.grid(padding=(0, 1))
+    bottom.add_column()
+    bottom.add_column()
+    history_panel = build_history_table(history, max_rows=6) if history else None
+    bottom.add_row(build_sizing_table(states), history_panel or "")
+    root.add_row(bottom)
 
     return root
 
