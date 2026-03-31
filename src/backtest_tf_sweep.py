@@ -40,34 +40,31 @@ STOPS   = [0.5, 1.0, 1.5, 2.0]
 TARGETS = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
 PRAC_S, PRAC_T = 2.0, 3.0
 
-TIMEFRAMES = [2, 3, 4, 5, 6, 10]   # minutes
+TIMEFRAMES = [5, 10, 15]   # minutes — focus set for NYSE TF comparison
 
 # Option A: same candle counts for all TFs
 PARAMS_A = {
-     2: {"trailing": 20, "mom": 8, "hold": 3},
-     3: {"trailing": 20, "mom": 8, "hold": 3},
-     4: {"trailing": 20, "mom": 8, "hold": 3},
      5: {"trailing": 20, "mom": 8, "hold": 3},
-     6: {"trailing": 20, "mom": 8, "hold": 3},
     10: {"trailing": 20, "mom": 8, "hold": 3},
+    15: {"trailing": 20, "mom": 8, "hold": 3},
 }
 
-# Option B: same time windows (~100-min σ, ~40-min CSR, ~15-min hold)
+# Option B: same time windows (~100-min σ, ~40-min CSR, ~45-min hold)
 PARAMS_B = {
-     2: {"trailing": 50, "mom": 20, "hold": 8},
-     3: {"trailing": 33, "mom": 13, "hold": 5},
-     4: {"trailing": 25, "mom": 10, "hold": 4},
      5: {"trailing": 20, "mom":  8, "hold": 3},
-     6: {"trailing": 17, "mom":  7, "hold": 3},
-    10: {"trailing": 10, "mom":  4, "hold": 2},
+    10: {"trailing": 10, "mom":  4, "hold": 3},
+    15: {"trailing":  7, "mom":  3, "hold": 3},
 }
 
 INSTRUMENTS = {
     "MES": "mes_hist_1min.csv",
     "MYM": "mym_hist_1min.csv",
+    "M2K": "m2k_hist_1min.csv",
 }
 
-BLACKOUT_ET = [(8, 0, 9, 0)]   # 08:00–09:00 ET (DST-aware)
+# NYSE session only: 09:30–16:00 ET
+RTH_START = (9, 30)
+RTH_END   = (16, 0)
 
 
 # ── Data helpers ───────────────────────────────────────────────────────────────
@@ -150,10 +147,10 @@ def scan(bars: pd.DataFrame, tf: int, params: dict) -> pd.DataFrame:
         sigma_pts = sigma * entry
         ann_vol   = sigma * math.sqrt(bars_per_year)
 
-        # Blackout check (ET local time — tracks DST correctly)
+        # NYSE session filter (09:30–16:00 ET only)
         bar_et = ts_pd[i].astimezone(ET)
         bar_hm = (bar_et.hour, bar_et.minute)
-        if any((sh, sm) <= bar_hm < (eh, em) for sh, sm, eh, em in BLACKOUT_ET):
+        if bar_hm < RTH_START or bar_hm >= RTH_END:
             continue
 
         # CSR: prior mom_bars bars only
@@ -320,17 +317,17 @@ def summary_table(sym: str, results: dict[int, pd.DataFrame], param_set: dict):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--sym", default=None, help="MES or MYM (default: both)")
-    parser.add_argument("--option", default="A", choices=["A", "B"],
-                        help="A = same candle counts; B = same time windows (default: A)")
+    parser.add_argument("--sym", default=None, help="MES, MYM, M2K (default: all)")
+    parser.add_argument("--option", default="B", choices=["A", "B"],
+                        help="A = same candle counts; B = same time windows (default: B)")
     args = parser.parse_args()
 
     param_set = PARAMS_A if args.option == "A" else PARAMS_B
     syms = {args.sym: INSTRUMENTS[args.sym]} if args.sym else INSTRUMENTS
 
-    print(f"\nOption {args.option}: "
+    print(f"\nNYSE session only (09:30–16:00 ET)  |  Option {args.option}: "
           + ("same candle counts (trailing=20, mom=8)" if args.option == "A"
-             else "same time windows (~100-min σ, ~40-min CSR, ~15-min hold)"))
+             else "same time windows (~100-min σ, ~40-min CSR, ~45-min hold)"))
 
     for sym, cache in syms.items():
         print(f"\nLoading {cache} …")

@@ -1,15 +1,20 @@
 """
-Backtest: Opening Range Breakout (ORB) on MES or MYM 1-min bars.
+Backtest: Opening Range Breakout (ORB) on MES / M2K / MYM 1-min bars.
 
 For each RTH session (9:30–16:00 ET), defines the opening range as the
 high/low of the first N minutes. After the ORB period closes, records the
 FIRST bar whose close breaks above the ORB high (long) or below the ORB low
 (short), then measures forward returns at multiple horizons including EOD.
 
+Width filter uses PERCENTAGE of the ORB midpoint price rather than fixed
+points, so the threshold is consistent across years regardless of the level
+of the index.
+
 Sweeps ORB periods: 1, 5, 10, 15, 30, 60 min.
 
 Usage:
   python src/backtest_orb.py           # MES
+  python src/backtest_orb.py --sym M2K
   python src/backtest_orb.py --sym MYM
 """
 
@@ -96,11 +101,14 @@ def scan_orb(df: pd.DataFrame, orb_min: int) -> pd.DataFrame:
         if len(orb_bars) < orb_min or len(post_bars) < 2:
             continue   # incomplete session
 
-        orb_high = orb_bars["high"].max()
-        orb_low  = orb_bars["low"].min()
+        orb_high  = orb_bars["high"].max()
+        orb_low   = orb_bars["low"].min()
         orb_width = orb_high - orb_low
         if orb_width <= 0:
             continue
+
+        orb_mid      = (orb_high + orb_low) / 2.0
+        orb_width_pct = orb_width / orb_mid   # fraction of price (e.g. 0.003 = 0.3%)
 
         eod_close = session["close"].iloc[-1]
         post = post_bars.reset_index(drop=True)
@@ -121,14 +129,16 @@ def scan_orb(df: pd.DataFrame, orb_min: int) -> pd.DataFrame:
                 entry_min  = bar["mins_from_open"]   # minutes from open
                 sigma_pts  = bar["sigma_pts"]        # rolling σ in price points at entry bar
                 row = {
-                    "date":       date,
-                    "direction":  direction,
-                    "entry":      entry,
-                    "orb_high":   orb_high,
-                    "orb_low":    orb_low,
-                    "orb_width":  orb_width,
-                    "entry_min":  entry_min,
-                    "sigma_pts":  sigma_pts,
+                    "date":          date,
+                    "direction":     direction,
+                    "entry":         entry,
+                    "orb_high":      orb_high,
+                    "orb_low":       orb_low,
+                    "orb_mid":       orb_mid,
+                    "orb_width":     orb_width,
+                    "orb_width_pct": orb_width_pct,
+                    "entry_min":     entry_min,
+                    "sigma_pts":     sigma_pts,
                     # How far through the range did the breakout close?
                     "break_ext":  (entry - orb_high) / orb_width if direction == 1
                                   else (orb_low - entry) / orb_width,
@@ -240,7 +250,9 @@ def print_orb_results(results: pd.DataFrame, orb_min: int, sym: str):
     print(f"\n{'═'*68}")
     print(f"  {sym}  ORB {orb_min:>2} min   sessions: {total:,}  "
           f"(long={up:,}  short={dn:,})")
-    print(f"  ORB width: avg {results['orb_width'].mean():.2f} pts  "
+    avg_w_pts = results["orb_width"].mean()
+    avg_w_pct = results["orb_width_pct"].mean() * 100
+    print(f"  ORB width: avg {avg_w_pts:.2f} pts ({avg_w_pct:.3f}% of price)  "
           f"  entry delay from open: avg {results['entry_min'].mean():.0f} min")
     print(f"{'─'*68}")
 
@@ -283,29 +295,37 @@ def print_orb_results(results: pd.DataFrame, orb_min: int, sym: str):
         print(f"  {label:>8}  {'  '.join(parts)}")
 
     # ORB width tertile breakdown (LONG only, all horizons)
+    # Width measured as % of ORB midpoint — consistent across price levels / years
     long_res = results[results["direction"] == 1].copy()
     if len(long_res) >= 30:
-        q33 = long_res["orb_width"].quantile(1/3)
-        q67 = long_res["orb_width"].quantile(2/3)
-        def width_tier(w):
-            if w <= q33: return "narrow"
-            if w <= q67: return "medium"
-            return "wide"
-        long_res["width_tier"] = long_res["orb_width"].apply(width_tier)
+        q33_pct = long_res["orb_width_pct"].quantile(1/3)
+        q67_pct = long_res["orb_width_pct"].quantile(2/3)
+        # Point equivalents at the median price in the dataset
+        med_price = long_res["orb_mid"].median()
+        q33_pts = q33_pct * med_price
+        q67_pts = q67_pct * med_price
 
-        print(f"\n  ORB width tertiles (LONG only):  "
-              f"narrow ≤{q33:.2f}  medium ≤{q67:.2f}  wide >{q67:.2f}")
+        def width_tier(pct):
+            if pct <= q33_pct: return "narrow"
+            if pct <= q67_pct: return "medium"
+            return "wide"
+        long_res["width_tier"] = long_res["orb_width_pct"].apply(width_tier)
+
+        print(f"\n  ORB width tertiles (LONG only, % of midpoint price):")
+        print(f"    narrow ≤{q33_pct*100:.3f}%  medium ≤{q67_pct*100:.3f}%  wide >{q67_pct*100:.3f}%")
+        print(f"    (at median price {med_price:.0f}: narrow ≤{q33_pts:.2f} pts  "
+              f"medium ≤{q67_pts:.2f} pts  wide >{q67_pts:.2f} pts)")
         tier_order = ["narrow", "medium", "wide"]
         h_labels = [(f"fwd_{h}", f"{h}m") for h in HOLD_MINS] + [("fwd_eod", "EOD")]
         header_parts = "  ".join(f"{'n':>5} {'Hit%':>6} {'Avg':>7}" for _ in h_labels)
         col_headers  = "  ".join(f"{lbl:>20}" for _, lbl in h_labels)
-        print(f"  {'Tier':>8}  {'w avg':>6}  " + "  ".join(
+        print(f"  {'Tier':>8}  {'w%avg':>6}  " + "  ".join(
             f"{'─── ' + lbl + ' ───':>20}" for _, lbl in h_labels))
         print(f"  {'':>8}  {'':>6}  " + "  ".join(
             f"{'n':>5} {'Hit%':>6} {'Avg':>7}" for _ in h_labels))
         for tier in tier_order:
             grp = long_res[long_res["width_tier"] == tier]
-            w_avg = grp["orb_width"].mean()
+            w_avg = grp["orb_width_pct"].mean() * 100   # show as %
             parts = []
             for col, _ in h_labels:
                 fwd = grp[col].dropna()
@@ -316,7 +336,7 @@ def print_orb_results(results: pd.DataFrame, orb_min: int, sym: str):
                     avg = fwd.mean()
                     flag = "◄" if avg > 0 else " "
                     parts.append(f"{len(fwd):>5,} {hit:>5.1f}% {avg:>+6.2f}{flag}")
-            print(f"  {tier:>8}  {w_avg:>6.2f}  " + "  ".join(parts))
+            print(f"  {tier:>8}  {w_avg:>5.3f}%  " + "  ".join(parts))
 
     # Stop-placement analysis: wide-ORB LONG only, both stop variants
     if len(long_res) >= 30 and "risk_wide" in long_res.columns:
@@ -431,13 +451,143 @@ def print_orb_results(results: pd.DataFrame, orb_min: int, sym: str):
                                         labels=tod_labels, right=False)
             key_horizons = [(f"fwd_{h}", f"{h}m") for h in [15, 30, 45, 60]] + \
                            [("fwd_eod", "EOD")]
-            print(f"\n  TOD breakdown — Wide ORB LONG (w > {q67:.2f} pts):")
+            print(f"\n  TOD breakdown — Wide ORB LONG (w > {q67_pct*100:.3f}% of price):")
             print(f"  {'Window':>14}  {'n':>5}  " + "  ".join(
                 f"{'─ ' + lbl + ' ─':>16}" for _, lbl in key_horizons))
             print(f"  {'':>14}  {'':>5}  " + "  ".join(
                 f"{'Hit%':>6} {'Avg':>7}" for _ in key_horizons))
             for lbl in tod_labels:
                 grp = wide[wide["tod_bucket"] == lbl]
+                if len(grp) < 5:
+                    continue
+                parts = []
+                for col, _ in key_horizons:
+                    fwd = grp[col].dropna()
+                    if len(fwd) < 5:
+                        parts.append(f"{'—':>6} {'—':>7}")
+                    else:
+                        hit = (fwd > 0).mean() * 100
+                        avg = fwd.mean()
+                        flag = "◄" if avg > 0 else " "
+                        parts.append(f"{hit:>5.1f}% {avg:>+6.2f}{flag}")
+                print(f"  {lbl:>14}  {len(grp):>5,}  " + "  ".join(parts))
+
+    # ── SHORT analysis (mirrors LONG block above) ─────────────────────────────
+    short_res = results[results["direction"] == -1].copy()
+    if len(short_res) >= 30:
+        sq33_pct = short_res["orb_width_pct"].quantile(1/3)
+        sq67_pct = short_res["orb_width_pct"].quantile(2/3)
+        med_price_s = short_res["orb_mid"].median()
+
+        def short_width_tier(pct):
+            if pct <= sq33_pct: return "narrow"
+            if pct <= sq67_pct: return "medium"
+            return "wide"
+        short_res["width_tier"] = short_res["orb_width_pct"].apply(short_width_tier)
+
+        print(f"\n  ORB width tertiles (SHORT only, % of midpoint price):")
+        print(f"    narrow ≤{sq33_pct*100:.3f}%  medium ≤{sq67_pct*100:.3f}%  wide >{sq67_pct*100:.3f}%")
+        print(f"    (at median price {med_price_s:.0f}: narrow ≤{sq33_pct*med_price_s:.2f} pts  "
+              f"medium ≤{sq67_pct*med_price_s:.2f} pts  wide >{sq67_pct*med_price_s:.2f} pts)")
+        h_labels = [(f"fwd_{h}", f"{h}m") for h in HOLD_MINS] + [("fwd_eod", "EOD")]
+        print(f"  {'Tier':>8}  {'w%avg':>6}  " + "  ".join(
+            f"{'─── ' + lbl + ' ───':>20}" for _, lbl in h_labels))
+        print(f"  {'':>8}  {'':>6}  " + "  ".join(
+            f"{'n':>5} {'Hit%':>6} {'Avg':>7}" for _ in h_labels))
+        for tier in ["narrow", "medium", "wide"]:
+            grp = short_res[short_res["width_tier"] == tier]
+            w_avg = grp["orb_width_pct"].mean() * 100
+            parts = []
+            for col, _ in h_labels:
+                fwd = grp[col].dropna()
+                if len(fwd) < MIN_SESSIONS:
+                    parts.append(f"{'—':>5} {'—':>6} {'—':>7}")
+                else:
+                    hit = (fwd > 0).mean() * 100
+                    avg = fwd.mean()
+                    flag = "◄" if avg > 0 else " "
+                    parts.append(f"{len(fwd):>5,} {hit:>5.1f}% {avg:>+6.2f}{flag}")
+            print(f"  {tier:>8}  {w_avg:>5.3f}%  " + "  ".join(parts))
+
+        # Sigma-based stop analysis: wide SHORT, morning window only
+        if "risk_sigma" in short_res.columns:
+            wide_short = short_res[
+                (short_res["width_tier"] == "wide") &
+                (short_res["entry_min"] >= 15) &
+                (short_res["entry_min"] <  60)
+            ].dropna(subset=["risk_sigma"]).copy()
+            wide_short["year"] = pd.to_datetime(wide_short["date"]).dt.year
+
+            if len(wide_short) >= 10:
+                avg_sig  = wide_short["sigma_pts"].mean()
+                avg_risk = wide_short["risk_sigma"].mean()
+                print(f"\n  Stop = {STOP_SIGMA}σ — Wide SHORT, Morning 9:45–10:30 ET "
+                      f"(n={len(wide_short)}, avg σ = {avg_sig:.2f} pts, stop = {avg_risk:.2f} pts):")
+                print(f"  {'Target':>16}  {'Hit tgt%':>9}  {'Hit stp%':>9}  "
+                      f"{'Neither%':>9}  {'EV (R)':>8}  {'Avg mins to tgt':>16}")
+                for r_mult in [1, 2, 3]:
+                    hc = wide_short[f"hit_sig_{r_mult}R"]
+                    sc = wide_short[f"stop_sig_{r_mult}R"]
+                    mc = wide_short[f"mins_sig_{r_mult}R"]
+                    p_tgt  = hc.mean()
+                    p_stp  = sc.mean()
+                    p_none = 1 - p_tgt - p_stp
+                    neither_r = (wide_short.loc[~hc & ~sc, "fwd_eod"] /
+                                 wide_short.loc[~hc & ~sc, "risk_sigma"])
+                    eod_r_n = neither_r.mean() if len(neither_r) > 0 else 0.0
+                    eod_r_n = 0.0 if np.isnan(eod_r_n) else eod_r_n
+                    ev = p_tgt * r_mult + p_stp * (-1) + p_none * eod_r_n
+                    avg_mins = mc[hc].mean()
+                    mins_str = f"{avg_mins:.0f} min" if not np.isnan(avg_mins) else "—"
+                    tgt_label = f"{r_mult}σ ({r_mult * avg_sig:.2f} pts)"
+                    print(f"  {tgt_label:>16}  "
+                          f"{p_tgt*100:>8.1f}%  {p_stp*100:>8.1f}%  {p_none*100:>8.1f}%  "
+                          f"{ev:>+8.3f}  {mins_str:>16}")
+
+                R_SHOW = 2
+                print(f"\n  Year-by-year P&L  [{R_SHOW}σ target / {STOP_SIGMA}σ stop]  Wide SHORT Morning:")
+                print(f"  {'Year':>6}  {'n':>4}  {'Win%':>6}  {'Stp%':>6}  "
+                      f"{'EV(R)':>7}  {'Tot R':>7}  {'Avg σ':>7}")
+                total_r = 0.0
+                for yr, grp in wide_short.groupby("year"):
+                    if len(grp) < 3:
+                        continue
+                    hc_y = grp[f"hit_sig_{R_SHOW}R"]
+                    sc_y = grp[f"stop_sig_{R_SHOW}R"]
+                    p_t  = hc_y.mean()
+                    p_s  = sc_y.mean()
+                    p_n  = 1 - p_t - p_s
+                    neither_yr = (grp.loc[~hc_y & ~sc_y, "fwd_eod"] /
+                                  grp.loc[~hc_y & ~sc_y, "risk_sigma"])
+                    eod_n = neither_yr.mean() if len(neither_yr) > 0 else 0.0
+                    eod_n = 0.0 if np.isnan(eod_n) else eod_n
+                    ev_yr = p_t * R_SHOW + p_s * (-1) + p_n * eod_n
+                    tot_r = ev_yr * len(grp)
+                    total_r += tot_r
+                    avg_s = grp["sigma_pts"].mean()
+                    flag = " ◄" if ev_yr > 0 else ""
+                    print(f"  {yr:>6}  {len(grp):>4}  {p_t*100:>5.1f}%  {p_s*100:>5.1f}%  "
+                          f"{ev_yr:>+7.3f}  {tot_r:>+7.2f}R{flag}  {avg_s:>6.2f}")
+                print(f"  {'TOTAL':>6}  {len(wide_short):>4}  {'':>6}  {'':>6}  "
+                      f"{'':>7}  {total_r:>+7.2f}R")
+
+        # TOD breakdown for wide SHORT
+        wide_s_tod = short_res[short_res["width_tier"] == "wide"].copy()
+        if len(wide_s_tod) >= 30:
+            tod_bins   = [15, 60, 120, 180, 240, 391]
+            tod_labels = ["9:45-10:30", "10:30-11:30", "11:30-12:30",
+                          "12:30-13:30", "13:30-16:00"]
+            wide_s_tod["tod_bucket"] = pd.cut(wide_s_tod["entry_min"], bins=tod_bins,
+                                              labels=tod_labels, right=False)
+            key_horizons = [(f"fwd_{h}", f"{h}m") for h in [15, 30, 45, 60]] + \
+                           [("fwd_eod", "EOD")]
+            print(f"\n  TOD breakdown — Wide ORB SHORT (w > {sq67_pct*100:.3f}% of price):")
+            print(f"  {'Window':>14}  {'n':>5}  " + "  ".join(
+                f"{'─ ' + lbl + ' ─':>16}" for _, lbl in key_horizons))
+            print(f"  {'':>14}  {'':>5}  " + "  ".join(
+                f"{'Hit%':>6} {'Avg':>7}" for _ in key_horizons))
+            for lbl in tod_labels:
+                grp = wide_s_tod[wide_s_tod["tod_bucket"] == lbl]
                 if len(grp) < 5:
                     continue
                 parts = []

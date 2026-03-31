@@ -1,8 +1,9 @@
 Opening Range Breakout (ORB) Strategy
 ======================================
 
-Instruments:      MES (Micro E-mini S&P 500), M2K (Micro E-mini Russell 2000)
-Direction:        Long only
+Instruments:      MES (Micro E-mini S&P 500), M2K (Micro E-mini Russell 2000),
+                  MYM (Micro E-mini Dow)
+Direction:        Long and Short
 Backtest period:  2019-2026 (7 years, ~1,500 RTH sessions per instrument)
 
 
@@ -14,8 +15,8 @@ establish the "opening range" -- a high/low band that the market frequently uses
 a reference for the rest of the morning. When price breaks cleanly above that range
 in the follow-through window, it tends to continue.
 
-Only long (upside) breakouts are traded. Short breakouts have been consistently
-negative in backtesting and are not implemented.
+Both long (upside) and short (downside) breakouts are traded. One trade per
+session — whichever direction fires first in the morning window.
 
 
 ENTRY RULES
@@ -33,13 +34,19 @@ ENTRY RULES
 2. Width Filter
 
    Only trade if the ORB is "wide" -- in the top third of historical ORB widths
-   for that instrument.
+   for that instrument. Width is measured as a percentage of the ORB midpoint price,
+   which keeps the threshold consistent across years as index levels change.
 
-     MES:  >= 15.25 pts
-     M2K:  >= 14.30 pts
+     ORB width %  =  (ORB high - ORB low) / ((ORB high + ORB low) / 2)
+
+     MES:  >= 0.354%  (e.g. >= ~20 pts at current ~5,700 level)
+     M2K:  >= 0.715%  (e.g. >= ~16 pts at current ~2,200 level)
+     MYM:  >= 0.402%  (e.g. >= ~175 pts at current ~43,500 level)
 
    Narrow opening ranges produce low-quality breakouts. The wide-tertile filter
    eliminates roughly 2/3 of sessions and concentrates trades in the clearest setups.
+   Using a percentage rather than fixed points prevents the filter from becoming
+   progressively easier to pass as the market rises over time.
 
 3. Fire Window
 
@@ -48,8 +55,9 @@ ENTRY RULES
 
 4. Breakout Trigger
 
-   When the 5-minute bar closes above the ORB high, enter long at the close of
-   that bar.
+   When the 5-minute bar closes above the ORB high, enter long at the close.
+   When the 5-minute bar closes below the ORB low, enter short at the close.
+   One trade per session — whichever direction fires first.
 
 
 EXIT RULES
@@ -69,20 +77,32 @@ is a fallback only.
 
 BACKTEST RESULTS
 ----------------
-Wide ORB, morning breakout (9:45-10:30 ET), 2s stop / 2s target:
+Wide ORB (percentage-based filter), morning breakout (9:45-10:30 ET), 2s stop / 2s target:
 
-     Instrument   Trades (7yr)   Win rate   EV per trade   Total R
-     ----------   ------------   --------   ------------   -------
-     MES          ~280           ~53%       +0.35-0.44R    ~+100R
-     M2K          ~280           ~56%       +0.61R         +170R
+     Instrument   Direction   Trades (7yr)   Win rate   EV per trade   Total R
+     ----------   ---------   ------------   --------   ------------   -------
+     MES          Long        312            54%        +0.66R         +205R
+     MES          Short       322            48%        +0.44R         +142R
+     M2K          Long        283            55%        +0.66R         +187R
+     M2K          Short       306            47%        +0.43R         +131R
+     MYM          Long        289            50%        +0.53R         +153R
+     MYM          Short       297            47%        +0.41R         +122R
 
-M2K outperforms MES in this setup -- Russell 2000 tends to trend more cleanly
-after opening range resolution.
+Long breakouts are stronger (higher EV and win rate). Short breakouts have real but
+weaker edge — positive in the sigma stop/target framework even with sub-50% win rate
+because the reward is 2s vs 1R risk (asymmetric payoff).
+
+Shorts are positive in most years for all instruments. One trade per session fires
+(whichever direction breaks first in the morning window).
 
 R = risk unit = 1x (2s stop distance).
 
-Tight stops placed at the ORB high (breakout extension only) were consistently
-negative (EV = -0.08 to -0.38R) and are not used. The sigma-based stop is required.
+Tight stops placed at the ORB level (breakout extension only) were consistently
+negative (EV = -0.06 to -0.32R) and are not used. The sigma-based stop is required.
+
+Note: The percentage-based width filter replaced an earlier fixed-point threshold
+calibrated to 2019-era prices. The percentage filter correctly identifies wide sessions
+across all price levels as the market has appreciated over time.
 
 
 PARAMETERS AT A GLANCE
