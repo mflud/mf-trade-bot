@@ -20,8 +20,9 @@ Signal types:
   - ORB width ≥ instrument-specific wide-range cutoff (from backtest)
 
   VWASLR (volume-weighted avg scaled log return, MES/MYM only):
-  - VWASLR(50min, σ=500min) crosses ±threshold; RTH only (9:30–16:00 ET)
-  - MES: threshold=1.0σ/bar (EV=+0.091σ)  MYM: threshold=0.5σ/bar (EV=+0.066σ)
+  - 1-min bars; VWASLR(50min, σ=500min) crosses ±threshold; RTH only (9:30–16:00 ET)
+  - MES: threshold=1.0σ/bar (EV=+0.293σ)  MYM: threshold=0.5σ/bar (EV=+0.211σ)
+  - Separate incremental 1-min bar fetch (initial 560 bars, then new bars only each poll)
 
 Only one position per instrument at a time (all signal types share the lock).
 
@@ -75,7 +76,10 @@ PL_N_BARS = 10    # 1-min bars to look back for PL computation
 PL_THRESH = 0.50  # PL_aligned ≥ this → 2× sizing
 
 # ── VWASLR parameters (keep in sync with signal_monitor.py) ─────────────────
-VWASLR_SIGMA_BARS   = 100   # 100 × 5-min = 500-min σ window (slow/stable)
+# 1-min bars: N=50 (50-min window), σ=500 bars (500-min window), hold=25 bars (25 min)
+VWASLR_SIGMA_BARS   = 500   # 500 × 1-min = 500-min σ window (slow/stable)
+VWASLR_N            = 50    # 50 × 1-min = 50-min signal window
+VWASLR_INIT_BARS    = VWASLR_SIGMA_BARS + VWASLR_N + 15  # initial 1-min fetch (565 bars)
 VWASLR_STOP_SIGMA   = 2.0
 VWASLR_TARGET_SIGMA = 3.0
 
@@ -166,7 +170,7 @@ INSTRUMENTS = [
                       (15, 45, 18,  0, False),  # EOD volatility + daily break until Globex open
                   ],
                   orb_enabled=True, orb_width_pct_min=0.00354,
-                  vwaslr_n=10, vwaslr_threshold=1.0),   # N=10/thr=1.0 → EV=+0.091σ
+                  vwaslr_n=50, vwaslr_threshold=1.0),   # 1-min N=50/thr=1.0 → EV=+0.293σ
     BotInstrument("MYM", "MYM", tick_size=1.00, point_value=0.50,
                   csr_vol_windows=[(0.08, 4), (1.0, 8)],
                   blackout_windows=[
@@ -175,7 +179,7 @@ INSTRUMENTS = [
                       (15, 45, 18,  0, False),  # EOD volatility + daily break until Globex open
                   ],
                   orb_enabled=True, orb_width_pct_min=0.00402,
-                  vwaslr_n=10, vwaslr_threshold=0.5),   # N=10/thr=0.5 → EV=+0.066σ
+                  vwaslr_n=50, vwaslr_threshold=0.5),   # 1-min N=50/thr=0.5 → EV=+0.211σ
     BotInstrument("M2K", "M2K", tick_size=0.10, point_value=5.00,
                   csr_vol_windows=[(0.08, 4), (1.0, 8)],
                   blackout_windows=[
@@ -183,7 +187,8 @@ INSTRUMENTS = [
                       (8,   0,  9,  0, True),   # econ releases: block only if CSR<1.5
                       (15, 45, 18,  0, False),  # EOD volatility + daily break until Globex open
                   ],
-                  orb_enabled=True, orb_width_pct_min=0.00715),
+                  orb_enabled=True, orb_width_pct_min=0.00715,
+                  vwaslr_n=50, vwaslr_threshold=1.0),  # 1-min N=50/thr=1.0 → EV=+0.470σ
 ]
 
 
@@ -322,6 +327,7 @@ class InstrumentState:
     instrument:   BotInstrument
     contract_id:  str = ""
     bars:         list[Bar] = field(default_factory=list)
+    vwaslr_bars:  list[Bar] = field(default_factory=list)  # separate 1-min bar list for VWASLR
     sigma:        float = 0.0
     sigma_pts:    float = 0.0
     mean_vol:           float | None = None
@@ -516,9 +522,7 @@ def evaluate(state: InstrumentState) -> dict | None:
 def fetch_bars(client: TopstepClient, state: InstrumentState):
     end      = datetime.now(timezone.utc)
     max_mom  = max(bars for inst in INSTRUMENTS for _, bars in inst.csr_vol_windows)
-    csr_lookback   = TRAILING_BARS + max_mom + 10
-    vwaslr_lookback = VWASLR_SIGMA_BARS + 15   # 100 σ-bars + n_win + margin
-    lookback = max(csr_lookback, vwaslr_lookback)
+    lookback = TRAILING_BARS + max_mom + 10
     start    = end - timedelta(minutes=TF_MINUTES * lookback)
     raw = client.get_bars(
         contract_id=state.contract_id,
@@ -532,6 +536,47 @@ def fetch_bars(client: TopstepClient, state: InstrumentState):
             close=b["c"], volume=b["v"])
         for b in reversed(raw)
     ]
+
+
+def fetch_vwaslr_bars(client: TopstepClient, state: InstrumentState):
+    """Fetch 1-min bars for VWASLR.  Initial call: full 565-bar history.
+    Subsequent calls: only bars since the last known timestamp (incremental)."""
+    if not state.vwaslr_bars:
+        end   = datetime.now(timezone.utc)
+        start = end - timedelta(minutes=VWASLR_INIT_BARS + 30)
+        raw   = client.get_bars(
+            contract_id=state.contract_id,
+            start=start, end=end,
+            unit=TopstepClient.MINUTE, unit_number=1,
+            limit=VWASLR_INIT_BARS,
+        )
+        state.vwaslr_bars = [
+            Bar(ts=datetime.fromisoformat(b["t"]),
+                open=b["o"], high=b["h"], low=b["l"],
+                close=b["c"], volume=b["v"])
+            for b in reversed(raw)
+        ]
+    else:
+        since = state.vwaslr_bars[-1].ts
+        end   = datetime.now(timezone.utc)
+        raw   = client.get_bars(
+            contract_id=state.contract_id,
+            start=since, end=end,
+            unit=TopstepClient.MINUTE, unit_number=1,
+            limit=10,
+        )
+        new_bars = [
+            Bar(ts=datetime.fromisoformat(b["t"]),
+                open=b["o"], high=b["h"], low=b["l"],
+                close=b["c"], volume=b["v"])
+            for b in reversed(raw)
+        ]
+        for b in new_bars:
+            if b.ts > since:
+                state.vwaslr_bars.append(b)
+        # Trim to avoid unbounded growth (keep last VWASLR_INIT_BARS + buffer)
+        if len(state.vwaslr_bars) > VWASLR_INIT_BARS + 200:
+            state.vwaslr_bars = state.vwaslr_bars[-(VWASLR_INIT_BARS + 100):]
 
 
 # ── Order placement ──────────────────────────────────────────────────────────
@@ -1093,12 +1138,12 @@ def _log_vwaslr_trade(trade: ActiveVwasrlTrade, outcome: str,
 
 def evaluate_vwaslr(state: InstrumentState) -> VwasrlSignal | None:
     """
-    Compute VWASLR for the last completed bar.  Returns a VwasrlSignal if the
-    value crosses ±threshold and the bar is within RTH (09:30–16:00 ET).
+    Compute VWASLR on 1-min bars.  Returns a VwasrlSignal if the value crosses
+    ±threshold and the bar is within RTH (09:30–16:00 ET).
     Respects instrument blackout windows.
     """
     inst = state.instrument
-    bars = state.bars
+    bars = state.vwaslr_bars
     needed = inst.vwaslr_n + VWASLR_SIGMA_BARS + 1
     if len(bars) < needed:
         return None
@@ -1203,7 +1248,8 @@ def handle_active_vwaslr_trade(client: TopstepClient, state: InstrumentState,
 
     if paper:
         if now >= trade.expires_at:
-            exit_price = state.bars[-1].close if state.bars else trade.sig.entry
+            exit_price = (state.vwaslr_bars[-1].close if state.vwaslr_bars
+                          else trade.sig.entry)
             _log_vwaslr_trade(trade, "TIME EXIT (paper)", exit_price, now)
             state.active_vwaslr_trade = None
         return
@@ -1226,10 +1272,10 @@ def handle_active_vwaslr_trade(client: TopstepClient, state: InstrumentState,
 
     # Software trailing stop for VWASLR trades.
     # The bracket stop at 2σ remains as a safety net; this fires earlier.
-    if pos and trade.fill_price is not None and state.bars:
+    if pos and trade.fill_price is not None and state.vwaslr_bars:
         fill       = trade.fill_price
         trail_dist = VWASLR_TRAIL_SIGMA * trade.sig.sigma_pts
-        bars_after = [b for b in state.bars if b.ts >= trade.fired_at]
+        bars_after = [b for b in state.vwaslr_bars if b.ts >= trade.fired_at]
         if bars_after:
             if trade.sig.direction == 1:   # LONG — track highest high
                 new_peak = max(b.high for b in bars_after)
@@ -1240,7 +1286,7 @@ def handle_active_vwaslr_trade(client: TopstepClient, state: InstrumentState,
                 trade.trail_peak = min(new_peak, fill)
                 trade.trail_stop_level = trade.trail_peak + trail_dist
 
-            last_bar   = state.bars[-1]
+            last_bar   = state.vwaslr_bars[-1]
             trail_stop = trade.trail_stop_level
             trail_hit  = (
                 last_bar.ts > trade.fired_at and trail_stop is not None and (
@@ -1282,7 +1328,7 @@ def handle_active_vwaslr_trade(client: TopstepClient, state: InstrumentState,
                                    (d == -1 and exit_price <= trade.target_price())
                        else "STOPPED")
         else:
-            outcome, exit_price = _classify_vwaslr_outcome(trade, state.bars)
+            outcome, exit_price = _classify_vwaslr_outcome(trade, state.vwaslr_bars)
         _log_vwaslr_trade(trade, outcome, exit_price, now)
         state.active_vwaslr_trade = None
         try:
@@ -1304,7 +1350,8 @@ def handle_active_vwaslr_trade(client: TopstepClient, state: InstrumentState,
         except Exception as e:
             log.error(f"VWASLR {trade.instrument.symbol}: failed to close position: {e}")
             return
-        exit_price = state.bars[-1].close if state.bars else (trade.fill_price or trade.sig.entry)
+        exit_price = (state.vwaslr_bars[-1].close if state.vwaslr_bars
+                      else (trade.fill_price or trade.sig.entry))
         _log_vwaslr_trade(trade, "TIME EXIT", exit_price, now)
         state.active_vwaslr_trade = None
         try:
@@ -1411,6 +1458,8 @@ def run(account_id: int | None, paper: bool):
         for state in states:
             try:
                 fetch_bars(client, state)
+                if state.instrument.vwaslr_n > 0:
+                    fetch_vwaslr_bars(client, state)
 
                 if state.active_trade:
                     handle_active_trade(client, state, account_id, now, paper)
@@ -1450,8 +1499,9 @@ def run(account_id: int | None, paper: bool):
 
                 if no_position and not past_cutoff and state.instrument.vwaslr_n > 0:
                     vwas_sig = evaluate_vwaslr(state)
-                    if vwas_sig and last_bar_ts != state.vwaslr_last_ts:
-                        state.vwaslr_last_ts = last_bar_ts
+                    vwaslr_bar_ts = state.vwaslr_bars[-1].ts if state.vwaslr_bars else None
+                    if vwas_sig and vwaslr_bar_ts != state.vwaslr_last_ts:
+                        state.vwaslr_last_ts = vwaslr_bar_ts
                         place_vwaslr_signal(client, state, vwas_sig, account_id, paper)
 
             except Exception as e:

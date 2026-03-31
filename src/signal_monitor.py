@@ -64,7 +64,10 @@ CSR_TRAIL_SIGMA    = 0.5
 VWASLR_TRAIL_SIGMA = 1.5
 
 # VWASLR parameters (Volume-Weighted Average Scaled Log Return)
-VWASLR_SIGMA_BARS = 100   # 100 × 5-min = 500-min σ window (slow/stable; matches backtest)
+# 1-min bars: N=50 (50-min signal window), σ=500 bars (500-min σ window)
+VWASLR_SIGMA_BARS = 500   # 500 × 1-min = 500-min σ window (slow/stable; matches backtest)
+VWASLR_N          = 50    # 50 × 1-min = 50-min signal window
+VWASLR_INIT_BARS  = VWASLR_SIGMA_BARS + VWASLR_N + 15  # initial 1-min fetch (565 bars)
 
 ET = ZoneInfo("America/New_York")
 
@@ -138,7 +141,7 @@ INSTRUMENTS = [
                          (15, 45, 18,  0, False),  # EOD volatility + daily break until Globex open
                      ],
                      orb_enabled=True, orb_width_pct_min=0.00354,
-                     vwaslr_n=10, vwaslr_threshold=1.0),   # best: N=10, thr=1.0 (EV=+0.091σ)
+                     vwaslr_n=50, vwaslr_threshold=1.0),   # 1-min N=50, thr=1.0 (EV=+0.293σ)
     InstrumentConfig("MYM", "MYM", stop_sigma=2.0, target_sigma=3.0,
                      point_value=0.50, ev_sigma=0.073,
                      csr_vol_windows=[(0.08, 4), (1.0, 8)],
@@ -148,7 +151,7 @@ INSTRUMENTS = [
                          (15, 45, 18,  0, False),  # EOD volatility + daily break until Globex open
                      ],
                      orb_enabled=True, orb_width_pct_min=0.00402,
-                     vwaslr_n=10, vwaslr_threshold=0.5),   # best: N=10, thr=0.5 (EV=+0.066σ)
+                     vwaslr_n=50, vwaslr_threshold=0.5),   # 1-min N=50, thr=0.5 (EV=+0.211σ)
     InstrumentConfig("M2K", "M2K", stop_sigma=2.0, target_sigma=3.0,
                      point_value=5.00, ev_sigma=0.107,
                      csr_vol_windows=[(0.08, 4), (1.0, 8)],
@@ -157,7 +160,8 @@ INSTRUMENTS = [
                          (8,   0,  9,  0, True),   # econ releases: block only if CSR<1.5
                          (15, 45, 18,  0, False),  # EOD volatility + daily break until Globex open
                      ],
-                     orb_enabled=True, orb_width_pct_min=0.00715),
+                     orb_enabled=True, orb_width_pct_min=0.00715,
+                     vwaslr_n=50, vwaslr_threshold=1.0),  # 1-min N=50/thr=1.0 → EV=+0.470σ
 ]
 
 ALERT_SOUND = "/System/Library/Sounds/Ping.aiff"
@@ -264,6 +268,7 @@ class InstrumentState:
     cid:           str = ""
     cname:         str = ""
     bars:          list[Bar] = field(default_factory=list)
+    vwaslr_bars:   list[Bar] = field(default_factory=list)  # separate 1-min bars for VWASLR
     sigma:         float = 0.0
     sigma_pts:     float = 0.0
     sigma_bar_count: int = 0      # number of returns used in sigma calc
@@ -718,8 +723,8 @@ def build_vwaslr_panel(state: InstrumentState) -> Panel:
     t.add_column(style="dim", width=16)
     t.add_column()
 
-    sig_min   = n * TF_MINUTES
-    sigma_min = VWASLR_SIGMA_BARS * TF_MINUTES
+    sig_min   = n * 1   # 1-min bars → sig_min = n minutes
+    sigma_min = VWASLR_SIGMA_BARS * 1
 
     if v == 0.0:
         t.add_row(f"VWASLR({sig_min}m):", "[dim]warming up…[/]")
@@ -728,20 +733,21 @@ def build_vwaslr_panel(state: InstrumentState) -> Panel:
         t.add_row(f"VWASLR({sig_min}m):",
                   f"{_signal_bar(v, thr, max_disp)} "
                   f"[{v_style}]{v:+.3f}[/]  / ±{thr:.1f}σ")
-    t.add_row("σ-window:", f"[dim]{sigma_min}min ({VWASLR_SIGMA_BARS} bars)[/]")
+    t.add_row("σ-window:", f"[dim]{sigma_min}min ({VWASLR_SIGMA_BARS} 1-min bars)[/]")
     if state.vwaslr_entry is not None:
         entry_style = "bold green" if is_long else "bold red"
         t.add_row("Entry:", f"[{entry_style}]{state.vwaslr_entry:,.2f}[/]")
 
-        # Compute trailing stop from bars since entry
+        # Compute trailing stop from 1-min bars since entry
         direction  = 1 if is_long else -1
         trail_dist = VWASLR_TRAIL_SIGMA * state.sigma_pts
-        if trail_dist > 0 and state.bars:
+        ref_bars   = state.vwaslr_bars if state.vwaslr_bars else state.bars
+        if trail_dist > 0 and ref_bars:
             if direction == 1:
-                peak = max(max(b.high for b in state.bars), state.vwaslr_entry)
+                peak = max(max(b.high for b in ref_bars), state.vwaslr_entry)
                 trail_stop = peak - trail_dist
             else:
-                peak = min(min(b.low for b in state.bars), state.vwaslr_entry)
+                peak = min(min(b.low for b in ref_bars), state.vwaslr_entry)
                 trail_stop = peak + trail_dist
             trail_pnl = (trail_stop - state.vwaslr_entry) * direction
             trail_col = "green" if trail_pnl >= 0 else "yellow"
@@ -794,6 +800,7 @@ def build_history_table(history: list[RecentSignal]) -> Panel:
     t.add_column("Entry",   width=10, justify="right")
     t.add_column("Target",  width=10, justify="right")
     t.add_column("Stop",    width=10, justify="right")
+    t.add_column("Exit",    width=10, justify="right")
     t.add_column("Outcome", width=12)
     t.add_column("P&L",     width=10, justify="right")
 
@@ -826,6 +833,12 @@ def build_history_table(history: list[RecentSignal]) -> Panel:
         else:
             out_str = f"[dim]{rs.outcome}[/]"
 
+        if rs.outcome == "OPEN":
+            exit_str = "[dim]—[/]"
+        else:
+            exit_price = s.entry + rs.pnl_pts * s.direction
+            exit_str = f"[{pnl_col}]{exit_price:,.2f}[/]"
+
         t.add_row(
             ts.strftime("%H:%M"),
             rs.symbol,
@@ -833,6 +846,7 @@ def build_history_table(history: list[RecentSignal]) -> Panel:
             f"{s.entry:,.2f}",
             f"{s.target:,.2f}",
             f"{s.stop:,.2f}",
+            exit_str,
             out_str,
             pnl_str,
         )
@@ -1558,8 +1572,7 @@ def run_live():
     def fetch_bars(state: InstrumentState):
         end   = datetime.now(timezone.utc)
         max_mom  = max(bars for cfg in INSTRUMENTS for _, bars in cfg.csr_vol_windows)
-        vwaslr_lookback = VWASLR_SIGMA_BARS + max(cfg.vwaslr_n for cfg in INSTRUMENTS) + 5
-        lookback = max(TRAILING_BARS + max_mom + 10, vwaslr_lookback)
+        lookback = TRAILING_BARS + max_mom + 10
         start = end - timedelta(minutes=TF_MINUTES * lookback)
         try:
             raw = client.get_bars(contract_id=state.cid, start=start, end=end,
@@ -1573,6 +1586,38 @@ def run_live():
         except Exception as e:
             state.error = f"fetch error: {e}"
 
+    def fetch_vwaslr_bars(state: InstrumentState):
+        """Incremental 1-min fetch for VWASLR.  Initial: 565-bar history.
+        Subsequent: only bars since last known timestamp."""
+        try:
+            if not state.vwaslr_bars:
+                end   = datetime.now(timezone.utc)
+                start = end - timedelta(minutes=VWASLR_INIT_BARS + 30)
+                raw   = client.get_bars(contract_id=state.cid, start=start, end=end,
+                                        unit=TopstepClient.MINUTE, unit_number=1,
+                                        limit=VWASLR_INIT_BARS)
+                state.vwaslr_bars = [Bar(ts=datetime.fromisoformat(b["t"]),
+                                         open=b["o"], high=b["h"], low=b["l"],
+                                         close=b["c"], volume=b["v"])
+                                     for b in reversed(raw)]
+            else:
+                since = state.vwaslr_bars[-1].ts
+                end   = datetime.now(timezone.utc)
+                raw   = client.get_bars(contract_id=state.cid, start=since, end=end,
+                                        unit=TopstepClient.MINUTE, unit_number=1,
+                                        limit=10)
+                new_bars = [Bar(ts=datetime.fromisoformat(b["t"]),
+                                open=b["o"], high=b["h"], low=b["l"],
+                                close=b["c"], volume=b["v"])
+                            for b in reversed(raw)]
+                for b in new_bars:
+                    if b.ts > since:
+                        state.vwaslr_bars.append(b)
+                if len(state.vwaslr_bars) > VWASLR_INIT_BARS + 200:
+                    state.vwaslr_bars = state.vwaslr_bars[-(VWASLR_INIT_BARS + 100):]
+        except Exception as e:
+            state.error = f"vwaslr fetch error: {e}"
+
     def resolve(state: InstrumentState, outcome: str, pnl_pts: float, now: datetime):
         sig = state.active_signal
         combined_history.append(RecentSignal(state.cfg.symbol, sig, outcome, pnl_pts))
@@ -1583,6 +1628,8 @@ def run_live():
     # signal_monitor was started after the 9:30–9:45 ORB window.
     for state in states:
         fetch_bars(state)
+        if state.cfg.vwaslr_n > 0:
+            fetch_vwaslr_bars(state)
         if state.cfg.orb_enabled:
             backfill_orb_state(state, client)
 
@@ -1599,13 +1646,16 @@ def run_live():
                 state.current_ha_streak = _ha_streak(state.bars)
                 state.live_bar          = fetch_live_bar(client, state, now)
                 if state.cfg.vwaslr_n > 0:
+                    fetch_vwaslr_bars(state)
                     prev_vwaslr = state.current_vwaslr
-                    state.current_vwaslr = _compute_vwaslr(state.bars, state.cfg.vwaslr_n)
+                    state.current_vwaslr = _compute_vwaslr(
+                        state.vwaslr_bars, state.cfg.vwaslr_n, VWASLR_SIGMA_BARS)
                     thr = state.cfg.vwaslr_threshold
                     was_active = abs(prev_vwaslr) >= thr
                     now_active = abs(state.current_vwaslr) >= thr
                     if now_active and not was_active:
-                        state.vwaslr_entry = state.bars[-1].close
+                        state.vwaslr_entry = (state.vwaslr_bars[-1].close
+                                              if state.vwaslr_bars else state.bars[-1].close)
                     elif not now_active and was_active:
                         state.vwaslr_entry = None
 
