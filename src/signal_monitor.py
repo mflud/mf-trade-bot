@@ -733,14 +733,14 @@ def build_vwaslr_panel(state: InstrumentState) -> Panel:
                   f"{_signal_bar(v, thr, max_disp)} "
                   f"[{v_style}]{v:+.3f}[/]  / ±{thr:.1f}σ")
 
-    # Three most recent 1-min VWASLR values
+    # Three prior 1-min VWASLR values (-1m, -2m, -3m)
     if len(state.vwaslr_bars) >= VWASLR_SIGMA_BARS + n + 1:
         tz_local = datetime.now().astimezone().tzinfo
-        for offset in range(3):
+        for offset in range(1, 4):
             slice_end = len(state.vwaslr_bars) - offset
             recent_v  = _compute_vwaslr(state.vwaslr_bars[:slice_end], n, VWASLR_SIGMA_BARS)
             bar_ts    = state.vwaslr_bars[slice_end - 1].ts.astimezone(tz_local)
-            lbl       = f"  {'now' if offset == 0 else f'-{offset}m'}:"
+            lbl       = f"  -{offset}m:"
             if recent_v == 0.0:
                 t.add_row(lbl, "[dim]—[/]")
             else:
