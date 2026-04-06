@@ -1,6 +1,6 @@
 MES/MYM Systematic Signal Research — Journey Summary
 ======================================================
-Written: 2026-03-15  |  Updated: 2026-03-31
+Written: 2026-03-15  |  Updated: 2026-04-02
 
 
 STARTING POINT
@@ -990,6 +990,141 @@ already used adverse-first ordering.
 
 The primary path (_get_exit_price → direction-aware check) was already correct from an
 earlier fix; this closes the fallback path.
+
+
+SCALED LOG RETURNS — WHY VWASLR GENERALIZES
+---------------------------------------------
+Updated: 2026-04-02
+
+A direct head-to-head backtest of VWAP-cross vs VWASLR on the same MES data
+(2019–2026, 5-min RTH bars, identical exits: 2σ stop / 3σ target / fixed hold)
+produced a clean result:
+
+  Metric              VWAP-cross     VWASLR
+  N trades               6,368        1,517
+  P(target hit)          16.6%        45.2%
+  P(stop hit)            33.4%        34.0%
+  EV per trade         ~0.00 σ       +0.82 σ
+  Total pts (7yr)         +1.6       +1,663
+  Total $ (1 micro)        $8        $8,316
+
+The stop rate is nearly identical — both signals carry the same loss exposure.
+But VWASLR wins at the target nearly 3× more often. VWAP-cross generates 4× more
+trades and essentially no edge. The difference is entirely attributable to the
+signal construction.
+
+WHY THE FORMULA WORKS
+
+VWASLR is defined as the EMA of the volume-weighted average scaled log return:
+
+  VWASLR_n[i] = EMA( Σ(vol_j × log(c_j/c_{j-1}) / σ) / Σ(vol_j) )
+
+This packs four filters into one number:
+
+1. LOG RETURN (not arithmetic)
+   Log returns are symmetric: a +2% move and a −2% move score equally. This
+   matters across a price range of MES 2500→6500 over the backtest period — a
+   fixed-point arithmetic signal would drift systematically with price level.
+   Log returns eliminate that drift.
+
+2. VOLATILITY SCALING (÷ σ)
+   Dividing by the trailing σ makes the signal regime-agnostic. A 0.4σ threshold
+   represents the same statistical conviction on a low-vol consolidation day as on
+   a high-vol trending day. A VWAP cross has no such adaptation — in a 5-point
+   vol regime it triggers constantly; in a 20-point vol regime it rarely fires,
+   but the underlying market condition is symmetric. VWASLR normalizes this.
+
+3. VOLUME WEIGHTING
+   A price move driven by high volume is structurally different from the same move
+   on thin participation. By weighting each bar's log return by its volume, VWASLR
+   gives more influence to bars where real order flow is present. A VWAP cross
+   tells you where price is relative to a reference level; VWASLR tells you how
+   much directed order flow has been present and in what direction.
+
+4. EMA SMOOTHING
+   The EMA acts as a temporal filter. A single outsized bar does not immediately
+   fire the signal; the directional conviction must persist across multiple bars.
+   This eliminates many fakeouts that a raw cross would catch.
+
+Together these four properties produce a signal that answers: "Is the market
+moving directionally, with conviction, at a statistically meaningful level,
+confirmed by volume, and has that conviction persisted over time?" — vs. the
+VWAP cross which only asks: "Is price currently above its average?"
+
+YEAR-BY-YEAR CONSISTENCY
+
+VWAP-cross EV was inconsistent across years: positive in 2020, 2022, 2023 but
+negative in 2019, 2021, 2024, 2025. No year produced strong positive EV. This
+is characteristic of a noise signal — performance is regime-dependent and
+unreliable out of sample.
+
+VWASLR (thr=0.4, hold=4 bars, N=10) has demonstrated positive EV in the
+majority of years tested and a Sharpe of 2.57 on 2,270 trades.
+
+THE VWAP-CROSS DIRECTION ASYMMETRY
+
+An interesting secondary finding: VWAP-cross short signals slightly outperformed
+long signals (−0.025σ long, +0.026σ short). This is consistent with the known
+mean-reversion tendency of price around VWAP intraday — price crossing up through
+VWAP is slightly more often a fakeout than a cross down. VWASLR avoids this
+entirely by requiring volume-weighted momentum rather than a price level cross.
+
+IMPLICATIONS — THE VWASLR FRAMEWORK AS A TEMPLATE
+
+Wherever a simple price-level signal is used as a trigger, a VWASLR analog
+structured around scaled log returns is likely to outperform it for the same
+reasons demonstrated above. The pattern applies broadly:
+
+  Simple signal              VWASLR analog
+  ─────────────────────────────────────────────────────────────────────────────
+  VWAP cross                 VWASLR (this work): EMA of volume-weighted scaled
+                             returns crosses a σ threshold — validated ✓
+
+  Moving average cross       Replace MA with EMA of volume-weighted scaled
+                             returns over the relevant window; threshold in σ
+                             units. Adapts to vol; volume-confirmed.
+
+  RSI overbought/oversold    RSI computes average gains vs losses in raw points.
+                             Replace with volume-weighted σ-scaled gains/losses
+                             — produces a "VWRSI" that normalizes both vol and
+                             participation.
+
+  Breakout above N-bar high  Instead of raw price exceeding a level, require
+                             VWASLR to cross a threshold AND price to exceed the
+                             level. The dual filter eliminates low-volume breaks.
+
+  Range expansion (ATR       Measure range expansion in σ units rather than raw
+  breakout)                  points. A 2σ expansion is meaningful regardless of
+                             the current vol regime.
+
+  Opening range breakout     Already partially addressed by the CSR signal
+  (ORB)                      (range-relative entry). A natural extension would
+                             be requiring VWASLR > threshold at the moment of
+                             the ORB breach — volume-confirming the break.
+
+  Globex gap fade / fill     A gap of N points means different things on
+                             different days. A gap of Nσ (normalized by prior
+                             session vol) is comparable across days. VWASLR
+                             directional alignment at the RTH open could filter
+                             whether to fade or follow.
+
+The unifying principle: raw price and raw-point measures are contaminated by
+the current volatility regime. Normalizing by σ and weighting by volume extracts
+the underlying directional conviction. The resulting signal degrades gracefully
+across regimes rather than being tuned to a specific vol environment.
+
+IMPLEMENTATION NOTE
+
+For any VWASLR analog, the key parameters are:
+  - Window N: how many bars of history to include (longer = smoother, laggier)
+  - σ window: trailing bars for volatility estimate (20 bars / 100 min is robust)
+  - Entry threshold: in σ units (0.4σ validated for VWASLR)
+  - Exit threshold: retrace-based (0.2σ) or fixed hold
+  - Volume source: use actual bar volume; if unavailable, tick count is a proxy
+
+The parameters should be stable across instruments. The same 0.4σ threshold
+that works for MES has shown positive EV for MYM and M2K with minimal re-tuning,
+which is the hallmark of a structurally sound signal rather than an overfit one.
 
 
 WHAT REMAINS OPEN

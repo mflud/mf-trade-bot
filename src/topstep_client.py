@@ -4,6 +4,8 @@ API docs: https://gateway.docs.projectx.com/
 """
 
 import os
+import time
+import threading
 from datetime import datetime, timezone
 from typing import Literal
 import httpx
@@ -12,6 +14,13 @@ from dotenv import load_dotenv
 load_dotenv()
 
 BASE_URL = "https://api.topstepx.com"
+
+# Process-level rate limiter: ensures a minimum gap between outgoing API requests.
+# Serialises concurrent threads (e.g. signal_monitor's ThreadPoolExecutor) so they
+# don't all fire at once and trip the 429 limit.
+_rate_lock  = threading.Lock()
+_last_req_t = 0.0
+_MIN_REQ_INTERVAL = 2.0   # seconds — 30 req/min ceiling per process
 
 
 class TopstepClient:
@@ -318,9 +327,20 @@ class TopstepClient:
         return data.get("trades", [])
 
     def _post(self, path: str, **kwargs) -> "httpx.Response":
-        """POST with automatic one-time re-login on 401 (token expiry)."""
+        """POST with rate limiting, backoff-retry on 429, and re-login on 401."""
+        global _last_req_t
+        with _rate_lock:
+            gap = time.monotonic() - _last_req_t
+            if gap < _MIN_REQ_INTERVAL:
+                time.sleep(_MIN_REQ_INTERVAL - gap)
+            _last_req_t = time.monotonic()
+
         self._ensure_authenticated()
         resp = self._client.post(path, **kwargs)
+        if resp.status_code == 429:
+            wait = int(resp.headers.get("Retry-After", 15))
+            time.sleep(wait)
+            resp = self._post(path, **kwargs)   # re-enter rate limiter for the retry
         if resp.status_code == 401:
             self.login()
             resp = self._client.post(path, **kwargs)

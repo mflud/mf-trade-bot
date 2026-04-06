@@ -19,10 +19,11 @@ Signal types:
   - 15-min opening range (9:30–9:45 ET); breakout in morning window (9:45–10:30 ET)
   - ORB width ≥ instrument-specific wide-range cutoff (from backtest)
 
-  VWASLR (volume-weighted avg scaled log return, MES/MYM only):
-  - 1-min bars; VWASLR(50min, σ=500min) crosses ±threshold; RTH only (9:30–16:00 ET)
-  - MES: threshold=1.0σ/bar (EV=+0.293σ)  MYM: threshold=0.5σ/bar (EV=+0.211σ)
-  - Separate incremental 1-min bar fetch (initial 560 bars, then new bars only each poll)
+  VWASLR (volume-weighted avg scaled log return, MES/MYM):
+  - 1-min bars; EMA-10(VWASLR(50min, σ=500min)) crosses ±0.4σ; M2K disabled (too noisy)
+  - MES/MYM: active 8:30–16:00 ET (pre-open edge confirmed)
+  - Exit: EMA retracts below ±0.2σ (half-zero); bracket orders remain as safety net
+  - Separate incremental 1-min bar fetch (initial 565 bars, then new bars only each poll)
 
 Only one position per instrument at a time (all signal types share the lock).
 
@@ -70,16 +71,20 @@ SIGNAL_SIGMA  = 3.0
 MAX_SCALED    = 5.0    # ignore extreme event spikes
 VOL_RATIO_MIN = 1.5
 MAX_HOLD_MIN  = 25     # force-close after this many minutes
-POLL_SECONDS  = 30
+POLL_SECONDS     = 40   # default poll interval (VWASLR on 1-min bars; 60s was too coarse)
+POLL_SECONDS_ORB = 20   # faster poll during the ORB window (9:30–10:30 ET)
 
 PL_N_BARS = 10    # 1-min bars to look back for PL computation
 PL_THRESH = 0.50  # PL_aligned ≥ this → 2× sizing
 
 # ── VWASLR parameters (keep in sync with signal_monitor.py) ─────────────────
-# 1-min bars: N=50 (50-min window), σ=500 bars (500-min window), hold=25 bars (25 min)
+# 1-min bars: N=50 (50-min window), σ=500 bars (500-min window)
+# Entry: EMA-10 of raw VWASLR crosses ±threshold.
+# Exit:  EMA retracts below ±(threshold/2) — "half-zero" signal exit.
 VWASLR_SIGMA_BARS   = 500   # 500 × 1-min = 500-min σ window (slow/stable)
 VWASLR_N            = 50    # 50 × 1-min = 50-min signal window
 VWASLR_INIT_BARS    = VWASLR_SIGMA_BARS + VWASLR_N + 15  # initial 1-min fetch (565 bars)
+VWASLR_EMA_SPAN     = 10    # EMA span applied to raw VWASLR (α = 2/11 ≈ 0.18)
 VWASLR_STOP_SIGMA   = 2.0
 VWASLR_TARGET_SIGMA = 3.0
 
@@ -88,7 +93,6 @@ VWASLR_TARGET_SIGMA = 3.0
 # The bracket stop (stop_sigma=2σ) stays as a hard safety net on the API.
 # Trail fires when price retraces TRAIL_SIGMA * sigma_pts from its peak.
 CSR_TRAIL_SIGMA    = 0.5   # tight — CSR momentum fades quickly after initial spike
-VWASLR_TRAIL_SIGMA = 1.5   # wider — VWASLR moves tend to run longer
 
 # ── ORB parameters (keep in sync with signal_monitor.py) ────────────────────
 ORB_BARS     = 3    # 3 × 5-min = 15-min opening range
@@ -157,8 +161,10 @@ class BotInstrument:
     orb_enabled:       bool  = False
     orb_width_pct_min: float = 0.0
     # VWASLR: 0 = disabled. n = look-back bars; threshold = signal level in σ/bar units.
+    # vwaslr_start: earliest (hour, minute) ET for VWASLR signals (default 9:30 RTH open).
     vwaslr_n:         int   = 0
     vwaslr_threshold: float = 1.0
+    vwaslr_start:     tuple = (9, 30)
 
 
 INSTRUMENTS = [
@@ -166,20 +172,19 @@ INSTRUMENTS = [
                   csr_vol_windows=[(0.08, 4), (1.0, 8)],
                   blackout_windows=[
                       (18,  0,  8,  0, False),  # overnight Globex: no edge, unvalidated
-                      (8,   0,  9,  0, True),   # econ releases: block only if CSR<1.5
+                      (8,   0,  9,  0, True),   # econ releases: block CSR if below 1.5σ (VWASLR skips conditional pre-9:30)
                       (15, 45, 18,  0, False),  # EOD volatility + daily break until Globex open
                   ],
                   orb_enabled=True, orb_width_pct_min=0.00354,
-                  vwaslr_n=50, vwaslr_threshold=0.8),   # 1-min N=50/thr=0.8 → EV=+0.312σ
+                  vwaslr_n=50, vwaslr_threshold=0.4, vwaslr_start=(8, 30)),  # VWASLR 8:30→16:00 ET; EMA=10 half-zero exit
     BotInstrument("MYM", "MYM", tick_size=1.00, point_value=0.50,
                   csr_vol_windows=[(0.08, 4), (1.0, 8)],
                   blackout_windows=[
-                      (18,  0,  9,  0, False),  # overnight Globex + pre-open
-                      (9,   0,  9, 30, False),  # pre-open RTH gap: EV=-0.076σ
+                      (18,  0,  8, 30, False),  # overnight Globex (VWASLR active from 8:30)
                       (15, 45, 18,  0, False),  # EOD volatility + daily break until Globex open
                   ],
                   orb_enabled=True, orb_width_pct_min=0.00402,
-                  vwaslr_n=50, vwaslr_threshold=0.8),   # 1-min N=50/thr=0.8 → EV=+0.309σ
+                  vwaslr_n=50, vwaslr_threshold=0.4, vwaslr_start=(8, 30)),  # VWASLR 8:30→16:00 ET; EMA=10 half-zero exit
     BotInstrument("M2K", "M2K", tick_size=0.10, point_value=5.00,
                   csr_vol_windows=[(0.08, 4), (1.0, 8)],
                   blackout_windows=[
@@ -188,7 +193,7 @@ INSTRUMENTS = [
                       (15, 45, 18,  0, False),  # EOD volatility + daily break until Globex open
                   ],
                   orb_enabled=True, orb_width_pct_min=0.00715,
-                  vwaslr_n=50, vwaslr_threshold=0.8),  # 1-min N=50/thr=0.8 → EV=+0.492σ
+                  vwaslr_n=0),  # VWASLR disabled — Russell 2000 too noisy at any threshold tested
 ]
 
 
@@ -339,6 +344,9 @@ class InstrumentState:
     orb:                  OrbState = field(default_factory=OrbState)
     last_evaluated_ts:    datetime | None = None
     vwaslr_last_ts:       datetime | None = None
+    vwaslr_fetch_min:     int = -1               # UTC minute of last vwaslr fetch (throttle)
+    vwaslr_ema:           float = 0.0            # EMA-10 of raw VWASLR (updated every poll)
+    vwaslr_ema_prev:      float = 0.0            # EMA value before last update (cross detection)
 
 
 # ── Trade logging ────────────────────────────────────────────────────────────
@@ -1136,62 +1144,102 @@ def _log_vwaslr_trade(trade: ActiveVwasrlTrade, outcome: str,
     )
 
 
-def evaluate_vwaslr(state: InstrumentState) -> VwasrlSignal | None:
+def _update_vwaslr_ema(state: InstrumentState):
     """
-    Compute VWASLR on 1-min bars.  Returns a VwasrlSignal if the value crosses
-    ±threshold and the bar is within RTH (09:30–16:00 ET).
-    Respects instrument blackout windows.
+    Compute raw VWASLR from the current 1-min bars and advance the EMA-10.
+    Called every poll cycle regardless of position state so the EMA stays
+    current for both entry cross-detection and half-zero exit checks.
+    Updates state.vwaslr_ema_prev and state.vwaslr_ema in-place.
+
+    EMA advances on every bar (Globex included, settlement gap excluded by the
+    API).  Backtesting confirmed that using all-bars EMA with an 8:30 ET entry
+    window doubles Sharpe vs RTH-only EMA.  Entry is still gated by
+    inst.vwaslr_start so no trade fires during the unvalidated overnight window.
     """
     inst = state.instrument
     bars = state.vwaslr_bars
     needed = inst.vwaslr_n + VWASLR_SIGMA_BARS + 1
     if len(bars) < needed:
-        return None
+        return
 
     closes  = np.array([b.close  for b in bars], dtype=float)
     volumes = np.array([b.volume for b in bars], dtype=float)
     i = len(bars) - 1
 
-    # σ from the slow 500-min window
     trail = np.log(closes[i - VWASLR_SIGMA_BARS + 1: i + 1]
                  / closes[i - VWASLR_SIGMA_BARS:     i    ])
     sigma = float(np.std(trail, ddof=1))
     if sigma == 0:
-        return None
+        return
 
-    sigma_pts = sigma * closes[i]
-
-    # VWASLR over last n_win bars
     ret_win = np.log(closes[i - inst.vwaslr_n + 1: i + 1]
                    / closes[i - inst.vwaslr_n:     i    ])
     vol_win = volumes[i - inst.vwaslr_n: i]
     sum_vol = float(vol_win.sum())
     if sum_vol == 0:
-        return None
-    vwaslr = float((ret_win / sigma * vol_win).sum() / sum_vol)
+        return
 
-    if abs(vwaslr) < inst.vwaslr_threshold:
+    raw = float((ret_win / sigma * vol_win).sum() / sum_vol)
+    alpha = 2.0 / (VWASLR_EMA_SPAN + 1)
+    state.vwaslr_ema_prev = state.vwaslr_ema
+    state.vwaslr_ema = alpha * raw + (1.0 - alpha) * state.vwaslr_ema
+
+
+def evaluate_vwaslr(state: InstrumentState) -> VwasrlSignal | None:
+    """
+    Return a VwasrlSignal if the EMA-10 of VWASLR just crossed ±threshold on
+    the current bar, and the bar is within inst.vwaslr_start–16:00 ET.
+    EMA must be updated by _update_vwaslr_ema() before calling this.
+    """
+    inst     = state.instrument
+    thr      = inst.vwaslr_threshold
+    ema      = state.vwaslr_ema
+    ema_prev = state.vwaslr_ema_prev
+
+    # Fire only on the bar where EMA first crosses the threshold
+    crossed_up   = ema_prev <= thr  and ema > thr
+    crossed_down = ema_prev >= -thr and ema < -thr
+    if not crossed_up and not crossed_down:
         return None
 
-    # RTH filter: 09:30–16:00 ET only
+    bars   = state.vwaslr_bars
+    needed = inst.vwaslr_n + VWASLR_SIGMA_BARS + 1
+    if len(bars) < needed:
+        return None
+
+    # σ for order sizing
+    closes = np.array([b.close for b in bars], dtype=float)
+    i = len(bars) - 1
+    trail = np.log(closes[i - VWASLR_SIGMA_BARS + 1: i + 1]
+                 / closes[i - VWASLR_SIGMA_BARS:     i    ])
+    sigma = float(np.std(trail, ddof=1))
+    if sigma == 0:
+        return None
+    sigma_pts = sigma * closes[i]
+
+    # RTH filter: inst.vwaslr_start–16:00 ET only
     last   = bars[-1]
     bar_et = last.ts.astimezone(ET)
     bar_hm = (bar_et.hour, bar_et.minute)
-    if bar_hm < (9, 30) or bar_hm >= (16, 0):
+    if bar_hm < inst.vwaslr_start or bar_hm >= (16, 0):
         return None
 
-    # Respect shared blackout windows
+    # Respect shared blackout windows.
+    # Pre-9:30 (pre-market): skip conditional blackouts — no CSR context from 5-min bars yet.
+    pre_rth = bar_hm < (9, 30)
     for sh, sm, eh, em, conditional in inst.blackout_windows:
         if _in_blackout(bar_hm, sh, sm, eh, em):
+            if conditional and pre_rth:
+                continue  # conditional blackout irrelevant pre-market; VWASLR edge confirmed
             if not conditional or state.csr < CSR_THRESHOLD:
                 return None
 
-    direction = 1 if vwaslr > 0 else -1
+    direction = 1 if ema > 0 else -1
     entry     = last.close
     target    = entry + direction * VWASLR_TARGET_SIGMA * sigma_pts
     stop      = entry - direction * VWASLR_STOP_SIGMA   * sigma_pts
     return VwasrlSignal(entry=entry, target=target, stop=stop,
-                        sigma_pts=sigma_pts, vwaslr=vwaslr,
+                        sigma_pts=sigma_pts, vwaslr=ema,
                         bar_ts=last.ts, direction=direction)
 
 
@@ -1270,54 +1318,39 @@ def handle_active_vwaslr_trade(client: TopstepClient, state: InstrumentState,
         log.info(f"VWASLR {trade.instrument.symbol} fill confirmed: {trade.fill_price:.2f}")
         play_trade_sound()
 
-    # Software trailing stop for VWASLR trades.
-    # The bracket stop at 2σ remains as a safety net; this fires earlier.
-    if pos and trade.fill_price is not None and state.vwaslr_bars:
-        fill       = trade.fill_price
-        trail_dist = VWASLR_TRAIL_SIGMA * trade.sig.sigma_pts
-        bars_after = [b for b in state.vwaslr_bars if b.ts >= trade.fired_at]
-        if bars_after:
-            if trade.sig.direction == 1:   # LONG — track highest high
-                new_peak = max(b.high for b in bars_after)
-                trade.trail_peak = max(new_peak, fill)
-                trade.trail_stop_level = trade.trail_peak - trail_dist
-            else:                          # SHORT — track lowest low
-                new_peak = min(b.low for b in bars_after)
-                trade.trail_peak = min(new_peak, fill)
-                trade.trail_stop_level = trade.trail_peak + trail_dist
-
-            last_bar   = state.vwaslr_bars[-1]
-            trail_stop = trade.trail_stop_level
-            trail_hit  = (
-                last_bar.ts > trade.fired_at and trail_stop is not None and (
-                    (trade.sig.direction ==  1 and last_bar.low  <= trail_stop) or
-                    (trade.sig.direction == -1 and last_bar.high >= trail_stop)
-                )
-            )
-            if trail_hit:
-                log.info(
-                    f"VWASLR {trade.instrument.symbol} TRAIL STOP  "
-                    f"trail_stop={trail_stop:.2f}  peak={trade.trail_peak:.2f}  "
-                    f"trail={VWASLR_TRAIL_SIGMA}σ={trail_dist:.2f}pts"
-                )
-                try:
-                    n = client.cancel_all_orders(account_id)
-                    if n:
-                        log.info(f"VWASLR {trade.instrument.symbol}: cancelled {n} bracket(s) before trail close")
-                except Exception as e:
-                    log.warning(f"VWASLR {trade.instrument.symbol}: pre-trail cancel failed: {e}")
-                try:
-                    client.close_position(account_id, trade.contract_id)
-                except Exception as e:
-                    log.error(f"VWASLR {trade.instrument.symbol}: trail close_position failed: {e}")
-                    return
-                _log_vwaslr_trade(trade, "TRAIL STOP", trail_stop, now)
-                state.active_vwaslr_trade = None
-                try:
-                    client.cancel_all_orders(account_id)
-                except Exception:
-                    pass
-                return
+    # Half-zero signal exit: close when EMA-VWASLR retracts below ±(threshold/2).
+    # The bracket stop at 2σ remains on the API as a hard safety net.
+    half_thr = trade.instrument.vwaslr_threshold / 2
+    ema = state.vwaslr_ema
+    signal_exit = pos and (
+        (trade.sig.direction ==  1 and ema < half_thr) or
+        (trade.sig.direction == -1 and ema > -half_thr)
+    )
+    if signal_exit:
+        log.info(
+            f"VWASLR {trade.instrument.symbol} SIGNAL EXIT  "
+            f"ema={ema:+.3f}  half_thr=±{half_thr:.2f}"
+        )
+        try:
+            n = client.cancel_all_orders(account_id)
+            if n:
+                log.info(f"VWASLR {trade.instrument.symbol}: cancelled {n} bracket(s) before signal exit")
+        except Exception as e:
+            log.warning(f"VWASLR {trade.instrument.symbol}: pre-signal-exit cancel failed: {e}")
+        try:
+            client.close_position(account_id, trade.contract_id)
+        except Exception as e:
+            log.error(f"VWASLR {trade.instrument.symbol}: signal exit close_position failed: {e}")
+            return
+        exit_price = (state.vwaslr_bars[-1].close if state.vwaslr_bars
+                      else (trade.fill_price or trade.sig.entry))
+        _log_vwaslr_trade(trade, "SIGNAL EXIT", exit_price, now)
+        state.active_vwaslr_trade = None
+        try:
+            client.cancel_all_orders(account_id)
+        except Exception:
+            pass
+        return
 
     if pos is None:
         exit_price = _get_exit_price(client, account_id, trade.fired_at,
@@ -1459,7 +1492,11 @@ def run(account_id: int | None, paper: bool):
             try:
                 fetch_bars(client, state)
                 if state.instrument.vwaslr_n > 0:
-                    fetch_vwaslr_bars(client, state)
+                    cur_min = now.minute
+                    if cur_min != state.vwaslr_fetch_min:
+                        fetch_vwaslr_bars(client, state)
+                        state.vwaslr_fetch_min = cur_min
+                    _update_vwaslr_ema(state)
 
                 if state.active_trade:
                     handle_active_trade(client, state, account_id, now, paper)
@@ -1507,7 +1544,11 @@ def run(account_id: int | None, paper: bool):
             except Exception as e:
                 log.error(f"{state.instrument.symbol}: {e}", exc_info=True)
 
-        time.sleep(POLL_SECONDS)
+        # Poll faster during the ORB window so breakouts aren't missed
+        now_et = datetime.now(ET)
+        hm = (now_et.hour, now_et.minute)
+        in_orb_window = (9, 30) <= hm < (10, 30)
+        time.sleep(POLL_SECONDS_ORB if in_orb_window else POLL_SECONDS)
 
 
 # ── Entry point ──────────────────────────────────────────────────────────────

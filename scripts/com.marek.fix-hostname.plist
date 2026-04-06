@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.marek.fix-hostname</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/usr/local/bin/fix-hostname.sh</string>
+    </array>
+
+    <!-- Run immediately at boot -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Also run whenever the network interface changes (catches sleep/wake) -->
+    <key>WatchPaths</key>
+    <array>
+        <string>/etc/resolv.conf</string>
+    </array>
+
+    <key>StandardOutPath</key>
+    <string>/var/log/fix-hostname.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/var/log/fix-hostname.log</string>
+</dict>
+</plist>

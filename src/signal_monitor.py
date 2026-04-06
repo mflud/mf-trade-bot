@@ -61,13 +61,14 @@ PL_THRESH = 0.50  # PL_aligned ≥ this → 2× sizing
 
 # Trailing stop sigmas (keep in sync with trading_bot.py)
 CSR_TRAIL_SIGMA    = 0.5
-VWASLR_TRAIL_SIGMA = 1.5
 
 # VWASLR parameters (Volume-Weighted Average Scaled Log Return)
 # 1-min bars: N=50 (50-min signal window), σ=500 bars (500-min σ window)
+# Entry: EMA-10 crosses ±threshold.  Exit: EMA retracts below ±(threshold/2).
 VWASLR_SIGMA_BARS = 500   # 500 × 1-min = 500-min σ window (slow/stable; matches backtest)
 VWASLR_N          = 50    # 50 × 1-min = 50-min signal window
 VWASLR_INIT_BARS  = VWASLR_SIGMA_BARS + VWASLR_N + 15  # initial 1-min fetch (565 bars)
+VWASLR_EMA_SPAN   = 10    # EMA span applied to raw VWASLR (α = 2/11 ≈ 0.18)
 
 ET = ZoneInfo("America/New_York")
 
@@ -80,9 +81,11 @@ ORB_WINDOWS   = [          # (start_h, start_m, end_h, end_m, label)
     (9,  45, 10, 30, "Morning"),
 ]
 
-LOG_PATH      = Path("logs/signals.csv")
-ORB_LOG_PATH  = Path("logs/orb_signals.csv")
+LOG_PATH      = Path("logs/signals.csv")       # signal_monitor's own audit log (not read back)
+ORB_LOG_PATH  = Path("logs/orb_signals.csv")   # signal_monitor's own audit log (not read back)
 VWAS_LOG_PATH = Path("logs/vwaslr_trades.csv")
+BOT_LOG_PATH     = Path("logs/bot_trades.csv")    # authoritative CSR trades written by trading_bot
+BOT_ORB_LOG_PATH = Path("logs/orb_trades.csv")    # authoritative ORB trades written by trading_bot
 ORB_LOG_FIELDS = [
     "fired_at", "resolved_at", "symbol", "direction",
     "entry", "target", "stop",
@@ -127,8 +130,10 @@ class InstrumentConfig:
     orb_width_pct_min: float = 0.0
     # VWASLR: 0 = disabled. n = look-back bars for the volume-weighted avg scaled return.
     # threshold = signal trigger level in σ/bar units (from backtest optimisation).
+    # vwaslr_start: earliest (hour, minute) ET for VWASLR signals (default 9:30 RTH open).
     vwaslr_n:         int   = 0
     vwaslr_threshold: float = 1.0
+    vwaslr_start:     tuple = (9, 30)
 
 
 INSTRUMENTS = [
@@ -137,21 +142,20 @@ INSTRUMENTS = [
                      csr_vol_windows=[(0.08, 4), (1.0, 8)],
                      blackout_windows=[
                          (18,  0,  8,  0, False),  # overnight Globex: no edge, unvalidated
-                         (8,   0,  9,  0, True),   # econ releases: block only if CSR<1.5
+                         (8,   0,  9,  0, True),   # econ releases: block CSR if below 1.5σ (VWASLR skips conditional pre-9:30)
                          (15, 45, 18,  0, False),  # EOD volatility + daily break until Globex open
                      ],
                      orb_enabled=True, orb_width_pct_min=0.00354,
-                     vwaslr_n=50, vwaslr_threshold=0.8),   # 1-min N=50, thr=0.8 (EV=+0.312σ)
+                     vwaslr_n=50, vwaslr_threshold=0.4, vwaslr_start=(8, 30)),  # VWASLR 8:30→16:00 ET; EMA=10 half-zero exit
     InstrumentConfig("MYM", "MYM", stop_sigma=2.0, target_sigma=3.0,
                      point_value=0.50, ev_sigma=0.073,
                      csr_vol_windows=[(0.08, 4), (1.0, 8)],
                      blackout_windows=[
-                         (18,  0,  9,  0, False),  # overnight Globex + pre-open
-                         (9,   0,  9, 30, False),  # pre-open RTH gap: EV=-0.076σ
+                         (18,  0,  8, 30, False),  # overnight Globex (VWASLR active from 8:30)
                          (15, 45, 18,  0, False),  # EOD volatility + daily break until Globex open
                      ],
                      orb_enabled=True, orb_width_pct_min=0.00402,
-                     vwaslr_n=50, vwaslr_threshold=0.8),   # 1-min N=50, thr=0.8 (EV=+0.309σ)
+                     vwaslr_n=50, vwaslr_threshold=0.4, vwaslr_start=(8, 30)),  # VWASLR 8:30→16:00 ET; EMA=10 half-zero exit
     InstrumentConfig("M2K", "M2K", stop_sigma=2.0, target_sigma=3.0,
                      point_value=5.00, ev_sigma=0.107,
                      csr_vol_windows=[(0.08, 4), (1.0, 8)],
@@ -161,7 +165,7 @@ INSTRUMENTS = [
                          (15, 45, 18,  0, False),  # EOD volatility + daily break until Globex open
                      ],
                      orb_enabled=True, orb_width_pct_min=0.00715,
-                     vwaslr_n=50, vwaslr_threshold=0.8),  # 1-min N=50/thr=0.8 → EV=+0.492σ
+                     vwaslr_n=0),  # VWASLR disabled — Russell 2000 too noisy at any threshold tested
 ]
 
 ALERT_SOUND = "/System/Library/Sounds/Ping.aiff"
@@ -256,10 +260,11 @@ class _HistSignal:
 
 @dataclass
 class RecentSignal:
-    symbol:  str
-    signal:  "Signal | OrbSignal | _HistSignal"
-    outcome: str        # "TARGET", "STOPPED", "TIME EXIT", "OPEN"
-    pnl_pts: float
+    symbol:    str
+    signal:    "Signal | OrbSignal | _HistSignal"
+    outcome:   str        # "TARGET", "STOPPED", "TIME EXIT", "OPEN"
+    pnl_pts:   float
+    contracts: int = 1    # number of contracts traded (CSR can be 2×)
 
 
 @dataclass
@@ -278,8 +283,11 @@ class InstrumentState:
     active_signal:      Signal | None = None
     current_pl:         float | None = None      # raw 1-min PL, refreshed every poll
     current_ha_streak:  int = 0                  # 5-min HA streak: +k green, -k red, 0 = flat
-    current_vwaslr:     float = 0.0             # VWASLR value (0.0 = not computed / warming up)
-    vwaslr_entry:       float | None = None     # close price when VWASLR first crossed threshold
+    current_vwaslr:     float = 0.0             # EMA-10 of VWASLR (0.0 = not computed / warming up)
+    vwaslr_ema:         float = 0.0            # running EMA-10 state (persists across polls)
+    vwaslr_ema_prev:    float = 0.0            # EMA before last update (cross detection)
+    vwaslr_entry:       float | None = None     # close price when EMA first crossed threshold
+    has_vwaslr_position: bool = False           # True if account has an open position for this instrument
     csr_trail_peak:     float | None = None     # most favourable price seen since CSR signal
     csr_trail_stop:     float | None = None     # current trailing stop level for CSR signal
     live_bar:           Bar | None = None        # developing 5-min bar, refreshed every poll
@@ -287,6 +295,11 @@ class InstrumentState:
     history:            list[RecentSignal] = field(default_factory=list)
     error:              str | None = None
     last_evaluated_ts:  datetime | None = None   # ts of last bar evaluated for signals
+    pl_bars:            list[Bar] = field(default_factory=list)  # cached 1-min bars for display PL
+    bars_fetch_min:     int = -1                 # UTC minute of last 5-min bar fetch (throttle)
+    vwaslr_fetch_min:   int = -1                 # UTC minute of last vwaslr fetch (throttle)
+    pl_fetch_min:       int = -1                 # UTC minute of last display PL fetch (throttle)
+    live_bar_fetch_min: int = -1                 # UTC minute of last live-bar fetch (throttle)
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -720,63 +733,64 @@ def build_vwaslr_panel(state: InstrumentState) -> Panel:
     max_disp = max(thr * 2.0, abs(v) * 1.05)
 
     t = Table.grid(padding=(0, 1))
-    t.add_column(style="dim", width=16)
+    t.add_column(width=16)
     t.add_column()
 
     sig_min = n * 1   # 1-min bars → sig_min = n minutes
 
     if v == 0.0:
-        t.add_row(f"VWASLR({sig_min}m):", "[dim]warming up…[/]")
+        t.add_row(f"VWASLR({sig_min}m):", "warming up…")
     else:
-        v_style = "bold green" if is_long else ("bold red" if is_short else "white")
+        v_style = ("bold green" if is_long  else
+                   "bold red"   if is_short else
+                   "green"      if v > 0    else
+                   "red"        if v < 0    else "bold")
         t.add_row(f"VWASLR({sig_min}m):",
                   f"{_signal_bar(v, thr, max_disp)} "
                   f"[{v_style}]{v:+.3f}[/]  / ±{thr:.1f}σ")
 
-    # Three prior 1-min VWASLR values (-1m, -2m, -3m)
+    # Five prior 1-min VWASLR values (-1m through -5m)
     if len(state.vwaslr_bars) >= VWASLR_SIGMA_BARS + n + 1:
         tz_local = datetime.now().astimezone().tzinfo
-        for offset in range(1, 4):
+        for offset in range(1, 6):
             slice_end = len(state.vwaslr_bars) - offset
             recent_v  = _compute_vwaslr(state.vwaslr_bars[:slice_end], n, VWASLR_SIGMA_BARS)
             bar_ts    = state.vwaslr_bars[slice_end - 1].ts.astimezone(tz_local)
             lbl       = f"  -{offset}m:"
             if recent_v == 0.0:
-                t.add_row(lbl, "[dim]—[/]")
+                t.add_row(lbl, "—")
             else:
-                rv_style = ("bold green" if recent_v >= thr else
-                            "bold red"   if recent_v <= -thr else "dim")
+                rv_style = ("bold green" if recent_v >= thr  else
+                            "bold red"   if recent_v <= -thr else
+                            "green"      if recent_v > 0      else
+                            "red"        if recent_v < 0      else "bold")
                 t.add_row(lbl,
                           f"[{rv_style}]{recent_v:+.3f}[/]"
-                          f"  [dim]{bar_ts.strftime('%H:%M')}[/]")
+                          f"  {bar_ts.strftime('%H:%M')}")
 
     if state.vwaslr_entry is not None:
         entry_style = "bold green" if is_long else "bold red"
         t.add_row("Entry:", f"[{entry_style}]{state.vwaslr_entry:,.2f}[/]")
 
-        # Compute trailing stop from 1-min bars since entry
-        direction  = 1 if is_long else -1
-        trail_dist = VWASLR_TRAIL_SIGMA * state.sigma_pts
-        ref_bars   = state.vwaslr_bars if state.vwaslr_bars else state.bars
-        if trail_dist > 0 and ref_bars:
-            if direction == 1:
-                peak = max(max(b.high for b in ref_bars), state.vwaslr_entry)
-                trail_stop = peak - trail_dist
-            else:
-                peak = min(min(b.low for b in ref_bars), state.vwaslr_entry)
-                trail_stop = peak + trail_dist
-            trail_pnl = (trail_stop - state.vwaslr_entry) * direction
-            trail_col = "green" if trail_pnl >= 0 else "yellow"
-            t.add_row("Trail stop:",
-                      f"[bold {trail_col}]{trail_stop:,.2f}[/]  "
-                      f"([{trail_col}]{trail_pnl:+.1f} pts[/] │ {VWASLR_TRAIL_SIGMA}σ trail)  "
-                      f"[dim](peak {peak:,.2f})[/]")
+        # Show half-zero exit level: EMA must retract below ±(thr/2) to exit
+        half_thr = thr / 2
+        exit_col = "cyan"
+        t.add_row("Exit when:",
+                  f"[{exit_col}]EMA {'<' if is_long else '>'} "
+                  f"{'+'if is_long else '-'}{half_thr:.2f}σ[/]  "
+                  f"[dim](now {v:+.3f}σ)[/]")
 
     border = "green" if is_long else ("red" if is_short else "dim")
     if is_long:
-        title = "[bold green]⬤  VWASLR  ▲ LONG[/]"
+        if state.has_vwaslr_position:
+            title = "[bold green]⬤  VWASLR  ▲ LONG[/]"
+        else:
+            title = "[green]◯  VWASLR  ▲ LONG  [dim]no position[/][/]"
     elif is_short:
-        title = "[bold red]⬤  VWASLR  ▼ SHORT[/]"
+        if state.has_vwaslr_position:
+            title = "[bold red]⬤  VWASLR  ▼ SHORT[/]"
+        else:
+            title = "[red]◯  VWASLR  ▼ SHORT  [dim]no position[/][/]"
     else:
         title = "[dim]VWASLR[/]"
     return Panel(t, title=title, border_style=border, padding=(0, 1))
@@ -807,6 +821,8 @@ def build_instrument_column(state: InstrumentState, now: datetime) -> Table:
     return col
 
 
+_POINT_VALUE = {"MES": 5.0, "MYM": 0.5, "M2K": 5.0}
+
 def build_history_table(history: list[RecentSignal], max_rows: int = 6) -> Panel:
     t = Table(box=box.SIMPLE, padding=(0, 1), show_header=True,
               header_style="bold dim")
@@ -818,7 +834,8 @@ def build_history_table(history: list[RecentSignal], max_rows: int = 6) -> Panel
     t.add_column("Stop",    width=10, justify="right")
     t.add_column("Exit",    width=10, justify="right")
     t.add_column("Outcome", width=12)
-    t.add_column("P&L",     width=10, justify="right")
+    t.add_column("P&L pts", width=8,  justify="right")
+    t.add_column("P&L $",   width=9,  justify="right")
 
     for rs in reversed(history[-max_rows:]):
         s  = rs.signal
@@ -855,6 +872,15 @@ def build_history_table(history: list[RecentSignal], max_rows: int = 6) -> Panel
             exit_price = s.entry + rs.pnl_pts * s.direction
             exit_str = f"[{pnl_col}]{exit_price:,.2f}[/]"
 
+        pv = _POINT_VALUE.get(rs.symbol, 1.0)
+        pnl_dollars = rs.pnl_pts * rs.contracts * pv
+        if rs.outcome == "OPEN":
+            dollar_str = "[dim]—[/]"
+        else:
+            d_col  = "green" if pnl_dollars >= 0 else "red"
+            d_sign = "+" if pnl_dollars >= 0 else "−"
+            dollar_str = f"[{d_col}]{d_sign}${abs(pnl_dollars):,.0f}[/]"
+
         t.add_row(
             ts.strftime("%H:%M"),
             rs.symbol,
@@ -865,6 +891,7 @@ def build_history_table(history: list[RecentSignal], max_rows: int = 6) -> Panel
             exit_str,
             out_str,
             pnl_str,
+            dollar_str,
         )
 
     return Panel(t, title="[bold]RECENT SIGNALS[/]",
@@ -885,8 +912,8 @@ def build_header(now: datetime) -> Panel:
 
 
 def build_sizing_table(states: list[InstrumentState]) -> Panel:
-    """Lot-size table: rows = $100/$200/$300/$400 risk, columns = each instrument."""
-    RISKS = [100, 200, 300, 400]
+    """Lot-size table: rows = $100/$200/$300/$400/$500/$600 risk, columns = each instrument."""
+    RISKS = [100, 200, 300, 400, 500, 600]
 
     t = Table(box=box.SIMPLE_HEAD, show_header=True, padding=(0, 2))
     t.add_column("", style="dim", justify="left")
@@ -930,7 +957,9 @@ def build_sizing_table(states: list[InstrumentState]) -> Panel:
 
 def render(states: list[InstrumentState],
            history: list[RecentSignal],
-           now: datetime) -> Table:
+           now: datetime | None = None) -> Table:
+    if now is None:
+        now = datetime.now(timezone.utc)
     root = Table.grid(padding=(0, 0))
     root.add_column()
 
@@ -945,7 +974,7 @@ def render(states: list[InstrumentState],
     bottom = Table.grid(padding=(0, 1))
     bottom.add_column()
     bottom.add_column()
-    history_panel = build_history_table(history, max_rows=6) if history else None
+    history_panel = build_history_table(history, max_rows=8) if history else None
     bottom.add_row(build_sizing_table(states), history_panel or "")
     root.add_row(bottom)
 
@@ -1380,10 +1409,10 @@ def backfill_orb_state(state: InstrumentState, client) -> None:
     now_et = datetime.now(ET)
     today  = now_et.date()
 
-    # Nothing to backfill before the ORB window has closed
+    # Nothing to backfill before the ORB window has opened
     from datetime import time as _dtime
-    orb_end_et = datetime.combine(today, _dtime(9, 30 + ORB_BARS * TF_MINUTES), tzinfo=ET)
-    if datetime.now(ET) < orb_end_et:
+    orb_start_et = datetime.combine(today, _dtime(9, 30), tzinfo=ET)
+    if datetime.now(ET) < orb_start_et:
         return
 
     # Already built for today
@@ -1451,12 +1480,12 @@ def backfill_orb_state(state: InstrumentState, client) -> None:
 
 
 def _load_recent_history(hours: int = 24) -> list[RecentSignal]:
-    """Read signals.csv and orb_signals.csv and return entries from the past `hours`."""
+    """Read bot_trades.csv and orb_trades.csv and return entries from the past `hours`."""
     cutoff  = datetime.now(timezone.utc) - timedelta(hours=hours)
     entries: list[tuple[datetime, RecentSignal]] = []
 
-    if LOG_PATH.exists():
-        with open(LOG_PATH, newline="") as f:
+    if BOT_LOG_PATH.exists():
+        with open(BOT_LOG_PATH, newline="") as f:
             for row in csv.DictReader(f):
                 try:
                     fired_at = datetime.fromisoformat(row["fired_at"])
@@ -1467,17 +1496,18 @@ def _load_recent_history(hours: int = 24) -> list[RecentSignal]:
                     sig = _HistSignal(
                         bar_ts=fired_at,
                         direction=1 if row["direction"] == "LONG" else -1,
-                        entry=float(row["entry"]),
+                        entry=float(row.get("fill_price") or row["est_entry"]),
                         target=float(row["target"]),
                         stop=float(row["stop"]),
                     )
                     entries.append((fired_at, RecentSignal(
-                        row["symbol"], sig, row["outcome"], float(row["pnl_pts"]))))
+                        row["symbol"], sig, row["outcome"], float(row["pnl_pts"]),
+                        contracts=int(float(row.get("contracts") or 1)))))
                 except Exception:
                     continue
 
-    if ORB_LOG_PATH.exists():
-        with open(ORB_LOG_PATH, newline="") as f:
+    if BOT_ORB_LOG_PATH.exists():
+        with open(BOT_ORB_LOG_PATH, newline="") as f:
             for row in csv.DictReader(f):
                 try:
                     fired_at = datetime.fromisoformat(row["fired_at"])
@@ -1487,8 +1517,8 @@ def _load_recent_history(hours: int = 24) -> list[RecentSignal]:
                         continue
                     sig = _HistSignal(
                         bar_ts=fired_at,
-                        direction=0,    # ORB is always long breakout
-                        entry=float(row["entry"]),
+                        direction=1 if row["direction"] == "LONG" else -1,
+                        entry=float(row.get("fill_price") or row["est_entry"]),
                         target=float(row["target"]),
                         stop=float(row["stop"]),
                         kind="ORB",
@@ -1559,11 +1589,78 @@ def _poll_vwaslr_new(since: datetime) -> tuple[list[RecentSignal], datetime]:
     return [rs for _, rs in new_entries], max_ts
 
 
+def _poll_csr_new(since: datetime) -> tuple[list[RecentSignal], datetime]:
+    """Return CSR trades from bot_trades.csv with fired_at > since."""
+    if not BOT_LOG_PATH.exists():
+        return [], since
+    new_entries: list[tuple[datetime, RecentSignal]] = []
+    max_ts = since
+    with open(BOT_LOG_PATH, newline="") as f:
+        for row in csv.DictReader(f):
+            try:
+                fired_at = datetime.fromisoformat(row["fired_at"])
+                if fired_at.tzinfo is None:
+                    fired_at = fired_at.replace(tzinfo=timezone.utc)
+                if fired_at <= since:
+                    continue
+                sig = _HistSignal(
+                    bar_ts=fired_at,
+                    direction=1 if row["direction"] == "LONG" else -1,
+                    entry=float(row.get("fill_price") or row["est_entry"]),
+                    target=float(row["target"]),
+                    stop=float(row["stop"]),
+                )
+                new_entries.append((fired_at, RecentSignal(
+                    row["symbol"], sig, row["outcome"], float(row["pnl_pts"]),
+                    contracts=int(float(row.get("contracts") or 1)))))
+                if fired_at > max_ts:
+                    max_ts = fired_at
+            except Exception:
+                continue
+    new_entries.sort(key=lambda x: x[0])
+    return [rs for _, rs in new_entries], max_ts
+
+
+def _poll_orb_new(since: datetime) -> tuple[list[RecentSignal], datetime]:
+    """Return ORB trades from orb_trades.csv with fired_at > since."""
+    if not BOT_ORB_LOG_PATH.exists():
+        return [], since
+    new_entries: list[tuple[datetime, RecentSignal]] = []
+    max_ts = since
+    with open(BOT_ORB_LOG_PATH, newline="") as f:
+        for row in csv.DictReader(f):
+            try:
+                fired_at = datetime.fromisoformat(row["fired_at"])
+                if fired_at.tzinfo is None:
+                    fired_at = fired_at.replace(tzinfo=timezone.utc)
+                if fired_at <= since:
+                    continue
+                sig = _HistSignal(
+                    bar_ts=fired_at,
+                    direction=1 if row["direction"] == "LONG" else -1,
+                    entry=float(row.get("fill_price") or row["est_entry"]),
+                    target=float(row["target"]),
+                    stop=float(row["stop"]),
+                    kind="ORB",
+                )
+                new_entries.append((fired_at, RecentSignal(
+                    row["symbol"], sig, row["outcome"], float(row["pnl_pts"]))))
+                if fired_at > max_ts:
+                    max_ts = fired_at
+            except Exception:
+                continue
+    new_entries.sort(key=lambda x: x[0])
+    return [rs for _, rs in new_entries], max_ts
+
+
 def run_live():
     from topstep_client import TopstepClient
 
     client = TopstepClient()
     client.login()
+
+    accounts   = client.get_accounts()
+    account_id = accounts[0]["id"] if accounts else None
 
     states: list[InstrumentState] = []
     for cfg in INSTRUMENTS:
@@ -1577,15 +1674,21 @@ def run_live():
         console.print(f"  {cfg.symbol}: {c['name']}  id={c['id']}")
 
     combined_history: list[RecentSignal] = _load_recent_history(hours=24)
-    _ensure_log()
 
-    # Track the latest VWASLR fired_at we've already loaded, so the live-poll
-    # only picks up trades that arrive *after* startup.
-    vwas_last_ts = datetime.min.replace(tzinfo=timezone.utc)
+    # Track the latest fired_at already loaded so live-polls only pick up new trades.
+    _ts_min = datetime.min.replace(tzinfo=timezone.utc)
+    csr_last_ts  = _ts_min
+    orb_last_ts  = _ts_min
+    vwas_last_ts = _ts_min
     for rs in combined_history:
-        if isinstance(rs.signal, _HistSignal) and rs.signal.kind == "VWASLR":
-            if rs.signal.bar_ts > vwas_last_ts:
-                vwas_last_ts = rs.signal.bar_ts
+        if not isinstance(rs.signal, _HistSignal):
+            continue
+        if rs.signal.kind == "VWASLR" and rs.signal.bar_ts > vwas_last_ts:
+            vwas_last_ts = rs.signal.bar_ts
+        elif rs.signal.kind == "ORB" and rs.signal.bar_ts > orb_last_ts:
+            orb_last_ts = rs.signal.bar_ts
+        elif rs.signal.kind == "" and rs.signal.bar_ts > csr_last_ts:
+            csr_last_ts = rs.signal.bar_ts
 
     def fetch_bars(state: InstrumentState):
         end   = datetime.now(timezone.utc)
@@ -1636,49 +1739,187 @@ def run_live():
         except Exception as e:
             state.error = f"vwaslr fetch error: {e}"
 
+    def update_pl_bars(state: InstrumentState, now: datetime):
+        """Incremental 1-min fetch for display PL.  Initial: PL_N_BARS+5 bars.
+        Subsequent: only the bar(s) since the last known timestamp."""
+        try:
+            if not state.pl_bars:
+                start = now - timedelta(minutes=PL_N_BARS + 5)
+                raw   = client.get_bars(contract_id=state.cid, start=start, end=now,
+                                        unit=TopstepClient.MINUTE, unit_number=1,
+                                        limit=PL_N_BARS + 5)
+                state.pl_bars = [Bar(ts=datetime.fromisoformat(b["t"]),
+                                     open=b["o"], high=b["h"], low=b["l"],
+                                     close=b["c"], volume=b["v"])
+                                 for b in reversed(raw)]
+            else:
+                since = state.pl_bars[-1].ts
+                raw   = client.get_bars(contract_id=state.cid, start=since, end=now,
+                                        unit=TopstepClient.MINUTE, unit_number=1,
+                                        limit=3)
+                for b in reversed(raw):
+                    bar = Bar(ts=datetime.fromisoformat(b["t"]),
+                              open=b["o"], high=b["h"], low=b["l"],
+                              close=b["c"], volume=b["v"])
+                    if bar.ts > since:
+                        state.pl_bars.append(bar)
+                if len(state.pl_bars) > PL_N_BARS + 10:
+                    state.pl_bars = state.pl_bars[-(PL_N_BARS + 5):]
+            # Recompute current_pl from cached bars
+            if len(state.pl_bars) >= PL_N_BARS + 1:
+                closes   = np.array([b.close for b in state.pl_bars[-(PL_N_BARS + 1):]])
+                rets     = np.log(closes[1:] / closes[:-1])
+                sum_absr = float(np.abs(rets).sum())
+                state.current_pl = float(rets.sum()) / sum_absr if sum_absr > 0 else None
+        except Exception:
+            pass  # keep last known value on error
+
     def resolve(state: InstrumentState, outcome: str, pnl_pts: float, now: datetime):
-        sig = state.active_signal
-        combined_history.append(RecentSignal(state.cfg.symbol, sig, outcome, pnl_pts))
-        _log_trade(state.cfg.symbol, sig, outcome, pnl_pts, now)
         state.active_signal = None
 
-    # Backfill ORB state once at startup so power-hour works even if
-    # signal_monitor was started after the 9:30–9:45 ORB window.
-    for state in states:
+    # Backfill at startup: fetch bars + VWASLR, run evaluate() so sigma_pts is
+    # ready for the first render, then stamp the throttle mins so the first
+    # loop iteration doesn't redundantly re-fetch everything.
+    _startup_min = datetime.now(timezone.utc).minute
+    n_instruments = len(states)
+    for i, state in enumerate(states, 1):
+        console.print(f"  [{i}/{n_instruments}] {state.cfg.symbol}: fetching bars…", end=" ")
         fetch_bars(state)
+        state.bars_fetch_min = _startup_min
+        if state.bars:
+            evaluate(state)          # populate sigma_pts immediately
         if state.cfg.vwaslr_n > 0:
+            console.print("vwaslr…", end=" ")
             fetch_vwaslr_bars(state)
+            state.vwaslr_fetch_min = _startup_min
         if state.cfg.orb_enabled:
+            console.print("orb…", end=" ")
             backfill_orb_state(state, client)
+        console.print("done")
 
     with Live(console=console, refresh_per_second=1, screen=True) as live:
         while True:
             now = datetime.now(timezone.utc)
 
-            # Fetch all instruments in parallel (I/O-bound; threads suffice)
-            def _fetch(state: InstrumentState):
-                fetch_bars(state)
+            # ── Fast path: bars fetch (serial, ~6 s for 3 instruments) ───────────
+            # Runs first so Scaled Return / sigma update immediately at each
+            # new 5-min bar, without waiting behind pl/live_bar/vwaslr calls.
+            if any(now.minute != s.bars_fetch_min for s in states):
+                for state in states:
+                    if now.minute != state.bars_fetch_min:
+                        fetch_bars(state)
+                        state.bars_fetch_min = now.minute
+                        if state.bars:
+                            state.current_ha_streak = _ha_streak(state.bars)
+                live.update(render(states, combined_history))
+
+            # ── Slow path: pl_bars, live_bar, vwaslr (background thread) ─────────
+            def _fetch_slow(state: InstrumentState):
                 if not state.bars:
                     return
-                state.current_pl        = fetch_1min_pl(client, state.cid, now, 1)
-                state.current_ha_streak = _ha_streak(state.bars)
-                state.live_bar          = fetch_live_bar(client, state, now)
+                if now.minute != state.pl_fetch_min:
+                    update_pl_bars(state, now)
+                    state.pl_fetch_min = now.minute
+                if now.minute != state.live_bar_fetch_min:
+                    state.live_bar           = fetch_live_bar(client, state, now)
+                    state.live_bar_fetch_min = now.minute
                 if state.cfg.vwaslr_n > 0:
-                    fetch_vwaslr_bars(state)
-                    prev_vwaslr = state.current_vwaslr
-                    state.current_vwaslr = _compute_vwaslr(
+                    if now.minute != state.vwaslr_fetch_min:
+                        fetch_vwaslr_bars(state)
+                        if account_id:
+                            try:
+                                positions = client.get_open_positions(account_id)
+                                cids = {str(p.get("contractId", "")) for p in positions}
+                                state.has_vwaslr_position = str(state.cid) in cids
+                            except Exception:
+                                pass
+                        state.vwaslr_fetch_min = now.minute
+                    # EMA advances on every bar (Globex included, settlement gap
+                    # excluded by the API).  Entry is still gated by vwaslr_start.
+                    raw = _compute_vwaslr(
                         state.vwaslr_bars, state.cfg.vwaslr_n, VWASLR_SIGMA_BARS)
-                    thr = state.cfg.vwaslr_threshold
-                    was_active = abs(prev_vwaslr) >= thr
-                    now_active = abs(state.current_vwaslr) >= thr
-                    if now_active and not was_active:
+                    alpha = 2.0 / (VWASLR_EMA_SPAN + 1)
+                    state.vwaslr_ema_prev = state.vwaslr_ema
+                    state.vwaslr_ema = alpha * raw + (1.0 - alpha) * state.vwaslr_ema
+                    state.current_vwaslr = state.vwaslr_ema
+                    thr      = state.cfg.vwaslr_threshold
+                    half_thr = thr / 2
+                    # Entry: EMA crosses ±threshold; Exit: EMA retracts below ±half_thr
+                    if abs(state.vwaslr_ema) >= thr and abs(state.vwaslr_ema_prev) < thr:
                         state.vwaslr_entry = (state.vwaslr_bars[-1].close
                                               if state.vwaslr_bars else state.bars[-1].close)
-                    elif not now_active and was_active:
+                    elif abs(state.vwaslr_ema) < half_thr and state.vwaslr_entry is not None:
                         state.vwaslr_entry = None
 
-            with ThreadPoolExecutor(max_workers=len(states)) as ex:
-                list(ex.map(_fetch, states))
+            import threading as _threading
+            _fetch_done = _threading.Event()
+            def _run_slow():
+                with ThreadPoolExecutor(max_workers=len(states)) as ex:
+                    list(ex.map(_fetch_slow, states))
+                _fetch_done.set()
+            _threading.Thread(target=_run_slow, daemon=True).start()
+            while not _fetch_done.wait(timeout=1):
+                live.update(render(states, combined_history))
+            live.update(render(states, combined_history))
+
+            # ── 5-min bar retry ───────────────────────────────────────────────────
+            # The API takes ~20 s to publish a completed bar after the close.
+            # We fire when either:
+            #   • just past a 5-min boundary (< 60 s in): wait the remaining
+            #     time to reach T+20 s, then retry.
+            #   • approaching a boundary (≤ 20 s away): wait through it to
+            #     T+20 s, then retry.  (Entered via the early display-loop break.)
+            # Uses live clock so it works regardless of when `now` was captured.
+            _rn        = datetime.now(timezone.utc)
+            _period_s  = TF_MINUTES * 60
+            _epoch_s   = int(_rn.timestamp())
+            _secs_in   = _epoch_s % _period_s          # seconds since last bar close
+            _secs_to   = _period_s - _secs_in          # seconds until next bar close
+
+            if _secs_in < 60 or _secs_to <= 20:
+                # Bar open-timestamp we expect to see after the (upcoming) close.
+                # Pre-boundary: the bar opening at the current period start closes
+                #               at the next boundary — that's what we're waiting for.
+                # Post-boundary: the bar that just closed opened one period earlier.
+                if _secs_to <= 20:   # pre-boundary
+                    _expected_bar_ts = datetime.fromtimestamp(
+                        (_epoch_s // _period_s) * _period_s, tz=timezone.utc
+                    )
+                else:                # post-boundary
+                    _expected_bar_ts = datetime.fromtimestamp(
+                        (_epoch_s // _period_s) * _period_s - _period_s, tz=timezone.utc
+                    )
+                needs_retry = any(
+                    s.bars and s.bars[-1].ts < _expected_bar_ts for s in states
+                )
+                if needs_retry:
+                    # Wait until T+20 s past the bar close, ticking the display.
+                    # Retry up to 3 times (15 s apart) for contracts whose bar
+                    # the API publishes late — stops as soon as all are updated.
+                    if _secs_to <= 20:
+                        _wait = _secs_to + 20   # cross boundary then 20 s more
+                    else:
+                        _wait = max(0, 20 - _secs_in)
+                    for _attempt in range(3):
+                        for _ in range(int(_wait) + 1):
+                            live.update(render(states, combined_history))
+                            time.sleep(1)
+                        for state in states:
+                            if state.bars and state.bars[-1].ts >= _expected_bar_ts:
+                                continue   # already have this bar
+                            fetch_bars(state)
+                            if state.bars:
+                                state.current_ha_streak = _ha_streak(state.bars)
+                        # Update throttle only for states that now have the bar
+                        _cur_min = datetime.now(timezone.utc).minute
+                        for state in states:
+                            if state.bars and state.bars[-1].ts >= _expected_bar_ts:
+                                state.bars_fetch_min = _cur_min
+                        live.update(render(states, combined_history))
+                        if not any(s.bars and s.bars[-1].ts < _expected_bar_ts
+                                   for s in states):
+                            break          # all contracts updated — done
+                        _wait = 15         # subsequent retries: 15 s apart
 
             for state in states:
                 if not state.bars:
@@ -1740,36 +1981,42 @@ def run_live():
                         state.active_signal.pl_aligned = pl
                     play_alert()
 
-                # Check ORB signal for target/stop hit or expiry (MES only)
+                # Check ORB signal for target/stop hit or expiry (display state only)
                 if state.orb.active_signal:
                     hit = _check_orb_resolution(state.orb.active_signal, state.bars)
                     if hit:
-                        _log_orb(state.cfg.symbol, state.orb.active_signal,
-                                 hit[0], hit[1], now)
-                        combined_history.append(RecentSignal(
-                            state.cfg.symbol, state.orb.active_signal, hit[0], hit[1]))
                         state.orb.active_signal = None
                     elif now >= state.orb.active_signal.bar_ts + timedelta(minutes=MAX_HOLD_MIN):
-                        pnl = ((state.bars[-1].close - state.orb.active_signal.entry)
-                               * state.orb.active_signal.direction)
-                        _log_orb(state.cfg.symbol, state.orb.active_signal,
-                                 "TIME EXIT", pnl, now)
-                        combined_history.append(RecentSignal(
-                            state.cfg.symbol, state.orb.active_signal, "TIME EXIT", pnl))
                         state.orb.active_signal = None
 
                 if new_orb and state.orb.active_signal is None:
                     state.orb.active_signal = new_orb
                     play_alert()
 
-            # Pick up any VWASLR trades logged by trading_bot since last poll
+            # Pick up any trades logged by trading_bot since last poll
+            new_csr,  csr_last_ts  = _poll_csr_new(csr_last_ts)
+            new_orb,  orb_last_ts  = _poll_orb_new(orb_last_ts)
             new_vwas, vwas_last_ts = _poll_vwaslr_new(vwas_last_ts)
-            if new_vwas:
+            if new_csr or new_orb or new_vwas:
+                combined_history.extend(new_csr)
+                combined_history.extend(new_orb)
                 combined_history.extend(new_vwas)
                 combined_history.sort(key=lambda r: r.signal.bar_ts)
 
-            live.update(render(states, combined_history, now))
-            time.sleep(30)
+            # Display loop: tick every second.
+            # Break at any minute change (picks up new bars quickly), AND
+            # break 20 s before each 5-min bar close so the retry window
+            # starts before the boundary rather than a full minute after it.
+            loop_start_min = now.minute
+            for _ in range(30):
+                live.update(render(states, combined_history))
+                time.sleep(1)
+                _cur = datetime.now(timezone.utc)
+                if _cur.minute != loop_start_min:
+                    break
+                # Pre-emptive break: 20 s before a 5-min bar close
+                if (TF_MINUTES * 60) - (int(_cur.timestamp()) % (TF_MINUTES * 60)) <= 20:
+                    break
 
 
 # ── Demo mode ──────────────────────────────────────────────────────────────────

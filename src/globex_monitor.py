@@ -62,7 +62,7 @@ EVE_HIST_MIN_GAP      = 0.001   # show in history if gap ≥ 0.1% (filter noise)
 
 # Active window: 30 min before 18:00 through 35 min after (both signals)
 WINDOW_PRE_MIN  = 30
-WINDOW_POST_MIN = 35
+WINDOW_POST_MIN = 120
 
 MES_POINT = 5.00
 console   = Console()
@@ -510,8 +510,11 @@ def _side_by_side(left, right) -> Table:
 
 
 def _next_evening_open_et(now: datetime) -> datetime:
-    """Next 18:00 ET on a weekday."""
+    """Next 18:00 ET on a weekday (today counts if 18:00 is still in the future)."""
     d = now.date()
+    today_open = datetime(d.year, d.month, d.day, 18, 0, tzinfo=ET)
+    if d.weekday() <= 4 and now < today_open:
+        return today_open
     for offset in range(1, 8):
         t = d + timedelta(days=offset)
         if t.weekday() <= 4:
@@ -705,7 +708,21 @@ def update_sunday(client, contract_id: str, state: SundayOpenState, now_et: date
 
 def update_evening(client, contract_id: str, state: EveningOpenState, now_et: datetime):
     if state.status == "DONE":
-        return
+        sub = _active_window(now_et)
+        if sub in ("STANDBY", "FIRST_CANDLE", "SIGNAL_EVAL"):
+            # New day's window is active — reset for fresh session
+            state.status         = "INACTIVE"
+            state.candle_complete = False
+            state.prev_close      = 0
+            state.first_bar_open  = 0.0
+            state.first_bar_close = 0.0
+            state.first_bar_vol   = 0.0
+            state.gap_open_pct    = 0.0
+            state.gap_close_pct   = 0.0
+            state.signal_dir      = 0
+            state.signal_entry    = 0.0
+        else:
+            return
     if now_et.weekday() > 4:   # Sat/Sun — not an evening session
         state.status = "INACTIVE"
         return
@@ -736,6 +753,9 @@ def update_evening(client, contract_id: str, state: EveningOpenState, now_et: da
         state.status = "FIRST_CANDLE"
 
     elif sub == "SIGNAL_EVAL" and not state.candle_complete:
+        if state.prev_close == 0:
+            cutoff = datetime(now_et.year, now_et.month, now_et.day, 17, 0, tzinfo=ET)
+            state.prev_close = fetch_prev_close(client, contract_id, cutoff)
         bar = fetch_current_bar(client, contract_id)
         if bar and state.prev_close:
             state.first_bar_open  = float(bar["o"])
