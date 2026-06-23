@@ -8,8 +8,8 @@ PYTHON=/Library/Frameworks/Python.framework/Versions/3.12/bin/python3
 
 mkdir -p "$REPO/logs"
 
-if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
-    echo "$(date): trading_bot already running (pid $(cat "$PIDFILE")) — skipping" >> "$REPO/logs/cron.log"
+if pgrep -f "src/trading_bot.py" > /dev/null 2>&1; then
+    echo "$(date): trading_bot already running (pid $(pgrep -f 'src/trading_bot.py' | tr '\n' ' ')) — skipping" >> "$REPO/logs/cron.log"
     exit 0
 fi
 

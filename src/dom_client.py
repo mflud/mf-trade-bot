@@ -15,7 +15,10 @@ Usage:
 
 import argparse
 import csv
+import json
+import logging
 import os
+import sqlite3
 import sys
 import threading
 import time
@@ -26,14 +29,67 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from signalrcore.hub_connection_builder import HubConnectionBuilder
 
+# signalrcore logs every WebSocket disconnect at ERROR level — suppress to WARNING
+# so routine reconnects don't flood the log file.
+logging.getLogger("SignalRCoreClient").setLevel(logging.CRITICAL)
+
 sys.path.insert(0, "src")
 from topstep_client import TopstepClient
 
 load_dotenv()
 
 MARKET_HUB_BASE = "https://rtc.topstepx.com/hubs/market"
+DOM_DB_PATH     = Path("data/dom.db")
 
 _CT = ZoneInfo("America/Chicago")
+
+
+# ── Shared DOM state DB (read by slr_monitor without its own WebSocket) ───────
+
+def _init_dom_db(db_path: Path) -> sqlite3.Connection:
+    db_path.parent.mkdir(exist_ok=True)
+    conn = sqlite3.connect(str(db_path), check_same_thread=False)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS dom_live (
+            symbol     TEXT PRIMARY KEY,
+            updated    TEXT NOT NULL,
+            last_price REAL,
+            best_bid   REAL,
+            best_ask   REAL,
+            bids_json  TEXT NOT NULL,
+            asks_json  TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+    return conn
+
+
+def _dom_writer_loop(books_by_sym: dict, db_conn: sqlite3.Connection,
+                     interval: float = 0.2):
+    """Write live DOM state to dom.db every interval seconds."""
+    db_lock = threading.Lock()
+    while True:
+        time.sleep(interval)
+        now = datetime.now(timezone.utc).isoformat()
+        for sym, book in books_by_sym.items():
+            with book._lock:
+                bids = {str(k): v for k, v in book.bids.items()}
+                asks = {str(k): v for k, v in book.asks.items()}
+                last = book.last_price
+                bb   = book.best_bid
+                ba   = book.best_ask
+            try:
+                with db_lock:
+                    db_conn.execute("""
+                        INSERT OR REPLACE INTO dom_live
+                        (symbol, updated, last_price, best_bid, best_ask,
+                         bids_json, asks_json)
+                        VALUES (?,?,?,?,?,?,?)
+                    """, (sym, now, last, bb, ba,
+                          json.dumps(bids), json.dumps(asks)))
+                    db_conn.commit()
+            except Exception:
+                pass
 
 def is_cme_weekend_closure() -> bool:
     """Return True during CME Globex weekend closure: Fri 16:00 CT – Sun 17:00 CT."""
@@ -267,7 +323,18 @@ class DOMRecorder:
             if not self._stop_event.is_set():
                 self._capture()
 
+    _ET             = ZoneInfo("America/New_York")
+    _SESSION_START  = dtime(9,  0)
+    _SESSION_END    = dtime(17, 0)
+
+    def _in_active_session(self) -> bool:
+        t = datetime.now(self._ET).time()
+        return self._SESSION_START <= t < self._SESSION_END
+
     def _capture(self):
+        if not self._in_active_session():
+            return   # outside 09:00–17:00 ET — skip snapshot
+
         row = self.book.record_features(n_levels=DOM_SNAPSHOT_LEVELS)
         row["contract"] = self.contract
         ts_str = row["ts"]
@@ -355,8 +422,12 @@ def render(book: DOMBook, contract: str, n_levels: int = 10):
 
 # ── SignalR connection ────────────────────────────────────────────────────────
 
-def build_connection(token: str, contract_id: str,
-                     book: DOMBook, verbose: bool = False):
+def build_connection(token: str, books: dict, contract_ids: list,
+                     verbose: bool = False):
+    """
+    books       : {contract_id: DOMBook}
+    contract_ids: list of contract IDs to subscribe to
+    """
     url = f"{MARKET_HUB_BASE}?access_token={token}"
 
     hub = (HubConnectionBuilder()
@@ -371,36 +442,39 @@ def build_connection(token: str, contract_id: str,
     # ── Event handlers ────────────────────────────────────────────────────────
 
     def _extract(args):
-        """
-        SignalR events arrive as [contractId, payload] or just [payload].
-        Find the first dict in args.
-        """
         for a in args:
             if isinstance(a, dict):
                 return a
         return None
 
+    def _book_for(args):
+        """Route to the correct DOMBook by contractId (first arg)."""
+        cid = str(args[0]) if args else ""
+        return books.get(cid)
+
     def on_depth(args):
         """GatewayDepth: [contractId, [{"price", "volume", "type"}, ...]]"""
         if verbose:
             print(f"[depth] {args}")
-        # Payload is a list of update dicts (second element after contractId)
-        updates = next((a for a in args if isinstance(a, list)), None)
-        if updates:
-            book.apply_depth(updates)
+        book = _book_for(args)
+        if book:
+            updates = next((a for a in args if isinstance(a, list)), None)
+            if updates:
+                book.apply_depth(updates)
 
     def on_quote(args):
-        """GatewayQuote: [contractId, {lastPrice, bestBid, bestAsk, volume, ...}]"""
+        """GatewayQuote: [contractId, {lastPrice, bestBid, bestAsk, ...}]"""
         if verbose:
             print(f"[quote] {args}")
-        msg = _extract(args)
-        if msg is None:
-            return
-        book.apply_quote(
-            msg.get("lastPrice"),
-            msg.get("bestBid"),
-            msg.get("bestAsk"),
-        )
+        book = _book_for(args)
+        if book:
+            msg = _extract(args)
+            if msg:
+                book.apply_quote(
+                    msg.get("lastPrice"),
+                    msg.get("bestBid"),
+                    msg.get("bestAsk"),
+                )
 
     def on_trade(args):
         if verbose:
@@ -417,61 +491,124 @@ def build_connection(token: str, contract_id: str,
     # ── Subscribe after connect ───────────────────────────────────────────────
 
     def on_open():
-        print(f"Connected to Market Hub — subscribing to {contract_id}")
-        hub.send("SubscribeContractQuotes",      [contract_id])
-        hub.send("SubscribeContractMarketDepth", [contract_id])
-        hub.send("SubscribeContractTrades",      [contract_id])
+        syms = ", ".join(contract_ids)
+        print(f"Connected to Market Hub — subscribing to {syms}")
+        for cid in contract_ids:
+            hub.send("SubscribeContractQuotes",      [cid])
+            hub.send("SubscribeContractMarketDepth", [cid])
+            hub.send("SubscribeContractTrades",      [cid])
 
     hub.on_open(on_open)
 
     return hub
 
 
+# ── Session guard ─────────────────────────────────────────────────────────────
+
+_SESSION_ET_START = dtime(8, 30)
+_SESSION_ET_END   = dtime(17, 0)
+_SESSION_ET_TZ    = ZoneInfo("America/New_York")
+
+
+def _wait_for_session():
+    """Block until 08:30–17:00 ET on a Mon–Fri weekday, sleeping in 30-min chunks."""
+    while True:
+        now_et = datetime.now(_SESSION_ET_TZ)
+        wd  = now_et.weekday()   # 0=Mon…4=Fri, 5=Sat, 6=Sun
+        t   = now_et.time()
+        if wd < 5 and _SESSION_ET_START <= t < _SESSION_ET_END:
+            return
+        target = now_et.replace(hour=8, minute=30, second=0, microsecond=0)
+        if t >= _SESSION_ET_START:
+            from datetime import timedelta as _td
+            target += _td(days=1)
+        while target.weekday() >= 5:
+            from datetime import timedelta as _td
+            target += _td(days=1)
+        wait = (target - now_et).total_seconds()
+        print(f"[session] Outside 08:30–17:00 ET — sleeping {wait/3600:.1f}h until "
+              f"{target.strftime('%a %H:%M ET')}")
+        time.sleep(min(wait, 1800))
+
+
+def _start_session_exit_watcher():
+    """Background thread: exit cleanly at 17:00 ET so launchd restarts us fresh tomorrow."""
+    def _watch():
+        while True:
+            time.sleep(30)
+            now_et = datetime.now(_SESSION_ET_TZ)
+            if now_et.time() >= _SESSION_ET_END:
+                print("[session] 17:00 ET — session ended, exiting cleanly")
+                import os
+                os._exit(0)   # hard kill — SIGTERM can be caught by signalrcore
+    threading.Thread(target=_watch, daemon=True, name="session-exit").start()
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
+
+DEFAULT_INSTRUMENTS = ["MES", "MNQ", "ES", "NQ"]
+
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--instruments", type=str,
+                        default=",".join(DEFAULT_INSTRUMENTS),
+                        help="Comma-separated instrument list "
+                             f"(default: {','.join(DEFAULT_INSTRUMENTS)})")
     parser.add_argument("--levels",  type=int,  default=10,
                         help="DOM levels to display each side (default 10)")
     parser.add_argument("--verbose", action="store_true",
                         help="Print raw SignalR messages")
-    parser.add_argument("--contract", type=str, default=None,
-                        help="Contract id (e.g. CON.F.US.MES.H26). "
-                             "Defaults to front-month MES.")
     parser.add_argument("--record", action="store_true",
                         help="Save DOM snapshots to CSV for ML training")
     parser.add_argument("--record-interval", type=int, default=5,
                         help="Snapshot interval in minutes (default 5)")
-    parser.add_argument("--record-out", type=str, default="mes_dom_snapshots.csv",
-                        help="Output CSV path (default mes_dom_snapshots.csv)")
     args = parser.parse_args()
+
+    syms = [s.strip().upper() for s in args.instruments.split(",") if s.strip()]
+
+    _wait_for_session()
+    _start_session_exit_watcher()
 
     # Authenticate
     client = TopstepClient()
     token  = client.login()
     print(f"Authenticated.")
 
-    # Resolve contract
-    if args.contract:
-        contract_id   = args.contract
-        contract_name = args.contract
-    else:
-        contracts     = client.search_contracts("MES")
-        contract      = contracts[0]
-        contract_id   = contract["id"]
-        contract_name = contract["name"]
-    print(f"Contract: {contract_name}  id={contract_id}")
+    # Resolve contracts
+    contracts_info = {}   # sym → {id, name}
+    for sym in syms:
+        results = client.search_contracts(sym)
+        if not results:
+            print(f"WARNING: no contract found for {sym} — skipping")
+            continue
+        c = results[0]
+        contracts_info[sym] = {"id": c["id"], "name": c["name"]}
+        print(f"  {sym}: {c['name']}  id={c['id']}")
 
-    book = DOMBook()
-    hub  = build_connection(token, contract_id, book, verbose=args.verbose)
+    if not contracts_info:
+        print("ERROR: no contracts resolved — exiting")
+        return
 
-    recorder = None
-    if args.record:
-        recorder = DOMRecorder(
-            book, contract_name,
-            out_path=args.record_out,
-            interval_minutes=args.record_interval,
-        )
+    # Per-instrument DOMBook and DOMRecorder
+    books     = {}   # contract_id → DOMBook
+    sym_by_id = {}   # contract_id → sym
+    recorders = []
+
+    for sym, info in contracts_info.items():
+        cid        = info["id"]
+        book       = DOMBook()
+        books[cid] = book
+        sym_by_id[cid] = sym
+        if args.record:
+            out_path = Path("data") / f"{sym.lower()}_dom_snapshots.csv"
+            rec = DOMRecorder(book, info["name"],
+                              out_path=str(out_path),
+                              interval_minutes=args.record_interval)
+            recorders.append(rec)
+
+    contract_ids = list(books.keys())
+    hub = build_connection(token, books, contract_ids, verbose=args.verbose)
 
     # ── Connection loop — rebuilds hub with fresh token on disconnect ─────────
     _stop = threading.Event()
@@ -483,7 +620,6 @@ def main():
                 now_ct = datetime.now(_CT)
                 print(f"[dom] CME weekend closure — pausing until Sunday 17:00 CT "
                       f"(now {now_ct.strftime('%a %H:%M %Z')})")
-                # Sleep 5 min at a time, checking stop_event
                 for _ in range(300):
                     if _stop.is_set():
                         return
@@ -491,18 +627,22 @@ def main():
                 continue
             try:
                 token = client.login()
-                book.bids.clear()   # clear stale levels before fresh subscribe
-                book.asks.clear()
-                hub   = build_connection(token, contract_id, book, verbose=args.verbose)
+                for book in books.values():
+                    book.bids.clear()
+                    book.asks.clear()
+                hub = build_connection(token, books, contract_ids,
+                                       verbose=args.verbose)
                 hub.start()
-                time.sleep(3)   # let first batch of depth events arrive
-                # Block until the connection drops (signalrcore calls on_close / raises)
-                # We detect a dead connection by watching book.last_update stall
+                time.sleep(3)
+                # Detect dead connection by watching for any book update
                 while not _stop.is_set():
                     time.sleep(30)
-                    age = (datetime.now(timezone.utc) - book.last_update).total_seconds()
+                    most_recent = max(
+                        (b.last_update for b in books.values()),
+                        default=datetime.now(timezone.utc))
+                    age = (datetime.now(timezone.utc) - most_recent).total_seconds()
                     if age > 120:
-                        print(f"[dom] No updates for {age:.0f}s — reconnecting with fresh token…")
+                        print(f"[dom] No updates for {age:.0f}s — reconnecting…")
                         break
                 hub.stop()
             except Exception as e:
@@ -511,29 +651,41 @@ def main():
 
     hub_thread = threading.Thread(target=_run_hub, daemon=True)
     hub_thread.start()
-    time.sleep(4)   # let first connection establish
+    time.sleep(4)
 
-    if recorder:
-        recorder.start()
+    # Write live DOM state to data/dom.db so slr_monitor can read it
+    # without opening its own WebSocket connection
+    books_by_sym = {sym: books[info["id"]] for sym, info in contracts_info.items()}
+    dom_db = _init_dom_db(DOM_DB_PATH)
+    threading.Thread(target=_dom_writer_loop, args=(books_by_sym, dom_db),
+                     daemon=True, name="dom-db-writer").start()
+
+    for rec in recorders:
+        rec.start()
 
     try:
         if args.record:
-            # Headless recording mode — no display, just block until killed
+            # Headless recording mode — block until killed
             threading.Event().wait()
         else:
+            # Display first instrument interactively
+            first_sym = syms[0]
+            first_cid = contracts_info[first_sym]["id"]
+            first_name = contracts_info[first_sym]["name"]
             while True:
-                print(render(book, contract_name, n_levels=args.levels),
+                print(render(books[first_cid], first_name, n_levels=args.levels),
                       end="", flush=True)
-                time.sleep(0.5)   # refresh twice per second
+                time.sleep(0.5)
     except KeyboardInterrupt:
         print("\nDisconnecting…")
     finally:
         _stop.set()
-        if recorder:
-            recorder.stop()
+        for rec in recorders:
+            rec.stop()
         try:
-            hub.send("UnsubscribeContractMarketDepth", [contract_id])
-            hub.send("UnsubscribeContractQuotes",      [contract_id])
+            for cid in contract_ids:
+                hub.send("UnsubscribeContractMarketDepth", [cid])
+                hub.send("UnsubscribeContractQuotes",      [cid])
             hub.stop()
         except Exception:
             pass
