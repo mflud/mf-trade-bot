@@ -35,7 +35,7 @@ PL_MOM_STOP_BPS      = 10.0
 PL_MOM_MIN_HOLD_S    = 10
 PL_MOM_MAX_HOLD_S    = 120
 PL_MOM_5S_FETCH      = 130   # covers sigma lookback (120) + window (6) + margin
-PL_MOM_SIGMA_N       = 2.0   # effective threshold = max(floor, N × σ_30s_bps)
+PL_MOM_SIGMA_N       = 3.0   # effective threshold = max(floor, N × σ_30s_bps)
 PL_MOM_SIGMA_LB      = 120   # 5s bars for σ computation (10 min)
 HISTORY_BARS         = 24    # 24 × 5s = 120s of history shown
 CLOSE_TRD_SHOW_S  = 8       # how long to display CLOSE TRD after signal clears

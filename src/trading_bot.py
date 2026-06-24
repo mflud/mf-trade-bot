@@ -148,7 +148,7 @@ PL_MOM_STOP_BPS        = 10.0
 PL_MOM_MIN_HOLD_S      = 10     # seconds before PL exit is checked (stop always active)
 PL_MOM_MAX_HOLD_S      = 120
 PL_MOM_5S_FETCH        = 130    # 5s bars to fetch: covers sigma lookback (120) + window (6) + margin
-PL_MOM_SIGMA_N         = 2.0    # move threshold = max(move_bps_floor, sigma_n × σ_30s_bps)
+PL_MOM_SIGMA_N         = 3.0    # move threshold = max(move_bps_floor, sigma_n × σ_30s_bps)
 PL_MOM_SIGMA_LOOKBACK  = 120    # 5s bars for rolling σ (10 min); backtest-optimal
 
 # ── Evening Resumption parameters ────────────────────────────────────────────
@@ -521,17 +521,18 @@ INSTRUMENTS = [
                   sun_gap_enabled=False,
                   pl_mom_enabled=True, pl_mom_entry_pl=0.80, pl_mom_move_bps=8.0,
                   pl_mom_stop_bps=7.0, pl_mom_exit_pl=0.40),
-    BotInstrument("MNQ", "MNQ", tick_size=0.25, point_value=2.00,
-                  csr_vol_windows=[(0.08, 4), (1.0, 8)],
-                  blackout_windows=[
-                      (16,  0,  9,  0, False),  # trade 09:00–16:00 ET only
-                  ],
-                  orb_enabled=False,
-                  vwaslr_n=0,
-                  slr_enabled=True,
-                  slr_vol_mult=15.0,            # raised from 7x: May analysis showed 7-10x MNQ signals have no edge
-                  pl_mom_enabled=True,
-                  pl_mom_stop_bps=8.0, pl_mom_exit_pl=0.20),
+    # MNQ disabled 2026-06-24: underperforms MES across SLR (-$320, 36% WR) and PL_MOM; focus on MES only
+    # BotInstrument("MNQ", "MNQ", tick_size=0.25, point_value=2.00,
+    #               csr_vol_windows=[(0.08, 4), (1.0, 8)],
+    #               blackout_windows=[
+    #                   (16,  0,  9,  0, False),  # trade 09:00–16:00 ET only
+    #               ],
+    #               orb_enabled=False,
+    #               vwaslr_n=0,
+    #               slr_enabled=True,
+    #               slr_vol_mult=15.0,            # raised from 7x: May analysis showed 7-10x MNQ signals have no edge
+    #               pl_mom_enabled=True,
+    #               pl_mom_stop_bps=8.0, pl_mom_exit_pl=0.20),
 ]
 
 
