@@ -86,7 +86,7 @@ DOM_BKT_BAR_W  = 14   # narrowed from 24
 
 # ── Sizing constants ──────────────────────────────────────────────────────────
 SIZING_SIGMA_BARS = 100
-SIZING_RISKS      = [100, 200, 300, 400, 500]
+SIZING_RISKS      = [100, 200, 300, 400, 500, 1000]
 
 # ── CME settlement gap ────────────────────────────────────────────────────────
 SETTLE_UTC_START = 21
@@ -687,6 +687,7 @@ def build_sizing_panel(state: MonitorState) -> Panel:
         t.add_row("bp",  "—", style="cyan")
         t.add_row("pts", "—", style="bold cyan")
 
+    actual_bars = min(SIZING_SIGMA_BARS, len(state.bars))
     t.add_row("RISK", "")
     for risk in SIZING_RISKS:
         if sigma_pts and sigma_pts > 0:
@@ -694,6 +695,7 @@ def build_sizing_panel(state: MonitorState) -> Panel:
         else:
             t.add_row(f"${risk}", "—")
     return Panel(t, title="[bold]SIZING (2σ stop)[/]",
+                 subtitle=f"[dim]σ from {actual_bars} 1-min bars[/]",
                  border_style="blue", padding=(0, 1), expand=False)
 
 
