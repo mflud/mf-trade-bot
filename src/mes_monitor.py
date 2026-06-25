@@ -86,7 +86,7 @@ DOM_BKT_BAR_W  = 14   # narrowed from 24
 
 # ── Sizing constants ──────────────────────────────────────────────────────────
 SIZING_SIGMA_BARS = 100
-SIZING_RISKS      = [100, 200, 300, 400, 500, 1000]
+SIZING_RISKS      = [100, 200, 300, 400, 500, 600, 700, 800, 900, 1000]
 
 # ── CME settlement gap ────────────────────────────────────────────────────────
 SETTLE_UTC_START = 21
