@@ -695,7 +695,7 @@ def build_sizing_panel(state: MonitorState) -> Panel:
         else:
             t.add_row(f"${risk}", "—")
     return Panel(t, title="[bold]SIZING (2σ stop)[/]",
-                 subtitle=f"[dim]σ from {actual_bars} 1-min bars[/]",
+                 subtitle=f"[dim]σ: {actual_bars} 1-min bars[/]",
                  border_style="blue", padding=(0, 1), expand=False)
 
 
