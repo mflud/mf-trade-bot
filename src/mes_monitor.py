@@ -19,6 +19,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -823,7 +824,10 @@ def run():
     # DOM reader thread (250ms)
     def _poll_dom():
         while True:
-            _read_dom_db(state)
+            try:
+                _read_dom_db(state)
+            except Exception:
+                traceback.print_exc()
             time.sleep(0.25)
     threading.Thread(target=_poll_dom, daemon=True, name="dom-reader").start()
 
@@ -834,7 +838,7 @@ def run():
             try:
                 fetch_1min_bars(client, state)
             except Exception:
-                pass
+                traceback.print_exc()
     threading.Thread(target=_fetch_1min_loop, daemon=True, name="bar-fetch").start()
 
     # 5s bar fetch + PL_MOM eval (2s cadence, RTH only)
@@ -863,7 +867,7 @@ def run():
                             for b in raw]
                         state.sigma_30s_bps = _compute_sigma(state.bars_5s, PL_MOM_SIGMA_LB)
                 except Exception:
-                    pass
+                    traceback.print_exc()
 
                 # History update on new bar
                 bar_ts = state.bars_5s[-1].ts if state.bars_5s else None
@@ -973,7 +977,7 @@ def run():
                 elif state.position_size == 0:
                     state.position_strategy = ""
             except Exception:
-                pass
+                traceback.print_exc()
             time.sleep(30)
     threading.Thread(target=_poll_positions, daemon=True, name="pos-poll").start()
 
