@@ -433,8 +433,6 @@ class SignalRConn:
 
     PING_INTERVAL = 15   # seconds between pings
     RECONNECT_DELAYS = [1, 2, 5, 10, 30, 60]  # seconds
-    FAST_FAIL_SECS   = 10   # connection that drops within this many seconds is a "fast fail"
-    FAST_FAIL_MAX    = 5    # exit process after this many consecutive fast fails (forces fresh loginKey)
 
     def __init__(self, hub_url: str, token_factory, on_message, on_connected,
                  name: str = "hub"):
@@ -482,14 +480,11 @@ class SignalRConn:
         return f"{self.hub_url}?access_token={token}"
 
     def _run_loop(self):
-        attempt    = 0
-        fast_fails = 0
+        attempt = 0
         while self._running:
-            connect_ts = time.monotonic()
             try:
                 self._connect()
                 attempt = 0   # reset back-off on clean run
-                fast_fails = 0
             except Exception as e:
                 if not self._running:
                     break
@@ -512,31 +507,11 @@ class SignalRConn:
                     )
                     time.sleep(wait)
                     attempt = 0
-                    fast_fails = 0
                     continue
                 delay = self.RECONNECT_DELAYS[min(attempt, len(self.RECONNECT_DELAYS) - 1)]
                 log.warning(f"{self.name}: disconnected ({e}) — reconnecting in {delay}s")
                 attempt += 1
                 time.sleep(delay)
-            else:
-                # _connect() returned cleanly — check if it was a fast fail
-                elapsed = time.monotonic() - connect_ts
-                if elapsed < self.FAST_FAIL_SECS:
-                    fast_fails += 1
-                    log.warning(
-                        f"{self.name}: fast disconnect after {elapsed:.1f}s "
-                        f"({fast_fails}/{self.FAST_FAIL_MAX}) — likely session invalidated"
-                    )
-                    if fast_fails >= self.FAST_FAIL_MAX:
-                        log.error(
-                            f"{self.name}: {self.FAST_FAIL_MAX} consecutive fast disconnects — "
-                            f"exiting so wrapper can restart with fresh token"
-                        )
-                        import sys; sys.exit(1)
-                    time.sleep(self.RECONNECT_DELAYS[min(fast_fails, len(self.RECONNECT_DELAYS) - 1)])
-                else:
-                    fast_fails = 0
-                    attempt = 0
 
     def _connect(self):
         ws = websocket.create_connection(
