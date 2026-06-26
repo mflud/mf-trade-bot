@@ -1757,6 +1757,8 @@ def evaluate_vwaslr(state: InstrumentState) -> VwasrlSignal | None:
     bar_hm = (bar_et.hour, bar_et.minute)
     if bar_hm < inst.vwaslr_start or bar_hm >= (16, 0):
         return None
+    if (9, 30) <= bar_hm < (9, 40):
+        return None
 
     # Respect shared blackout windows.
     # Pre-9:30 (pre-market): skip conditional blackouts — no CSR context from 5-min bars yet.
@@ -3084,7 +3086,7 @@ def run(account_id: int | None, paper: bool):
                 past_cutoff = (now_ct.hour, now_ct.minute) >= TRADING_CUTOFF_CT
                 # SLR is also active during Globex — cutoff only applies in RTH session
                 now_et_hm        = (now_et.hour, now_et.minute)
-                slr_in_rth       = (9, 30) <= now_et_hm < (16, 0)
+                slr_in_rth       = (9, 40) <= now_et_hm < (16, 0)
                 slr_past_cutoff  = past_cutoff and slr_in_rth
 
                 if no_position and not past_cutoff:
