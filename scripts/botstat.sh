@@ -26,6 +26,10 @@ screen_check() {
 echo ""
 echo "=== MF Trade Bot Status  $(date '+%Y-%m-%d %H:%M:%S') ==="
 echo ""
+if [ -f "$REPO/logs/bot.disabled" ]; then
+    echo "  *** BOT DISABLED (botdown.sh was run — run botup.sh to restart) ***"
+    echo ""
+fi
 echo "--- Processes ---"
 screen_check "bar_collector " "bar_collector" "bar_collector.py"
 screen_check "mes_monitor   " "mes_monitor" "mes_monitor.py"
