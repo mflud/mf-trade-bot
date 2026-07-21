@@ -68,7 +68,10 @@ sys.path.insert(0, "src")
 from dotenv import load_dotenv
 load_dotenv()
 
+import sqlite3
+
 from topstep_client import TopstepClient, get_bars_from_db, get_5s_bars_from_db, bars_db_available
+from wall_tracker import WallTracker, WallEvent, log_wall_events, ensure_wall_log
 
 # Practice account — the only account the live bot is permitted to trade on.
 # Set TOPSTEP_ACCOUNT_ID in .env to override.
@@ -172,7 +175,22 @@ VWAS_LOG_PATH = Path("logs/vwaslr_trades.csv")
 SLR_LOG_PATH  = Path("logs/slr_trades.csv")
 EVE_LOG_PATH  = Path("logs/eve_trades.csv")
 SUN_LOG_PATH  = Path("logs/sun_gap_trades.csv")
-PL_MOM_LOG_PATH = Path("logs/pl_mom_trades.csv")
+PL_MOM_LOG_PATH     = Path("logs/pl_mom_trades.csv")
+WALL_BREAK_LOG_PATH = Path("logs/wall_break_trades.csv")
+
+# ── DOM DB constants ──────────────────────────────────────────────────────────
+DOM_DB_PATH    = Path("data/dom.db")
+DOM_DB_STALE_S = 30   # seconds; DOM older than this is considered stale
+
+# ── Wall breakout parameters ──────────────────────────────────────────────────
+WALL_MED_MIN          = 100    # peak_size lower bound for "medium" wall
+WALL_MED_MAX          = 300    # peak_size upper bound for "medium" wall
+WALL_BREAK_MIN_TESTS  = 2      # minimum test_count at breakout to qualify
+WALL_BREAK_STOP_PTS   = 4.0   # hard stop distance in points
+WALL_BREAK_TARGET_PTS = 12.0  # profit target distance in points
+WALL_BREAK_HOLD_MIN   = 15    # max hold in minutes
+WALL_EXTEND_MIN       = 10    # minutes to extend VWASLR hold on qualifying breakout
+WALL_STOP_SEARCH_PTS  = 10.0  # search radius for tested walls to anchor stop
 SLR_LOG_FIELDS = [
     "fired_at", "resolved_at", "symbol", "direction",
     "est_entry", "fill_price", "target", "stop",
@@ -211,6 +229,11 @@ LOG_FIELDS = [
     "sigma_pts", "scaled", "vol_ratio", "csr",
     "pl_aligned", "contracts",
     "outcome", "pnl_pts", "pnl_sigma",
+]
+WALL_BREAK_LOG_FIELDS = [
+    "fired_at", "resolved_at", "symbol", "direction",
+    "est_entry", "fill_price", "wall_price", "peak_size", "test_count",
+    "stop", "target", "outcome", "pnl_pts",
 ]
 
 log = logging.getLogger("bot")
@@ -466,6 +489,44 @@ def log_dom_at_signal(strategy: str, symbol: str, direction: int, entry: float,
 def play_trade_sound():
     """Play trade-execution sound non-blocking. Currently disabled."""
     pass
+
+
+# ── DOM DB reader ─────────────────────────────────────────────────────────────
+
+def _read_dom_db(states: list) -> None:
+    """Read live DOM state from data/dom.db (written by bar_collector) and
+    update each InstrumentState.dom in place.  No-ops silently if DB is absent."""
+    if not DOM_DB_PATH.exists():
+        return
+    try:
+        conn = sqlite3.connect(str(DOM_DB_PATH), timeout=1.0)
+        syms = {s.instrument.symbol: s for s in states}
+        rows = conn.execute(
+            "SELECT symbol, updated, last_price, best_bid, best_ask, "
+            "bids_json, asks_json FROM dom_live WHERE symbol IN ({})".format(
+                ",".join("?" * len(syms))),
+            list(syms.keys()),
+        ).fetchall()
+        conn.close()
+        now = datetime.now(timezone.utc)
+        for sym, updated, last, bb, ba, bids_json, asks_json in rows:
+            state = syms.get(sym)
+            if not state:
+                continue
+            updated_dt = datetime.fromisoformat(updated)
+            if (now - updated_dt).total_seconds() > DOM_DB_STALE_S:
+                continue   # stale — leave existing book intact
+            bids = {float(k): v for k, v in json.loads(bids_json).items()}
+            asks = {float(k): v for k, v in json.loads(asks_json).items()}
+            with state.dom._lock:
+                state.dom.bids        = bids
+                state.dom.asks        = asks
+                state.dom.last_price  = last
+                state.dom.best_bid    = bb
+                state.dom.best_ask    = ba
+                state.dom.last_update = updated_dt
+    except Exception as e:
+        log.debug(f"_read_dom_db: {e}")
 
 
 # ── Instrument config ────────────────────────────────────────────────────────
@@ -781,6 +842,42 @@ class ActiveSundayGapTrade:
 
 
 @dataclass
+class WallBreakSignal:
+    direction:  int      # +1 long (ask wall broke up), -1 short (bid wall broke down)
+    entry:      float
+    stop:       float
+    target:     float
+    wall_price: float
+    peak_size:  float
+    test_count: int
+    bar_ts:     datetime
+
+    def stop_pts(self):   return abs(self.stop   - self.entry)
+    def target_pts(self): return abs(self.target - self.entry)
+
+
+@dataclass
+class ActiveWallBreakTrade:
+    instrument:  BotInstrument
+    contract_id: str
+    sig:         WallBreakSignal
+    fired_at:    datetime
+    order_id:    int   | None = None
+    fill_price:  float | None = None
+
+    def target_price(self) -> float:
+        p = self.fill_price or self.sig.entry
+        return p + self.sig.direction * self.sig.target_pts()
+
+    def stop_price(self) -> float:
+        p = self.fill_price or self.sig.entry
+        return p - self.sig.direction * self.sig.stop_pts()
+
+    def expires_at(self) -> datetime:
+        return self.fired_at + timedelta(minutes=WALL_BREAK_HOLD_MIN)
+
+
+@dataclass
 class InstrumentState:
     instrument:   BotInstrument
     contract_id:  str = ""
@@ -819,6 +916,12 @@ class InstrumentState:
     sun_fired_date:          date | None = None   # ET date of last Sunday gap trade
     sun_vol_rec_date:        date | None = None   # ET date when current Sunday vol was recorded
     active_sunday_gap_trade: ActiveSundayGapTrade | None = None
+    # WallTracker state
+    wall_tracker:               "WallTracker | None"          = None
+    recent_wall_breakouts:      list                          = field(default_factory=list)
+    wall_break_last_ts:         "datetime | None"             = None
+    vwaslr_wall_extended_until: "datetime | None"             = None
+    active_wall_break_trade:    "ActiveWallBreakTrade | None" = None
 
 
 # ── Trade logging ────────────────────────────────────────────────────────────
@@ -1790,7 +1893,10 @@ def place_vwaslr_signal(client: TopstepClient, state: InstrumentState,
     tick      = inst.tick_size
     is_long   = sig.direction == 1
     dir_label = "LONG" if is_long else "SHORT"
-    stop_mag   = max(1, round(sig.stop_pts()   / tick))
+    # Tighten stop if a tested DOM wall is within WALL_STOP_SEARCH_PTS
+    adjusted_stop  = _wall_stop_price(state, sig.direction, sig.entry, sig.stop)
+    stop_pts_adj   = abs(adjusted_stop - sig.entry)
+    stop_mag   = max(1, round(stop_pts_adj     / tick))
     target_mag = max(1, round(sig.target_pts() / tick))
     stop_ticks   = -stop_mag   if is_long else  stop_mag
     target_ticks =  target_mag if is_long else -target_mag
@@ -1842,6 +1948,7 @@ def handle_active_vwaslr_trade(client: TopstepClient, state: InstrumentState,
                           else trade.sig.entry)
             _log_vwaslr_trade(trade, "TIME EXIT (paper)", exit_price, now)
             state.active_vwaslr_trade = None
+            state.vwaslr_wall_extended_until = None
         return
 
     try:
@@ -1868,6 +1975,29 @@ def handle_active_vwaslr_trade(client: TopstepClient, state: InstrumentState,
         (trade.sig.direction ==  1 and ema < half_thr) or
         (trade.sig.direction == -1 and ema > -half_thr)
     )
+
+    # Extend hold if a qualifying wall breakout in the trade direction occurred
+    # since entry — suppress the half-zero exit for WALL_EXTEND_MIN minutes.
+    if signal_exit:
+        for evt in state.recent_wall_breakouts:
+            if evt.ts <= trade.fired_at:
+                continue
+            evt_dir = 1 if evt.side == "ask" else -1
+            if evt_dir != trade.sig.direction:
+                continue
+            extended_until = evt.ts + timedelta(minutes=WALL_EXTEND_MIN)
+            if (state.vwaslr_wall_extended_until is None
+                    or extended_until > state.vwaslr_wall_extended_until):
+                state.vwaslr_wall_extended_until = extended_until
+                log.info(
+                    f"VWASLR {trade.instrument.symbol}: wall-extend active until "
+                    f"{extended_until.astimezone(ET).strftime('%H:%M')} ET  "
+                    f"wall={evt.wall_price:.2f}  peak={evt.peak_size:.0f}"
+                )
+        if (state.vwaslr_wall_extended_until is not None
+                and now < state.vwaslr_wall_extended_until):
+            signal_exit = False
+
     if signal_exit:
         log.info(
             f"VWASLR {trade.instrument.symbol} SIGNAL EXIT  "
@@ -1888,6 +2018,7 @@ def handle_active_vwaslr_trade(client: TopstepClient, state: InstrumentState,
                       else (trade.fill_price or trade.sig.entry))
         _log_vwaslr_trade(trade, "SIGNAL EXIT", exit_price, now)
         state.active_vwaslr_trade = None
+        state.vwaslr_wall_extended_until = None
         try:
             client.cancel_all_orders(account_id)
         except Exception:
@@ -1906,6 +2037,7 @@ def handle_active_vwaslr_trade(client: TopstepClient, state: InstrumentState,
             outcome, exit_price = _classify_vwaslr_outcome(trade, state.vwaslr_bars)
         _log_vwaslr_trade(trade, outcome, exit_price, now)
         state.active_vwaslr_trade = None
+        state.vwaslr_wall_extended_until = None
         try:
             n = client.cancel_all_orders(account_id)
             if n:
@@ -1929,6 +2061,7 @@ def handle_active_vwaslr_trade(client: TopstepClient, state: InstrumentState,
                       else (trade.fill_price or trade.sig.entry))
         _log_vwaslr_trade(trade, "TIME EXIT", exit_price, now)
         state.active_vwaslr_trade = None
+        state.vwaslr_wall_extended_until = None
         try:
             client.cancel_all_orders(account_id)
         except Exception:
@@ -2067,7 +2200,10 @@ def place_slr_signal(client: TopstepClient, state: InstrumentState,
                      paper: bool) -> ActiveSLRTrade:
     inst      = state.instrument
     tick      = inst.tick_size
-    stop_mag   = max(1, round(sig.stop_pts()   / tick))
+    # Tighten stop if a tested DOM wall is within WALL_STOP_SEARCH_PTS
+    adjusted_stop = _wall_stop_price(state, sig.direction, sig.entry, sig.stop)
+    stop_pts_adj  = abs(adjusted_stop - sig.entry)
+    stop_mag   = max(1, round(stop_pts_adj     / tick))
     target_mag = max(1, round(sig.target_pts() / tick))
     stop_ticks   = -sig.direction * stop_mag    # LONG: below entry; SHORT: above entry
     target_ticks =  sig.direction * target_mag  # LONG: above entry; SHORT: below entry
@@ -2116,7 +2252,7 @@ def handle_active_slr_trade(client: TopstepClient, state: InstrumentState,
     trade = state.active_slr_trade
 
     if paper:
-        if now >= trade.sig.expires_at():
+        if now >= trade.fired_at + timedelta(seconds=PL_MOM_MAX_HOLD_S):
             exit_price = (state.vwaslr_bars[-1].close if state.vwaslr_bars
                           else trade.sig.entry)
             _log_slr_trade(trade, "TIME EXIT (paper)", exit_price, now)
@@ -2160,7 +2296,7 @@ def handle_active_slr_trade(client: TopstepClient, state: InstrumentState,
             log.warning(f"SLR {trade.instrument.symbol}: cancel_all_orders failed: {e}")
         return
 
-    if now >= trade.sig.expires_at():
+    if now >= trade.fired_at + timedelta(seconds=PL_MOM_MAX_HOLD_S):
         log.info(f"SLR {trade.instrument.symbol} max hold reached — closing")
         try:
             client.cancel_all_orders(account_id)
@@ -2184,6 +2320,178 @@ def handle_active_slr_trade(client: TopstepClient, state: InstrumentState,
 def _classify_slr_outcome(trade: ActiveSLRTrade,
                            bars: list[Bar]) -> tuple[str, float]:
     """Infer bracket outcome from 1-min bar OHLC (direction-aware, stop-first)."""
+    d = trade.sig.direction
+    for bar in bars:
+        if bar.ts <= trade.fired_at:
+            continue
+        if d == 1:
+            if bar.low  <= trade.stop_price():   return "STOPPED", trade.stop_price()
+            if bar.high >= trade.target_price():  return "TARGET",  trade.target_price()
+        else:
+            if bar.high >= trade.stop_price():   return "STOPPED", trade.stop_price()
+            if bar.low  <= trade.target_price():  return "TARGET",  trade.target_price()
+    last_close = bars[-1].close if bars else (trade.fill_price or trade.sig.entry)
+    if abs(last_close - trade.target_price()) <= abs(last_close - trade.stop_price()):
+        return "TARGET",  trade.target_price()
+    return "STOPPED", trade.stop_price()
+
+
+# ── Wall Breakout Signal ──────────────────────────────────────────────────────
+
+def evaluate_wall_break(state, now: datetime) -> "WallBreakSignal | None":
+    """Find the most recent qualifying wall breakout and return a signal.
+    Qualifies: event=breakout, WALL_MED_MIN <= peak_size <= WALL_MED_MAX,
+    test_count >= WALL_BREAK_MIN_TESTS, age < 5 min, not already traded."""
+    if not state.recent_wall_breakouts:
+        return None
+    cutoff_fresh = now - timedelta(minutes=5)
+    for evt in reversed(state.recent_wall_breakouts):
+        if evt.ts < cutoff_fresh:
+            break
+        if state.wall_break_last_ts is not None and evt.ts <= state.wall_break_last_ts:
+            continue
+        with state.dom._lock:
+            best_bid = state.dom.best_bid
+            best_ask = state.dom.best_ask
+        if best_bid is None or best_ask is None:
+            continue
+        if evt.side == "ask":   # ask wall broke → LONG
+            direction = 1
+            entry     = best_ask
+            stop      = entry - WALL_BREAK_STOP_PTS
+            target    = entry + WALL_BREAK_TARGET_PTS
+        else:                   # bid wall broke → SHORT
+            direction = -1
+            entry     = best_bid
+            stop      = entry + WALL_BREAK_STOP_PTS
+            target    = entry - WALL_BREAK_TARGET_PTS
+        return WallBreakSignal(
+            direction=direction, entry=entry, stop=stop, target=target,
+            wall_price=evt.wall_price, peak_size=evt.peak_size,
+            test_count=evt.test_count, bar_ts=evt.ts,
+        )
+    return None
+
+
+def place_wall_break_signal(client: TopstepClient, state,
+                             sig: WallBreakSignal, account_id: int,
+                             paper: bool) -> ActiveWallBreakTrade:
+    inst      = state.instrument
+    tick      = inst.tick_size
+    is_long   = sig.direction == 1
+    dir_label = "LONG" if is_long else "SHORT"
+    stop_mag   = max(1, round(sig.stop_pts()   / tick))
+    target_mag = max(1, round(sig.target_pts() / tick))
+    stop_ticks   = -stop_mag   if is_long else  stop_mag
+    target_ticks =  target_mag if is_long else -target_mag
+
+    trade = ActiveWallBreakTrade(
+        instrument=inst, contract_id=state.contract_id,
+        sig=sig, fired_at=sig.bar_ts,
+    )
+
+    if paper:
+        log.info(
+            f"[PAPER] WALL_BREAK {inst.symbol} {dir_label}  entry≈{sig.entry:.2f}  "
+            f"stop={sig.stop:.2f} ({sig.stop_pts():.2f}pts)  "
+            f"target={sig.target:.2f} ({sig.target_pts():.2f}pts)  "
+            f"wall={sig.wall_price:.2f}  peak={sig.peak_size:.0f}  tests={sig.test_count}"
+        )
+    else:
+        order_side = TopstepClient.BID if is_long else TopstepClient.ASK
+        resp = client.place_order(
+            account_id=account_id,
+            contract_id=state.contract_id,
+            side=order_side,
+            size=1,
+            order_type=TopstepClient.ORDER_MARKET,
+            stop_loss_ticks=stop_ticks,
+            take_profit_ticks=target_ticks,
+            custom_tag=f"wb_{inst.symbol}_{sig.bar_ts.strftime('%Y%m%d%H%M%S')}_{random.randint(100,999)}",
+        )
+        trade.order_id = resp.get("orderId")
+        log.info(
+            f"WALL_BREAK ORDER  {inst.symbol} {dir_label}  order_id={trade.order_id}  "
+            f"entry≈{sig.entry:.2f}  stop={stop_ticks}t  target={target_ticks}t  "
+            f"wall={sig.wall_price:.2f}  peak={sig.peak_size:.0f}  tests={sig.test_count}"
+        )
+
+    state.active_wall_break_trade = trade
+    state.wall_break_last_ts      = sig.bar_ts
+    return trade
+
+
+def handle_active_wall_break_trade(client: TopstepClient, state,
+                                    account_id: int, now: datetime, paper: bool):
+    trade = state.active_wall_break_trade
+
+    if paper:
+        if now >= trade.expires_at():
+            exit_price = (state.vwaslr_bars[-1].close if state.vwaslr_bars
+                          else trade.sig.entry)
+            _log_wall_break_trade(trade, "TIME EXIT (paper)", exit_price, now)
+            state.active_wall_break_trade = None
+        return
+
+    try:
+        positions = client.get_open_positions(account_id)
+    except Exception as e:
+        log.warning(f"WALL_BREAK {trade.instrument.symbol}: could not fetch positions: {e}")
+        return
+
+    pos = next(
+        (p for p in positions if p.get("contractId") == trade.contract_id),
+        None,
+    )
+
+    if pos and trade.fill_price is None:
+        trade.fill_price = pos.get("averagePrice")
+        log.info(f"WALL_BREAK {trade.instrument.symbol} fill confirmed: {trade.fill_price:.2f}")
+        play_trade_sound()
+
+    if pos is None:
+        exit_price = _get_exit_price(client, account_id, trade.fired_at,
+                                     trade.contract_id, now)
+        if exit_price is not None:
+            d = trade.sig.direction
+            outcome = ("TARGET" if (d == 1 and exit_price >= trade.target_price()) or
+                                   (d == -1 and exit_price <= trade.target_price())
+                       else "STOPPED")
+        else:
+            outcome, exit_price = _classify_wall_break_outcome(trade, state.vwaslr_bars)
+        _log_wall_break_trade(trade, outcome, exit_price, now)
+        state.active_wall_break_trade = None
+        try:
+            n = client.cancel_all_orders(account_id)
+            if n:
+                log.info(f"WALL_BREAK {trade.instrument.symbol} {outcome}: cancelled {n} residual order(s)")
+        except Exception as e:
+            log.warning(f"WALL_BREAK {trade.instrument.symbol}: cancel_all_orders failed: {e}")
+        return
+
+    if now >= trade.expires_at():
+        log.info(f"WALL_BREAK {trade.instrument.symbol} max hold reached — closing")
+        try:
+            client.cancel_all_orders(account_id)
+        except Exception as e:
+            log.warning(f"WALL_BREAK {trade.instrument.symbol}: pre-close cancel_all failed: {e}")
+        try:
+            client.close_position(account_id, trade.contract_id)
+        except Exception as e:
+            log.error(f"WALL_BREAK {trade.instrument.symbol}: failed to close position: {e}")
+            return
+        exit_price = (state.vwaslr_bars[-1].close if state.vwaslr_bars
+                      else (trade.fill_price or trade.sig.entry))
+        _log_wall_break_trade(trade, "TIME EXIT", exit_price, now)
+        state.active_wall_break_trade = None
+        try:
+            client.cancel_all_orders(account_id)
+        except Exception:
+            pass
+
+
+def _classify_wall_break_outcome(trade: ActiveWallBreakTrade,
+                                  bars: list) -> tuple[str, float]:
     d = trade.sig.direction
     for bar in bars:
         if bar.ts <= trade.fired_at:
@@ -2236,6 +2544,82 @@ def _log_pl_mom_trade(trade: ActivePLMomTrade, outcome: str,
     )
 
 
+# ── Wall Break log ────────────────────────────────────────────────────────────
+
+def _ensure_wall_break_log():
+    WALL_BREAK_LOG_PATH.parent.mkdir(exist_ok=True)
+    if not WALL_BREAK_LOG_PATH.exists():
+        with open(WALL_BREAK_LOG_PATH, "w", newline="") as f:
+            csv.DictWriter(f, fieldnames=WALL_BREAK_LOG_FIELDS).writeheader()
+
+
+def _log_wall_break_trade(trade: ActiveWallBreakTrade, outcome: str,
+                           exit_price: float, now: datetime):
+    fill    = trade.fill_price or trade.sig.entry
+    pnl_pts = (exit_price - fill) * trade.sig.direction
+    dirn    = "LONG" if trade.sig.direction == 1 else "SHORT"
+    row = {
+        "fired_at":    trade.fired_at.isoformat(),
+        "resolved_at": now.isoformat(),
+        "symbol":      trade.instrument.symbol,
+        "direction":   dirn,
+        "est_entry":   round(trade.sig.entry, 4),
+        "fill_price":  round(fill, 4),
+        "wall_price":  round(trade.sig.wall_price, 4),
+        "peak_size":   round(trade.sig.peak_size, 0),
+        "test_count":  trade.sig.test_count,
+        "stop":        round(trade.stop_price(), 4),
+        "target":      round(trade.target_price(), 4),
+        "outcome":     outcome,
+        "pnl_pts":     round(pnl_pts, 4),
+    }
+    with open(WALL_BREAK_LOG_PATH, "a", newline="") as f:
+        csv.DictWriter(f, fieldnames=WALL_BREAK_LOG_FIELDS).writerow(row)
+    log.info(
+        f"WALL_BREAK LOGGED  {trade.instrument.symbol} {dirn}  {outcome}  "
+        f"fill={fill:.2f}  exit={exit_price:.2f}  pnl={pnl_pts:+.2f}pts  "
+        f"wall={trade.sig.wall_price:.2f}  peak={trade.sig.peak_size:.0f}  "
+        f"tests={trade.sig.test_count}"
+    )
+
+
+# ── Wall-anchored stop helper ─────────────────────────────────────────────────
+
+def _wall_stop_price(state, direction: int, entry: float, default_stop: float) -> float:
+    """Return a tighter stop anchored to a tested DOM wall if one is within
+    WALL_STOP_SEARCH_PTS of entry on the protective side.
+    For LONG: look for tested bid walls below entry; snap stop to (wall_price - 1 tick).
+    For SHORT: look for tested ask walls above entry; snap stop to (wall_price + 1 tick).
+    Only uses wall if the candidate is tighter (closer to entry) than default_stop."""
+    if state.wall_tracker is None:
+        return default_stop
+    tick  = state.instrument.tick_size
+    walls = state.wall_tracker.active_walls()
+    best  = default_stop
+    if direction == 1:   # LONG: bid wall below entry
+        for w in walls:
+            if (w.side == "bid"
+                    and 0 < entry - w.price <= WALL_STOP_SEARCH_PTS
+                    and w.test_count >= 1):
+                candidate = w.price - tick
+                if candidate > best:   # tighter = higher for long stop
+                    best = candidate
+    else:                # SHORT: ask wall above entry
+        for w in walls:
+            if (w.side == "ask"
+                    and 0 < w.price - entry <= WALL_STOP_SEARCH_PTS
+                    and w.test_count >= 1):
+                candidate = w.price + tick
+                if candidate < best:   # tighter = lower for short stop
+                    best = candidate
+    if best != default_stop:
+        log.info(
+            f"{state.instrument.symbol}: wall-anchored stop "
+            f"{best:.2f} (default {default_stop:.2f})"
+        )
+    return best
+
+
 def _compute_pl_mom_sigma(bars: list, lookback: int) -> float:
     """Compute rolling σ of 30s (PL_MOM_WINDOW × 5s) net moves in bps
     using up to `lookback` 5s bars. Returns 0.0 if insufficient data."""
@@ -2284,12 +2668,13 @@ def fetch_pl_mom_bars(client: TopstepClient, state: InstrumentState):
             limit=PL_MOM_5S_FETCH,
         )
         if raw:
-            state.pl_mom_5s_bars = [
-                Bar(ts=datetime.fromisoformat(b["t"]),
-                    open=b["o"], high=b["h"], low=b["l"],
-                    close=b["c"], volume=b["v"])
-                for b in raw
-            ]
+            state.pl_mom_5s_bars = sorted(
+                [Bar(ts=datetime.fromisoformat(b["t"]),
+                     open=b["o"], high=b["h"], low=b["l"],
+                     close=b["c"], volume=b["v"])
+                 for b in raw],
+                key=lambda b: b.ts,
+            )
             state.pl_mom_sigma_30s_bps = _compute_pl_mom_sigma(
                 state.pl_mom_5s_bars, state.instrument.pl_mom_sigma_lookback)
     except Exception as e:
@@ -2408,7 +2793,7 @@ def handle_active_pl_mom_trade(client: TopstepClient, state: InstrumentState,
 
     if paper:
         # Paper mode: time exit only
-        if now >= trade.sig.expires_at():
+        if now >= trade.entry_ts + timedelta(seconds=PL_MOM_MAX_HOLD_S):
             exit_price = (state.pl_mom_5s_bars[-1].close if state.pl_mom_5s_bars
                           else trade.sig.entry)
             _log_pl_mom_trade(trade, "TIME EXIT (paper)", exit_price, now)
@@ -2488,7 +2873,7 @@ def handle_active_pl_mom_trade(client: TopstepClient, state: InstrumentState,
                 return
 
     # Time exit
-    if now >= trade.sig.expires_at():
+    if now >= trade.entry_ts + timedelta(seconds=PL_MOM_MAX_HOLD_S):
         log.info(f"PL_MOM {trade.instrument.symbol} max hold reached — closing")
         try:
             client.cancel_all_orders(account_id)
@@ -2981,6 +3366,11 @@ def run(account_id: int | None, paper: bool):
     if not states:
         raise RuntimeError("No instruments initialised.")
 
+    # Initialise wall trackers
+    ensure_wall_log()
+    for state in states:
+        state.wall_tracker = WallTracker(state.instrument.symbol)
+
     # Warn if positions are already open on startup
     try:
         existing = client.get_open_positions(account_id)
@@ -3001,6 +3391,7 @@ def run(account_id: int | None, paper: bool):
     _ensure_eve_log()
     _ensure_sun_log()
     _ensure_pl_mom_log()
+    _ensure_wall_break_log()
     _ensure_dom_signal_log()
     for state in states:
         if state.instrument.sun_gap_enabled:
@@ -3019,6 +3410,7 @@ def run(account_id: int | None, paper: bool):
 
     while True:
         now = datetime.now(timezone.utc)
+        _read_dom_db(states)
 
         for state in states:
             try:
@@ -3045,6 +3437,28 @@ def run(account_id: int | None, paper: bool):
                     if state.instrument.eve_enabled:
                         _update_eve_prev_close(state, now)
 
+                # WallTracker: feed DOM snapshot, collect and prune events
+                if state.wall_tracker is not None and state.dom.best_bid is not None:
+                    with state.dom._lock:
+                        _wt_bids     = dict(state.dom.bids)
+                        _wt_asks     = dict(state.dom.asks)
+                        _wt_best_bid = state.dom.best_bid
+                        _wt_best_ask = state.dom.best_ask
+                    _wt_events = state.wall_tracker.update(
+                        _wt_bids, _wt_asks, _wt_best_bid, _wt_best_ask, ts=now)
+                    if _wt_events:
+                        log_wall_events(_wt_events)
+                    prune_before = now - timedelta(minutes=WALL_BREAK_HOLD_MIN + 2)
+                    for evt in _wt_events:
+                        if (evt.event == "breakout"
+                                and WALL_MED_MIN <= evt.peak_size <= WALL_MED_MAX
+                                and evt.test_count >= WALL_BREAK_MIN_TESTS):
+                            state.recent_wall_breakouts.append(evt)
+                    state.recent_wall_breakouts = [
+                        e for e in state.recent_wall_breakouts
+                        if e.ts >= prune_before
+                    ]
+
                 if state.active_trade:
                     handle_active_trade(client, state, account_id, now, paper)
 
@@ -3063,6 +3477,9 @@ def run(account_id: int | None, paper: bool):
                 if state.active_sunday_gap_trade:
                     handle_active_sunday_gap_trade(client, state, account_id, now, paper)
 
+                if state.active_wall_break_trade:
+                    handle_active_wall_break_trade(client, state, account_id, now, paper)
+
                 # PL_Mom: fetch 5s bars when trade active (needed for PL exit check)
                 if state.active_pl_mom_trade and state.instrument.pl_mom_enabled:
                     fetch_pl_mom_bars(client, state)
@@ -3077,7 +3494,8 @@ def run(account_id: int | None, paper: bool):
                                and not state.active_slr_trade
                                and not state.active_pl_mom_trade
                                and not state.active_evening_trade
-                               and not state.active_sunday_gap_trade)
+                               and not state.active_sunday_gap_trade
+                               and not state.active_wall_break_trade)
                 last_bar_ts = state.bars[-1].ts if state.bars else None
 
                 # Don't enter new trades after TopstepX daily cutoff (RTH only)
@@ -3107,7 +3525,8 @@ def run(account_id: int | None, paper: bool):
                     if orb_sig:
                         place_orb_signal(client, state, orb_sig, account_id, paper)
 
-                if no_position and not past_cutoff and state.instrument.vwaslr_n > 0:
+                vwaslr_open_window = not ((9, 30) <= now_et_hm < (9, 40))  # block 9:30–9:40 ET open
+                if no_position and not past_cutoff and vwaslr_open_window and state.instrument.vwaslr_n > 0:
                     vwas_sig = evaluate_vwaslr(state)
                     vwaslr_bar_ts = state.vwaslr_bars[-1].ts if state.vwaslr_bars else None
                     if vwas_sig and vwaslr_bar_ts != state.vwaslr_last_ts:
@@ -3136,7 +3555,8 @@ def run(account_id: int | None, paper: bool):
                     _in_blackout(now_et_hm, sh, sm, eh, em)
                     for sh, sm, eh, em, _cond in state.instrument.blackout_windows
                 )
-                if no_position and not slr_past_cutoff and not slr_in_blackout and state.instrument.slr_enabled:
+                slr_open_window = not ((9, 30) <= now_et_hm < (9, 40))  # block 9:30–9:40 ET open
+                if no_position and not slr_past_cutoff and not slr_in_blackout and slr_open_window and state.instrument.slr_enabled:
                     slr_bar_ts = state.vwaslr_bars[-1].ts if state.vwaslr_bars else None
                     if slr_bar_ts != state.slr_last_bar_ts:
                         state.slr_last_bar_ts = slr_bar_ts
@@ -3171,6 +3591,12 @@ def run(account_id: int | None, paper: bool):
                             if pl_mom_sig:
                                 place_pl_mom_signal(client, state, pl_mom_sig,
                                                     account_id, paper, now)
+
+                # Wall Breakout signal: RTH only, 9:40–16:00 ET, no position
+                if no_position and not past_cutoff and (9, 40) <= now_et_hm < (16, 0):
+                    wb_sig = evaluate_wall_break(state, now)
+                    if wb_sig:
+                        place_wall_break_signal(client, state, wb_sig, account_id, paper)
 
             except Exception as e:
                 log.error(f"{state.instrument.symbol}: {e}", exc_info=True)
