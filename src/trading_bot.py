@@ -186,7 +186,9 @@ DOM_DB_STALE_S = 30   # seconds; DOM older than this is considered stale
 WALL_MED_MIN          = 100    # peak_size lower bound for "medium" wall
 WALL_MED_MAX          = 300    # peak_size upper bound for "medium" wall
 WALL_BREAK_MIN_TESTS  = 2      # minimum test_count at breakout to qualify
-WALL_BREAK_STOP_PTS   = 4.0   # hard stop distance in points
+WALL_BREAK_STOP_MIN   = 4.0   # stop floor in points (quiet markets)
+WALL_BREAK_STOP_MAX   = 5.0   # stop ceiling in points (volatile markets)
+# Actual stop = clamp(state.sigma_pts, WALL_BREAK_STOP_MIN, WALL_BREAK_STOP_MAX)
 WALL_BREAK_TARGET_PTS = 12.0  # profit target distance in points
 WALL_BREAK_HOLD_MIN   = 15    # max hold in minutes
 WALL_EXTEND_MIN       = 10    # minutes to extend VWASLR hold on qualifying breakout
@@ -2355,15 +2357,17 @@ def evaluate_wall_break(state, now: datetime) -> "WallBreakSignal | None":
             best_ask = state.dom.best_ask
         if best_bid is None or best_ask is None:
             continue
+        stop_pts = max(WALL_BREAK_STOP_MIN,
+                       min(state.sigma_pts, WALL_BREAK_STOP_MAX))
         if evt.side == "ask":   # ask wall broke → LONG
             direction = 1
             entry     = best_ask
-            stop      = entry - WALL_BREAK_STOP_PTS
+            stop      = entry - stop_pts
             target    = entry + WALL_BREAK_TARGET_PTS
         else:                   # bid wall broke → SHORT
             direction = -1
             entry     = best_bid
-            stop      = entry + WALL_BREAK_STOP_PTS
+            stop      = entry + stop_pts
             target    = entry - WALL_BREAK_TARGET_PTS
         return WallBreakSignal(
             direction=direction, entry=entry, stop=stop, target=target,
