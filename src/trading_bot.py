@@ -561,6 +561,7 @@ class BotInstrument:
     orb_entry_window_min: int   = 60
     orb_target_mult:      float = 1.0
     orb_gap_fade_long:    bool  = False
+    orb_full_range_stop:  bool  = False  # if True, stop at opposite ORB edge; default = half-range
     # VWASLR: 0 = disabled. n = look-back bars; threshold = signal level in σ/bar units.
     # vwaslr_start: earliest (hour, minute) ET for VWASLR signals (default 9:30 RTH open).
     vwaslr_n:         int   = 0
@@ -601,16 +602,17 @@ INSTRUMENTS = [
                   pl_mom_enabled=True, pl_mom_entry_pl=0.80, pl_mom_move_bps=8.0,
                   pl_mom_stop_bps=7.0, pl_mom_exit_pl=0.40),
     # MNQ: ORB-only re-enabled 2026-07-25; SLR/PL_MOM disabled (underperform MES).
-    # 10-min ORB, gap-fade-long only (LONG on gap-down days), 0.5× target.
-    # Backtest EV: +23–27 pts/trade, 65–69% WR over 77 sessions (Jun 2 – Jul 21 2026).
+    # 1-min ORB (9:30 bar), gap-fade-long only, full-range stop, 1× target.
+    # Backtest: EV +30 pts/trade, 76% WR, 21 trades (Apr–Jul 2026, 15-min entry window).
     BotInstrument("MNQ", "MNQ", tick_size=0.25, point_value=2.00,
                   blackout_windows=[
                       (16,  0,  9,  0, False),  # trade 09:00–16:00 ET only
                   ],
                   orb_enabled=True,
-                  orb_width_pct_min=0.002, orb_width_pct_max=0.010,
-                  orb_period_min=10, orb_entry_window_min=60,
-                  orb_target_mult=0.5, orb_gap_fade_long=True,
+                  orb_width_pct_min=0.001, orb_width_pct_max=0.010,
+                  orb_period_min=1, orb_entry_window_min=15,
+                  orb_target_mult=1.0, orb_gap_fade_long=True,
+                  orb_full_range_stop=True,
                   vwaslr_n=0,
                   slr_enabled=False,
                   pl_mom_enabled=False),
@@ -1512,35 +1514,41 @@ def _orb_window(bar_et: datetime) -> str | None:
 def evaluate_orb(state: InstrumentState) -> OrbSignal | None:
     """Update OrbState incrementally; return a new OrbSignal on qualifying breakout.
 
-    New logic (2026-07-25):
-    - Per-instrument ORB period (orb_period_min, must be multiple of TF_MINUTES).
-    - Stop = half ORB range (entry to ORB midpoint).
-    - Target = orb_width × orb_target_mult.
-    - Gap-fade-long filter: if orb_gap_fade_long, only fire LONG on days where
-      9:30 open < prior RTH close (gap-down opens).
-    - Width cap: orb_width_pct_max rejects unusually wide ranges.
-    - Entry window: [ORB complete time, ORB complete time + orb_entry_window_min).
-    - Only one trade per session (morning_fired).
+    Supports two bar-resolution modes:
+    - orb_period_min >= TF_MINUTES: uses state.bars (5-min bars); ORB = first N bars.
+    - orb_period_min < TF_MINUTES:  uses state.vwaslr_bars (1-min bars); ORB = 1 bar.
+      Requires vwaslr_bars to be fetched (done automatically for these instruments).
+
+    Stop: half ORB range by default; opposite ORB edge when orb_full_range_stop=True.
+    Target: orb_width × orb_target_mult.
+    Gap-fade-long filter: if orb_gap_fade_long, only LONG on gap-down sessions.
     """
-    if not state.bars:
+    inst = state.instrument
+
+    # ── Choose bar list based on ORB resolution ───────────────────────────────
+    use_1min = inst.orb_period_min < TF_MINUTES
+    if use_1min:
+        bar_list = state.vwaslr_bars   # 1-min bars (fetched when orb_period_min < TF_MINUTES)
+    else:
+        bar_list = state.bars           # 5-min bars
+    if not bar_list:
         return None
 
-    inst   = state.instrument
-    bar    = state.bars[-1]
+    bar    = bar_list[-1]
     bar_et = bar.ts.astimezone(ET)
     today  = bar_et.date()
     orb    = state.orb
 
     # ── Session reset ────────────────────────────────────────────────────────
     if orb.session_date != today:
-        # Save prior_rth_close: scan backwards for last RTH bar from previous session
-        prev_rth_close = orb.prior_rth_close  # carry forward if not found
-        for prev_bar in reversed(state.bars[:-1]):
+        # Find last RTH close from prior session (scan the appropriate bar list)
+        scan_list = state.vwaslr_bars if use_1min else state.bars
+        prev_rth_close = orb.prior_rth_close
+        for prev_bar in reversed(scan_list[:-1]):
             prev_et = prev_bar.ts.astimezone(ET)
             if prev_et.date() < today:
-                ph = prev_et.hour
-                pm = prev_et.minute
-                if (9, 30) <= (ph, pm) < (16, 0):
+                ph, pm = prev_et.hour, prev_et.minute
+                if 9 * 60 + 30 <= ph * 60 + pm < 16 * 60:
                     prev_rth_close = prev_bar.close
                     break
         orb.session_date    = today
@@ -1553,18 +1561,19 @@ def evaluate_orb(state: InstrumentState) -> OrbSignal | None:
         orb.orb_930_open    = 0.0
         orb.is_gap_down     = False
 
-    hm            = (bar_et.hour, bar_et.minute)
-    current_min   = hm[0] * 60 + hm[1]
-    orb_bars      = inst.orb_period_min // TF_MINUTES  # e.g. 15//5=3 or 10//5=2
+    current_min   = bar_et.hour * 60 + bar_et.minute
     orb_start_min = 9 * 60 + 30
     orb_end_min   = orb_start_min + inst.orb_period_min
+    # Number of bars that fit in the ORB accumulation window
+    bar_tf        = 1 if use_1min else TF_MINUTES
+    orb_bars      = max(1, inst.orb_period_min // bar_tf)
 
     # ── ORB accumulation window ───────────────────────────────────────────────
     if orb_start_min <= current_min < orb_end_min and not orb.orb_complete:
         if orb.orb_bars_seen == 0:
             orb.orb_high     = bar.high
             orb.orb_low      = bar.low
-            orb.orb_930_open = bar.open   # capture true 9:30 open for gap detection
+            orb.orb_930_open = bar.open   # true 9:30 open for gap detection
         else:
             orb.orb_high = max(orb.orb_high, bar.high)
             orb.orb_low  = min(orb.orb_low,  bar.low)
@@ -1584,8 +1593,7 @@ def evaluate_orb(state: InstrumentState) -> OrbSignal | None:
         return None
 
     # Entry window: from ORB complete until orb_entry_window_min minutes later
-    entry_cutoff_min = orb_end_min + inst.orb_entry_window_min
-    if current_min >= entry_cutoff_min:
+    if current_min >= orb_end_min + inst.orb_entry_window_min:
         return None
 
     # ── Width filter ─────────────────────────────────────────────────────────
@@ -1600,17 +1608,20 @@ def evaluate_orb(state: InstrumentState) -> OrbSignal | None:
     if state.sigma_pts <= 0:
         return None
 
+    # ── Stop and target sizing ────────────────────────────────────────────────
+    target_pts = orb_width * inst.orb_target_mult
+
     # ── LONG breakout ─────────────────────────────────────────────────────────
     if bar.close > orb.orb_high:
         if inst.orb_gap_fade_long and not orb.is_gap_down:
             return None  # gap-fade-long: only LONG on gap-down sessions
-        entry      = bar.close
-        stop_pts   = orb_width / 2.0   # stop at ORB midpoint
-        target_pts = orb_width * inst.orb_target_mult
+        entry    = bar.close
+        if inst.orb_full_range_stop:
+            stop = orb.orb_low              # opposite side of ORB range
+        else:
+            stop = entry - orb_width / 2.0  # half-range (ORB midpoint)
         sig = OrbSignal(
-            entry=entry,
-            target=entry + target_pts,
-            stop=entry   - stop_pts,
+            entry=entry, target=entry + target_pts, stop=stop,
             orb_high=orb.orb_high, orb_low=orb.orb_low,
             sigma_pts=state.sigma_pts, window="Morning", bar_ts=bar.ts,
             direction=1,
@@ -1622,13 +1633,13 @@ def evaluate_orb(state: InstrumentState) -> OrbSignal | None:
     if bar.close < orb.orb_low:
         if inst.orb_gap_fade_long:
             return None  # gap-fade-long mode is LONG-only
-        entry      = bar.close
-        stop_pts   = orb_width / 2.0
-        target_pts = orb_width * inst.orb_target_mult
+        entry    = bar.close
+        if inst.orb_full_range_stop:
+            stop = orb.orb_high             # opposite side of ORB range
+        else:
+            stop = entry + orb_width / 2.0  # half-range
         sig = OrbSignal(
-            entry=entry,
-            target=entry - target_pts,
-            stop=entry   + stop_pts,
+            entry=entry, target=entry - target_pts, stop=stop,
             orb_high=orb.orb_high, orb_low=orb.orb_low,
             sigma_pts=state.sigma_pts, window="Morning", bar_ts=bar.ts,
             direction=-1,
@@ -3496,7 +3507,12 @@ def run(account_id: int | None, paper: bool):
                 if state.instrument.sun_gap_enabled:
                     _update_sun_fri_close(state)
 
-                if state.instrument.vwaslr_n > 0 or state.instrument.slr_enabled or state.instrument.eve_enabled:
+                _needs_1min_bars = (state.instrument.vwaslr_n > 0
+                                    or state.instrument.slr_enabled
+                                    or state.instrument.eve_enabled
+                                    or (state.instrument.orb_enabled
+                                        and state.instrument.orb_period_min < TF_MINUTES))
+                if _needs_1min_bars:
                     cur_min = now.minute
                     _expected_1min = datetime.fromtimestamp(
                         (int(now.timestamp()) // 60) * 60 - 60, tz=timezone.utc)
