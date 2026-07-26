@@ -1,41 +1,59 @@
 """
-Automated trading bot for the 3σ MES/MNQ continuation signal.
+Automated trading bot — MES (6 strategies) and MNQ (ORB only).
 
-Monitors 5-min bars every 30 seconds, detects signals using the same criteria
-as signal_monitor.py, places market orders with native API bracket
-stops/targets, force-closes at 15-minute expiry if brackets not hit, and
-logs every trade outcome to logs/bot_trades.csv.
+Places market orders with native API bracket stops/targets. Only one open
+position per instrument at a time across all strategies.
 
-Signal types:
+Logs: bot_trades.csv (CSR), orb_trades.csv, vwaslr_trades.csv,
+      slr_trades.csv, pl_mom_trades.csv, wall_break_trades.csv
 
-  Primary (3σ CSR momentum) — 2σ bracket stop (safety net) + 0.5σ software trailing stop:
-  1. |bar_return / σ| ≥ 3.0   (σ = trailing 100-min close-return std dev)
-  2. Volume ≥ 1.5× trailing mean volume
-  3. 40-min CSR ≥ 1.5σ aligned with signal direction (momentum filter)
-  4. Not in instrument-specific blackout window
-  5. |scaled| ≤ 5.0 (extreme event filter)
+━━━ MES strategies ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  ORB (opening range breakout, MES/MNQ):
-  - 15-min opening range (9:30–9:45 ET); breakout in morning window (9:45–10:30 ET)
-  - ORB width ≥ instrument-specific wide-range cutoff (from backtest)
+  CSR (3σ momentum) — active 9:00–16:00 ET
+    Entry : 5-min bar return ≥ 3σ, volume ≥ 1.5× mean, 40-min CSR aligned
+    Stop  : 2σ bracket (safety net) + 0.5σ software trailing stop
+    Target: 3σ bracket; force-close after 25 min if neither hit
+    Filter: |scaled| ≤ 5.0 (blocks extreme-event spikes)
 
-  Evening Resumption (MES only):
-  - At 18:00 ET Mon–Fri, if |gap from last RTH close → first bar open| ≥ 0.2%,
-    enter in gap direction; pure 30-min time exit, no bracket orders
+  ORB (opening range breakout) — active 9:45–10:45 ET
+    Entry : First 5-min close outside 15-min opening range (9:30–9:45),
+            LONG only on gap-down days (9:30 open < prior RTH close),
+            ORB width 0.15%–0.50% of price
+    Stop  : ORB midpoint (half-range)
+    Target: 1× ORB width
 
-  Sunday Open Gap (MES only):
-  - At 18:00 ET Sunday (weekly Globex open), if |gap from Friday close → first
-    5-min bar open| ≥ 0.3% AND first-bar volume ≥ 1.5× median of prior 8 Sundays,
-    enter in gap direction; pure 30-min time exit, no bracket orders
-  - fri_close and Sunday vol history persisted to logs/sun_gap_state_MES.json
+  VWASLR (volume-weighted avg scaled log return) — active 9:00–16:00 ET
+    Entry : EMA-10 of 50-min VWASLR (σ=500-min) crosses ±0.4σ, 1-min bars
+    Stop  : 2σ bracket
+    Target: 3σ bracket
+    Exit  : EMA retracts to ±0.2σ (half-zero signal exit)
 
-  VWASLR (volume-weighted avg scaled log return, MES/MNQ):
-  - 1-min bars; EMA-10(VWASLR(50min, σ=500min)) crosses ±0.4σ
-  - MES/MNQ: active 8:30–16:00 ET (pre-open edge confirmed)
-  - Exit: EMA retracts below ±0.2σ (half-zero); bracket orders remain as safety net
-  - Separate incremental 1-min bar fetch (initial 565 bars, then new bars only each poll)
+  SLR Scalp (volume surge) — active 9:40–16:00 ET
+    Entry : 1-min bar: vol ≥ 7× rolling median, move ≥ 12bp
+    Stop  : 10bp
+    Target: 15bp; max hold 10 min
 
-Only one position per instrument at a time (all signal types share the lock).
+  PL_MOM (price linearity momentum) — active 9:40–16:00 ET
+    Entry : 5s bars: PL ≥ 0.80, price move ≥ 8bp (adaptive floor)
+    Stop  : 7bp
+    Exit  : PL drops below 0.40
+
+  Wall Break (DOM resting-order breakout) — active 9:40–16:00 ET
+    Entry : DOM wall (peak 100–300 lots, tested ≥ 2×) breaks out
+    Stop  : 4–5pt adaptive (clamped to trailing 100-min σ)
+    Target: 12pt; max hold 15 min
+
+━━━ MNQ strategies ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ORB (1-min opening range breakout) — active 9:31–9:46 ET
+    Entry : First 1-min close above 9:30 bar high,
+            LONG only on gap-down days (9:30 open < prior RTH close),
+            ORB width 0.10%–1.00% of price
+    Stop  : Opposite ORB edge (orb_low); full-range stop
+    Target: 0.75× ORB width
+    Backtest (Apr–Jul 2026): 86% WR, +32 pts EV, 21 trades
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 Usage:
   python src/trading_bot.py                  # live trading (requires .env)
