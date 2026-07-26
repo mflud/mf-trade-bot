@@ -611,7 +611,7 @@ INSTRUMENTS = [
                   orb_enabled=True,
                   orb_width_pct_min=0.001, orb_width_pct_max=0.010,
                   orb_period_min=1, orb_entry_window_min=15,
-                  orb_target_mult=1.0, orb_gap_fade_long=True,
+                  orb_target_mult=0.75, orb_gap_fade_long=True,
                   orb_full_range_stop=True,
                   vwaslr_n=0,
                   slr_enabled=False,
