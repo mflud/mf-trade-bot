@@ -112,11 +112,13 @@ VWASLR_TARGET_SIGMA = 3.0
 # Trail fires when price retraces TRAIL_SIGMA * sigma_pts from its peak.
 CSR_TRAIL_SIGMA    = 0.5   # tight — CSR momentum fades quickly after initial spike
 
-# ── ORB parameters (keep in sync with signal_monitor.py) ────────────────────
-ORB_BARS     = 3    # 3 × 5-min = 15-min opening range
-ORB_STOP_SIG = 2.0
-ORB_TGT_SIG  = 2.0  # 2σ:2σ → EV ≈ +0.61R
-ORB_WINDOWS  = [    # (start_h, start_m, end_h, end_m, label)
+# ── ORB parameters ──────────────────────────────────────────────────────────
+# Per-instrument: orb_period_min, orb_entry_window_min, orb_target_mult, orb_gap_fade_long
+# Stop = half ORB range (placed at ORB midpoint); Target = orb_width × orb_target_mult
+ORB_BARS     = 3    # kept for reference; actual period is per-instrument orb_period_min
+ORB_STOP_SIG = 2.0  # no longer used; half-range stop now
+ORB_TGT_SIG  = 2.0  # no longer used; orb_target_mult now
+ORB_WINDOWS  = [    # legacy; entry window now computed per-instrument
     (9,  45, 10, 30, "Morning"),
 ]
 
@@ -546,10 +548,19 @@ class BotInstrument:
     # Per-instrument blackout windows: (start_h, start_m, end_h, end_m, conditional)
     # conditional=True: block only when CSR < threshold; False: always block.
     blackout_windows: list = field(default_factory=list)
-    # ORB: set orb_enabled=True and orb_width_pct_min to wide-tertile cutoff from backtest.
-    # Width threshold is a fraction of ORB midpoint price (e.g. 0.00354 = 0.354%).
-    orb_enabled:       bool  = False
-    orb_width_pct_min: float = 0.0
+    # ORB: set orb_enabled=True and configure per-instrument parameters.
+    # orb_width_pct_min/max: ORB width as fraction of midpoint price.
+    # orb_period_min: how many minutes to accumulate ORB (must be multiple of TF_MINUTES).
+    # orb_entry_window_min: how long after ORB completes entries are allowed (minutes).
+    # orb_target_mult: target = orb_width × this; stop = half ORB range (at midpoint).
+    # orb_gap_fade_long: if True, only fire LONG entries on days where 9:30 open < prior RTH close.
+    orb_enabled:          bool  = False
+    orb_width_pct_min:    float = 0.0
+    orb_width_pct_max:    float = 1.0
+    orb_period_min:       int   = 15
+    orb_entry_window_min: int   = 60
+    orb_target_mult:      float = 1.0
+    orb_gap_fade_long:    bool  = False
     # VWASLR: 0 = disabled. n = look-back bars; threshold = signal level in σ/bar units.
     # vwaslr_start: earliest (hour, minute) ET for VWASLR signals (default 9:30 RTH open).
     vwaslr_n:         int   = 0
@@ -577,25 +588,32 @@ INSTRUMENTS = [
                   blackout_windows=[
                       (16,  0,  9,  0, False),  # trade 09:00–16:00 ET only
                   ],
-                  orb_enabled=True, orb_width_pct_min=0.00354,
+                  # ORB: 15-min range, gap-fade-long only (LONG on gap-down days),
+                  #   half-range stop, 1× target, 0.15%–0.5% width, 60-min entry window
+                  orb_enabled=True,
+                  orb_width_pct_min=0.0015, orb_width_pct_max=0.005,
+                  orb_period_min=15, orb_entry_window_min=60,
+                  orb_target_mult=1.0, orb_gap_fade_long=True,
                   vwaslr_n=50, vwaslr_threshold=0.4, vwaslr_start=(9, 0),
                   slr_enabled=True,
                   eve_enabled=False,
                   sun_gap_enabled=False,
                   pl_mom_enabled=True, pl_mom_entry_pl=0.80, pl_mom_move_bps=8.0,
                   pl_mom_stop_bps=7.0, pl_mom_exit_pl=0.40),
-    # MNQ disabled 2026-06-24: underperforms MES across SLR (-$320, 36% WR) and PL_MOM; focus on MES only
-    # BotInstrument("MNQ", "MNQ", tick_size=0.25, point_value=2.00,
-    #               csr_vol_windows=[(0.08, 4), (1.0, 8)],
-    #               blackout_windows=[
-    #                   (16,  0,  9,  0, False),  # trade 09:00–16:00 ET only
-    #               ],
-    #               orb_enabled=False,
-    #               vwaslr_n=0,
-    #               slr_enabled=True,
-    #               slr_vol_mult=15.0,            # raised from 7x: May analysis showed 7-10x MNQ signals have no edge
-    #               pl_mom_enabled=True,
-    #               pl_mom_stop_bps=8.0, pl_mom_exit_pl=0.20),
+    # MNQ: ORB-only re-enabled 2026-07-25; SLR/PL_MOM disabled (underperform MES).
+    # 10-min ORB, gap-fade-long only (LONG on gap-down days), 0.5× target.
+    # Backtest EV: +23–27 pts/trade, 65–69% WR over 77 sessions (Jun 2 – Jul 21 2026).
+    BotInstrument("MNQ", "MNQ", tick_size=0.25, point_value=2.00,
+                  blackout_windows=[
+                      (16,  0,  9,  0, False),  # trade 09:00–16:00 ET only
+                  ],
+                  orb_enabled=True,
+                  orb_width_pct_min=0.002, orb_width_pct_max=0.010,
+                  orb_period_min=10, orb_entry_window_min=60,
+                  orb_target_mult=0.5, orb_gap_fade_long=True,
+                  vwaslr_n=0,
+                  slr_enabled=False,
+                  pl_mom_enabled=False),
 ]
 
 
@@ -667,6 +685,9 @@ class OrbState:
     orb_bars_seen:   int   = 0
     orb_complete:    bool  = False
     morning_fired:   bool  = False
+    prior_rth_close: float = 0.0   # last RTH close of prior session (for gap-fade filter)
+    orb_930_open:    float = 0.0   # 9:30 first-bar open price (for gap detection)
+    is_gap_down:     bool  = False  # 9:30 open < prior_rth_close → qualify for gap-fade-long
 
 
 @dataclass
@@ -1489,77 +1510,127 @@ def _orb_window(bar_et: datetime) -> str | None:
 
 
 def evaluate_orb(state: InstrumentState) -> OrbSignal | None:
-    """Update OrbState incrementally; return a new OrbSignal on qualifying breakout."""
+    """Update OrbState incrementally; return a new OrbSignal on qualifying breakout.
+
+    New logic (2026-07-25):
+    - Per-instrument ORB period (orb_period_min, must be multiple of TF_MINUTES).
+    - Stop = half ORB range (entry to ORB midpoint).
+    - Target = orb_width × orb_target_mult.
+    - Gap-fade-long filter: if orb_gap_fade_long, only fire LONG on days where
+      9:30 open < prior RTH close (gap-down opens).
+    - Width cap: orb_width_pct_max rejects unusually wide ranges.
+    - Entry window: [ORB complete time, ORB complete time + orb_entry_window_min).
+    - Only one trade per session (morning_fired).
+    """
     if not state.bars:
         return None
 
+    inst   = state.instrument
     bar    = state.bars[-1]
     bar_et = bar.ts.astimezone(ET)
     today  = bar_et.date()
     orb    = state.orb
 
+    # ── Session reset ────────────────────────────────────────────────────────
     if orb.session_date != today:
-        orb.session_date   = today
-        orb.orb_high       = 0.0
-        orb.orb_low        = 0.0
-        orb.orb_bars_seen  = 0
-        orb.orb_complete   = False
-        orb.morning_fired  = False
+        # Save prior_rth_close: scan backwards for last RTH bar from previous session
+        prev_rth_close = orb.prior_rth_close  # carry forward if not found
+        for prev_bar in reversed(state.bars[:-1]):
+            prev_et = prev_bar.ts.astimezone(ET)
+            if prev_et.date() < today:
+                ph = prev_et.hour
+                pm = prev_et.minute
+                if (9, 30) <= (ph, pm) < (16, 0):
+                    prev_rth_close = prev_bar.close
+                    break
+        orb.session_date    = today
+        orb.orb_high        = 0.0
+        orb.orb_low         = 0.0
+        orb.orb_bars_seen   = 0
+        orb.orb_complete    = False
+        orb.morning_fired   = False
+        orb.prior_rth_close = prev_rth_close
+        orb.orb_930_open    = 0.0
+        orb.is_gap_down     = False
 
-    hm = (bar_et.hour, bar_et.minute)
+    hm            = (bar_et.hour, bar_et.minute)
+    current_min   = hm[0] * 60 + hm[1]
+    orb_bars      = inst.orb_period_min // TF_MINUTES  # e.g. 15//5=3 or 10//5=2
+    orb_start_min = 9 * 60 + 30
+    orb_end_min   = orb_start_min + inst.orb_period_min
 
-    if (9, 30) <= hm < (9, 30 + ORB_BARS * TF_MINUTES) and not orb.orb_complete:
+    # ── ORB accumulation window ───────────────────────────────────────────────
+    if orb_start_min <= current_min < orb_end_min and not orb.orb_complete:
         if orb.orb_bars_seen == 0:
-            orb.orb_high = bar.high
-            orb.orb_low  = bar.low
+            orb.orb_high     = bar.high
+            orb.orb_low      = bar.low
+            orb.orb_930_open = bar.open   # capture true 9:30 open for gap detection
         else:
             orb.orb_high = max(orb.orb_high, bar.high)
             orb.orb_low  = min(orb.orb_low,  bar.low)
         orb.orb_bars_seen += 1
-        if orb.orb_bars_seen >= ORB_BARS:
+        if orb.orb_bars_seen >= orb_bars:
             orb.orb_complete = True
+            if orb.prior_rth_close > 0 and orb.orb_930_open > 0:
+                orb.is_gap_down = orb.orb_930_open < orb.prior_rth_close
         return None
 
+    # ── Guards ────────────────────────────────────────────────────────────────
     if not orb.orb_complete:
         return None
-    if hm < (9, 30) or hm >= (16, 0):
+    if current_min < orb_start_min or current_min >= 16 * 60:
+        return None
+    if orb.morning_fired:
         return None
 
-    window = _orb_window(bar_et)
-    if window is None:
-        return None
-    if window == "Morning" and orb.morning_fired:
+    # Entry window: from ORB complete until orb_entry_window_min minutes later
+    entry_cutoff_min = orb_end_min + inst.orb_entry_window_min
+    if current_min >= entry_cutoff_min:
         return None
 
+    # ── Width filter ─────────────────────────────────────────────────────────
     orb_width     = orb.orb_high - orb.orb_low
     orb_mid       = (orb.orb_high + orb.orb_low) / 2.0
     orb_width_pct = orb_width / orb_mid if orb_mid > 0 else 0.0
-    if orb_width_pct < state.instrument.orb_width_pct_min:
+    if orb_width_pct < inst.orb_width_pct_min:
         return None
+    if orb_width_pct > inst.orb_width_pct_max:
+        return None
+
     if state.sigma_pts <= 0:
         return None
 
+    # ── LONG breakout ─────────────────────────────────────────────────────────
     if bar.close > orb.orb_high:
-        entry = bar.close
+        if inst.orb_gap_fade_long and not orb.is_gap_down:
+            return None  # gap-fade-long: only LONG on gap-down sessions
+        entry      = bar.close
+        stop_pts   = orb_width / 2.0   # stop at ORB midpoint
+        target_pts = orb_width * inst.orb_target_mult
         sig = OrbSignal(
             entry=entry,
-            target=entry + ORB_TGT_SIG * state.sigma_pts,
-            stop=entry   - ORB_STOP_SIG * state.sigma_pts,
+            target=entry + target_pts,
+            stop=entry   - stop_pts,
             orb_high=orb.orb_high, orb_low=orb.orb_low,
-            sigma_pts=state.sigma_pts, window=window, bar_ts=bar.ts,
+            sigma_pts=state.sigma_pts, window="Morning", bar_ts=bar.ts,
             direction=1,
         )
         orb.morning_fired = True
         return sig
 
+    # ── SHORT breakout — only when gap-fade-long is disabled ─────────────────
     if bar.close < orb.orb_low:
-        entry = bar.close
+        if inst.orb_gap_fade_long:
+            return None  # gap-fade-long mode is LONG-only
+        entry      = bar.close
+        stop_pts   = orb_width / 2.0
+        target_pts = orb_width * inst.orb_target_mult
         sig = OrbSignal(
             entry=entry,
-            target=entry - ORB_TGT_SIG * state.sigma_pts,
-            stop=entry   + ORB_STOP_SIG * state.sigma_pts,
+            target=entry - target_pts,
+            stop=entry   + stop_pts,
             orb_high=orb.orb_high, orb_low=orb.orb_low,
-            sigma_pts=state.sigma_pts, window=window, bar_ts=bar.ts,
+            sigma_pts=state.sigma_pts, window="Morning", bar_ts=bar.ts,
             direction=-1,
         )
         orb.morning_fired = True
@@ -1588,12 +1659,15 @@ def place_orb_signal(client: TopstepClient, state: InstrumentState,
         sig=sig, fired_at=sig.bar_ts,
     )
 
+    orb_width_pct = (sig.orb_high - sig.orb_low) / ((sig.orb_high + sig.orb_low) / 2) * 100
+    gap_tag = f"  gap_down={state.orb.is_gap_down}" if inst.orb_gap_fade_long else ""
     if paper:
         log.info(
             f"[PAPER] ORB {inst.symbol} {dir_label}  entry≈{sig.entry:.2f}  "
             f"target={sig.target:.2f} ({sig.target_pts():.2f}pts)  "
             f"stop={sig.stop:.2f} ({sig.stop_pts():.2f}pts)  "
             f"window={sig.window}  orb={sig.orb_low:.2f}–{sig.orb_high:.2f}"
+            f"  width={orb_width_pct:.2f}%{gap_tag}"
         )
     else:
         order_side = TopstepClient.BID if is_long else TopstepClient.ASK
@@ -1611,7 +1685,7 @@ def place_orb_signal(client: TopstepClient, state: InstrumentState,
         log.info(
             f"ORB ORDER  {inst.symbol} {dir_label}  order_id={trade.order_id}  "
             f"entry≈{sig.entry:.2f}  stop={stop_ticks}t  target={target_ticks}t  "
-            f"window={sig.window}"
+            f"window={sig.window}  width={orb_width_pct:.2f}%{gap_tag}"
         )
 
     state.active_orb_trade = trade
