@@ -1,5 +1,5 @@
 """
-5-Second Bar Recorder for MES and MYM.
+5-Second Bar Recorder for MES, MNQ, ES and NQ.
 
 Polls the TopstepX API every 60 seconds and appends new 5-second OHLCV bars
 to CSV files.  On first run it backfills all available history (~28 hours).
@@ -13,13 +13,14 @@ CSV columns:  ts, open, high, low, close, volume
   ts is UTC ISO-8601, e.g. 2026-03-14T14:30:05+00:00
 
 Usage:
-  python src/bar_recorder.py          # record MES + MYM
+  python src/bar_recorder.py          # record MES + MNQ + ES + NQ
   python src/bar_recorder.py --sym MES  # single instrument
 """
 
 import argparse
 import csv
 import logging
+import os
 import time
 from datetime import datetime, timedelta, timezone, time as dtime
 from pathlib import Path
@@ -41,7 +42,9 @@ BAR_SECONDS   = 5       # bar size
 
 INSTRUMENTS = {
     "MES": {"search": "MES", "file": "mes_hist_5sec.csv"},
-    "MYM": {"search": "MYM", "file": "mym_hist_5sec.csv"},
+    "MNQ": {"search": "MNQ", "file": "mnq_hist_5sec.csv"},
+    "ES":  {"search": "ES",  "file": "es_hist_5sec.csv"},
+    "NQ":  {"search": "NQ",  "file": "nq_hist_5sec.csv"},
 }
 
 CSV_FIELDS = ["ts", "open", "high", "low", "close", "volume"]
@@ -49,6 +52,15 @@ CSV_FIELDS = ["ts", "open", "high", "low", "close", "volume"]
 log = logging.getLogger("recorder")
 
 _CT = ZoneInfo("America/Chicago")
+_ET = ZoneInfo("America/New_York")
+
+# Active session: 09:00–17:00 ET only (17:00 ET = 14:00 MST).
+ACTIVE_ET_START = dtime(9,  0)
+ACTIVE_ET_END   = dtime(17, 0)
+
+def _in_active_session() -> bool:
+    t = datetime.now(_ET).time()
+    return ACTIVE_ET_START <= t < ACTIVE_ET_END
 
 def is_cme_weekend_closure() -> bool:
     """Return True during CME Globex weekend closure: Fri 16:00 CT – Sun 17:00 CT."""
@@ -122,8 +134,27 @@ def _append_bars(path: Path, bars: list[dict], after: datetime | None) -> int:
 
 # ── Recorder ─────────────────────────────────────────────────────────────────
 
+def _wait_for_session():
+    """Block until 08:30–17:00 ET on a Mon–Fri weekday, sleeping in 30-min chunks."""
+    while True:
+        now_et = datetime.now(_ET)
+        wd  = now_et.weekday()   # 0=Mon…4=Fri, 5=Sat, 6=Sun
+        hm  = (now_et.hour, now_et.minute)
+        if wd < 5 and (8, 30) <= hm < (17, 0):
+            return
+        target = now_et.replace(hour=8, minute=30, second=0, microsecond=0)
+        if hm >= (8, 30):
+            target += timedelta(days=1)
+        while target.weekday() >= 5:
+            target += timedelta(days=1)
+        wait = (target - now_et).total_seconds()
+        log.info(f"Outside session — sleeping {wait/3600:.1f}h until "
+                 f"{target.strftime('%a %H:%M ET')}")
+        time.sleep(min(wait, 1800))
+
+
 def record(symbols: list[str]):
-    wait_for_market_open()
+    _wait_for_session()
 
     client = TopstepClient()
     client.login()
@@ -173,13 +204,12 @@ def record(symbols: list[str]):
     # Continuous polling loop
     log.info(f"Polling every {POLL_SECONDS}s …  Ctrl-C to stop")
     while True:
-        if is_cme_weekend_closure():
-            wait_for_market_open()
-            # Re-login after weekend so the token is fresh
-            log.info("Market reopened — re-logging in …")
-            client.login()
-
         time.sleep(POLL_SECONDS)
+
+        if not _in_active_session():
+            log.info("17:00 ET — session ended, exiting cleanly")
+            os._exit(0)   # hard kill — sys.exit() can be caught by threads
+
         now = datetime.now(timezone.utc)
 
         for sym, st in states.items():
@@ -210,18 +240,20 @@ def record(symbols: list[str]):
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    from logging.handlers import RotatingFileHandler
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s  %(levelname)-7s  %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
         handlers=[
             logging.StreamHandler(),
-            logging.FileHandler("logs/recorder.log"),
+            RotatingFileHandler("logs/recorder.log",
+                                maxBytes=5 * 1024 * 1024, backupCount=2),
         ],
     )
     Path("logs").mkdir(exist_ok=True)
 
-    parser = argparse.ArgumentParser(description="5-second bar recorder for MES and MYM")
+    parser = argparse.ArgumentParser(description="5-second bar recorder for MES and MNQ")
     parser.add_argument("--sym", nargs="+", default=list(INSTRUMENTS.keys()),
                         choices=list(INSTRUMENTS.keys()),
                         help="Instrument(s) to record (default: all)")

@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.mf-trade-bot.bar-check</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/marek/mf-trade-bot/scripts/check_bar_collector.sh</string>
+    </array>
+
+    <!-- Run every 5 minutes, and catch up after wake from sleep -->
+    <key>StartInterval</key>
+    <integer>300</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/marek/mf-trade-bot/logs/bar_check.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/marek/mf-trade-bot/logs/bar_check.log</string>
+</dict>
+</plist>

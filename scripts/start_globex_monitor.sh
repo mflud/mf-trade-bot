@@ -13,5 +13,5 @@ fi
 cd "$REPO"
 export LANG=en_US.UTF-8
 export LC_ALL=en_US.UTF-8
-/usr/bin/screen -U -dmS "$SESSION" "$PYTHON" src/globex_monitor.py
+/usr/bin/screen -U -dmS "$SESSION" bash -c "$PYTHON src/globex_monitor.py 2>> $REPO/logs/globex_monitor.log"
 echo "$(date): started $SESSION" >> "$REPO/logs/cron.log"

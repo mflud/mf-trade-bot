@@ -1,6 +1,68 @@
 MES/MYM Systematic Signal Research — Journey Summary
 ======================================================
-Written: 2026-03-15  |  Updated: 2026-04-02
+Written: 2026-03-15  |  Updated: 2026-05-13
+
+
+LIVE SYSTEM OVERVIEW  (updated 2026-05-13)
+------------------------------------------
+The bot trades five strategies across two micro futures instruments on the
+TopstepX practice platform. All execution is via trading_bot.py; the monitors
+(signal_monitor.py, slr_monitor.py, globex_monitor.py) display signals but do
+not place orders.
+
+  Instruments: MES (Micro S&P 500), MNQ (Micro Nasdaq-100)
+  (MYM and M2K dropped 2026-05-05 after session analysis showed negative EV)
+
+  Trading window: 9:00 AM – 4:00 PM ET, Monday–Friday only
+  (Globex / overnight trading dropped 2026-05-05: session breakdown showed
+   CSR globex at 25% win rate / -17.95 avg pts; SLR MNQ globex -13.56 avg pts)
+
+  Strategy            Instruments   Window              Description
+  ─────────────────── ───────────── ─────────────────── ──────────────────────
+  CSR (3σ momentum)   MES, MNQ      9:00–16:00 ET       5-min bar ≥3σ + vol
+  ORB (opening range  MES           9:45–10:30 ET       Wide-range ORB filter
+    breakout)
+  VWASLR (EMA cross)  MES           9:00–16:00 ET       1-min EMA vol-weighted
+                                                        scaled return ±0.4σ
+  SLR Scalp           MES, MNQ      9:00–16:00 ET       1-min 7× vol + 12bp
+    (vol surge)
+  PL Momentum         MES, MNQ      9:00–16:00 ET       5s bar price linearity
+                                                        ≥0.7 + 12bp move
+
+  Trading cutoff: configurable via TRADING_CUTOFF_MST in .env
+    TopstepX default = 13:10 MST; Lucid = 13:45 MST; Tradeify = 13:59 MST
+
+  Background processes — session-gated 08:30–17:00 ET Mon–Fri:
+  ────────────────────────────── ─────────────────────────────────────────────
+  trading_bot          Places live orders (cron)
+  signal_monitor       Display: CSR / VWASLR / ORB / PL Mom panels (screen)
+  slr_monitor          Display: SLR / PL Mom / DOM / Positions / Sizing (screen)
+  globex_monitor       Monitors session conditions — informational (screen)
+  bar_collector        Writes 1-min + 5-min + 5s bars to bars.db (launchd)
+  bar_recorder         Writes 5s bars to CSV files (launchd)
+  dom_recorder         Records DOM snapshots to CSV (launchd)
+
+  All three launchd processes exit at 17:00 ET and restart at 08:30 ET,
+  giving exactly one TopstepX auth session per day (prevents "multiple
+  sessions" login conflicts).
+
+  Bar collection window: 09:00–17:00 ET (TopstepX data available until
+  17:00 ET = 14:00 MST).
+
+  Timezone: Phoenix/MST = UTC−7 (no DST); EDT = UTC−4; so ET = MST+3.
+    08:30 ET = 05:30 MST  |  17:00 ET = 14:00 MST
+
+  Cron schedule (MST/Phoenix times):
+    05:30–13:55 MST  Watchdog every 5 min: restarts crashed screen monitors + trading_bot
+    14:00 MST        Stops trading_bot, signal_monitor, slr_monitor (= 17:00 ET)
+    No overnight / weekend activity
+
+  Monitor display features (slr_monitor):
+    • Hybrid DOM: tick-by-tick near spread + aggregated buckets further out
+    • Visual bar charts on SLR vol ratio and PL linearity readings
+    • POSITIONS panel shows open contracts + strategy that opened them
+    • SIZING panel: lot sizes for $100–$600 risk at 2σ stop, from live sigma
+    • Trade Summary: last 24h trades across all strategies, MES + MNQ separate
 
 
 STARTING POINT
@@ -902,6 +964,36 @@ TWO POSSIBLE EXCEPTIONS (not yet implemented — require purpose-built approach)
      drift. Different from intraday momentum in both mechanism and required response time.
   Any future Globex strategy must account for thin book depth throughout.
 
+SHORT-N GLOBEX VWASLR TEST (2026-04-06)
+-----------------------------------------
+Script: src/backtest_vwaslr_globex.py
+Tested N = 10, 15, 20 min on 1-min bars during Globex hours. MES only.
+σ-window: 500 bars (same as production).  Thresholds: 0.1–0.5σ.
+Stop/target combos: (1.0/1.5), (1.0/2.0), (1.5/2.0), (1.5/3.0).
+
+KEY CONSTRAINT DISCOVERED: The 500-bar σ-window means no valid signals are
+possible until 500 minutes (~8.3 hrs) after each daily settlement gap
+(16:00–17:00 ET). Globex resumes at 17:00 ET, so the safe zone begins only
+at ~01:20 ET. The "evening" window (17:00–01:20 ET) yields zero valid signals.
+The tested signals are effectively from the 01:20–09:30 ET pre-dawn window.
+
+RESULTS:
+  - All combos with stop ≥ 1.5σ: consistently negative EV. Wide stops get
+    hit by thin-book noise before any continuation.
+  - stop=1.0 / target=1.5 or 2.0: marginally positive EV, but tiny:
+      Best overall: N=20, thr=±0.4, s=1.0/t=1.5 → EV=+0.029σ  (vs +0.091σ RTH)
+      N=10, thr=±0.2, s=1.0/t=2.0 → EV=+0.008σ
+  - Year-by-year is inconsistent — 2019 and 2023 are negative for most combos.
+  - No consistent long/short asymmetry.
+
+CONCLUSION: Not viable for production. EV is ~3–10× smaller than RTH VWASLR,
+inconsistent year-to-year, and only positive under tight stop parameters that
+leave little room for spread and slippage. Original Globex blackout stands.
+
+NOTE: To test the true post-close evening window (17:00–01:20 ET), a much
+shorter σ-window (50–100 bars) would be needed — sacrificing the stability
+that makes the production σ reliable.
+
 
 MFE / MAE ANALYSIS (2026-03-31)
 ---------------------------------
@@ -1127,8 +1219,96 @@ that works for MES has shown positive EV for MYM and M2K with minimal re-tuning,
 which is the hallmark of a structurally sound signal rather than an overfit one.
 
 
+VOLUME SURGE + SHALLOW PULLBACK (SLR_Scalp) (2026-04-06)
+----------------------------------------------------------
+Script: src/backtest_vol_surge_pullback.py
+Data:   mes_hist_1min.csv  (2,380,318 bars, 2019-05-05 – 2026-03-12)
+Instrument: MES only.
+
+PATTERN DESCRIPTION
+A discretionary pattern from Bookmap trading: a volume spike (N× rolling 20-bar
+median) produces a short directional move (≥ move_bps basis points), followed by
+a shallow pullback (1.5–4.5 bp of price). Entry at the end of the pullback bar;
+direction follows the initial surge direction.
+
+PARAMETERISATION
+Volume threshold:  5×, 6×, 7×, or 8× rolling 20-bar median
+Move threshold:    5, 8, 10, or 12 bp of current price
+Pullback window:   1.5–4.5 bp of current price (fixed)
+Stop:              3.0 points fixed
+Target:            15 bp or 20 bp of price (~10.0 pts / ~13.3 pts at MES ≈ 6640)
+Hold (time exit):  6, 8, 10, or 15 bars (minutes) after entry
+
+All thresholds in basis points so they scale correctly across the price history
+(MES ≈ 2900 in 2019 vs ≈ 6640 in 2026).
+
+RESULTS SUMMARY (all sessions, best hold per cell)
+
+  Target = 15bp (~10 pts):
+    vol    5bp      8bp     10bp     12bp
+    5×   +0.040  +0.054  +0.062  +0.082
+    6×   +0.069  +0.112  +0.140  +0.182
+    7×   +0.081  +0.129  +0.173  +0.229
+    8×   +0.085  +0.151  +0.197  +0.230    (pts/trade)
+
+  Target = 20bp (~13.3 pts):
+    vol    5bp      8bp     10bp     12bp
+    5×   +0.051  +0.072  +0.084  +0.100
+    6×   +0.079  +0.126  +0.152  +0.185
+    7×   +0.093  +0.147  +0.175  +0.226
+    8×   +0.103  +0.182  +0.214  +0.252    (pts/trade)
+
+Every combination is positive EV. All-sessions count for the tightest filter
+(vol≥8×, move≥12bp): n≈1,570 over 7 years (≈220/year, ≈1/day).
+
+RTH vs GLOBEX
+Both sessions show positive EV — opposite to VWASLR/CSR which are Globex-negative.
+The key difference: a volume surge is genuine order flow regardless of session.
+
+  RTH (target=20bp, hold=15b):
+    vol≥8×, move≥12bp → +0.346 pts/trade  (n=712)
+  Globex (target=20bp, hold=10b):
+    vol≥8×, move≥12bp → +0.252 pts/trade  (n=860)
+  Roughly 2:1 ratio RTH vs Globex absolute EV.
+
+RTH peaks at 15-bar hold (longer holds allow momentum to develop).
+Globex peaks at 6–10 bar hold (take it and go; thinner book).
+
+DIRECTION SPLIT (vol≥8×, move≥12bp)
+LONG strongly outperforms SHORT — consistent across all hold/target combos:
+  hold=15b, target=20bp:  LONG +0.435 pts   SHORT +0.048 pts
+  hold=10b, target=20bp:  LONG +0.376 pts   SHORT +0.129 pts
+  hold=10b, target=15bp:  LONG +0.368 pts   SHORT +0.093 pts
+
+The long/short asymmetry is the "elevator vs escalator" effect: sharp drops attract
+immediate counter-buyers; recoveries climb more slowly and persistently after a
+volume surge + shallow pullback.
+
+OUTCOME STRUCTURE
+P(tgt) is low (10–17% at 20bp target, 13–24% at 15bp target). The bulk of the
+EV comes from time-exit drift, not target hits. The 20bp target (~13.3 pts today)
+is ambitious; more time exits successfully drift in the right direction than reach
+that level. Consequence: reducing the hold period materially degrades EV.
+
+YEAR-BY-YEAR (vol≥8×, move≥12bp, hold=10b, target=20bp)
+  2019 +0.224  2020 +0.129  2021 +0.118  2022 +0.288
+  2023 -0.433  2024 +1.253  2025 +0.394  2026 +0.719
+2023 is the only loss year across all top combinations — consistent across every
+hold/target variant. All other 7 years are positive. 2024 is unusually strong.
+
+RECOMMENDED PARAMETERS FOR IMPLEMENTATION (SLR_Scalp)
+  RTH:    vol≥7×, move≥12bp, hold=15b, target=15bp, LONG-only for clearest edge
+  Globex: vol≥7-8×, move≥12bp, hold=10b, target=15bp
+
+Bi-directional operation is viable (both positive) but the long-only EV is ≈3–9×
+the short EV. If trading both directions, the short side should use a tighter hold.
+Status: not yet implemented in signal_monitor.py or trading_bot.py.
+
+
 WHAT REMAINS OPEN
 ------------------
+- SLR_Scalp implementation: add to signal_monitor.py (RTH) and globex_monitor.py
+  (Globex). Parameters from the backtest above. Execution in trading_bot.py.
 - 5-second bar analysis: insufficient data yet; revisit after several weeks of
   continuous recording.
 - Live signal performance tracking: bot trades logged to logs/bot_trades.csv,
@@ -1146,3 +1326,530 @@ WHAT REMAINS OPEN
   the same session, given the 0.67 correlation (particularly at NYSE hours r=0.78).
 - Sunday open / post-close Globex strategy: may have genuine edge (real order flow)
   but requires a purpose-built approach accounting for thin book depth.
+
+
+================================================================================
+SLR SCALP — 5-SECOND BAR BACKTEST (2026-05-02)
+================================================================================
+
+MOTIVATION
+----------
+1-min SLR generates only ~20-50 RTH trades/year per instrument (a few/month).
+Goal: generate a few trades/day by moving to shorter timeframes.
+5-second bars have been collected for MES since 2026-03-12 (~7 weeks as of
+2026-05-02). MNQ/ES/NQ collection started 2026-05-02.
+
+DATA
+----
+  MES 5s RTH bars: 156,265 bars  (2026-03-12 → 2026-05-01)
+  Script: python src/backtest_slr_5s.py
+  Source: mes_hist_5sec.csv (recorded by bar_recorder.py)
+
+METHODOLOGY
+-----------
+- Resample 5s bars to 15s (3× aggregate) and 20s (4× aggregate) OHLCV
+- Filter RTH only: 9:30–16:00 ET (after filtering CME settlement gap 21-22 UTC)
+- Signal: vol surge N× rolling 40-bar median (≈10-13 min lookback), bullish only
+- Move: WO2 = open[prev bar] → close[surge bar] ≥ M bp
+- Entry: IMMEDIATE — open of bar immediately after surge (no pullback wait)
+- Stop: 10bp (live-bot minimum)
+- Target: 15bp
+- Hold max: 8 bars at 15s (2 min), 6 bars at 20s (2 min)
+- Dedup: no overlapping trades within the hold window
+
+Note: this is opposite to 1-min backtest (which uses pullback→entry). Immediate
+entry is appropriate at these timeframes because the pullback phase at 15-20s
+resolution is too fast to catch reliably.
+
+RESULTS — 15s BARS
+-------------------
+52,095 15s RTH bars; 44 trades total after dedup
+
+  vol →        ≥5×              ≥7×              ≥9×              ≥11×
+  ─────────────────────────────────────────────────────────────────────
+  ≥8bp    +0.09bp/44n/1.2m  +0.26bp/32n/1.2m  -0.65bp/24n/1.3m  +0.47bp/15n/1.4m
+  ≥10bp   -1.29bp/32n/1.2m  -0.50bp/24n/1.1m  -1.25bp/19n/1.2m  -0.97bp/11n/1.3m
+  ≥12bp   +0.25bp/22n/0.9m  +0.65bp/18n/0.9m  -0.01bp/13n/0.9m      —
+  ≥14bp   +0.51bp/13n/0.8m  +0.27bp/10n/0.7m      —                  —
+
+  Best cells:
+    vol≥7×, move≥12bp: +0.65bp / 18 trades / 0.9m avg hold
+    vol≥7×, move≥8bp:  +0.26bp / 32 trades / 1.2m avg hold
+
+RESULTS — 20s BARS
+-------------------
+39,074 20s RTH bars; 48 trades total after dedup
+
+  vol →        ≥5×              ≥7×              ≥9×              ≥11×
+  ─────────────────────────────────────────────────────────────────────
+  ≥8bp    +1.63bp/48n/1.4m  -0.70bp/30n/1.4m  -1.76bp/19n/1.2m  -3.26bp/12n/1.4m
+  ≥10bp   +2.13bp/34n/1.3m  -0.43bp/22n/1.3m  -2.44bp/15n/1.2m      —
+  ≥12bp   +0.26bp/27n/1.1m  -0.43bp/17n/1.0m  -4.00bp/11n/0.9m      —
+  ≥14bp   -2.09bp/14n/0.8m  -2.20bp/11n/0.8m      —                  —
+
+  Best cells:
+    vol≥5×, move≥10bp: +2.13bp / 34 trades / 1.3m avg hold
+    vol≥5×, move≥8bp:  +1.63bp / 48 trades / 1.4m avg hold
+
+KEY OBSERVATIONS
+----------------
+1. Lower vol threshold (5-7×) beats higher (9-11×) at short timeframes.
+   At 15-20s resolution even moderate volume spikes carry signal.
+   Contrast with 1-min where vol≥7-8× was optimal.
+
+2. Avg hold ≈ 0.9-1.4 min — confirms intuition that a 15-20s surge is
+   followed by a ~1-2 min continuation.
+
+3. Trade frequency: ~1-2 RTH trades/day at tighter thresholds.
+   Getting close to the "few trades per day" goal vs. "few per month" at 1-min.
+
+4. Sample is small (7 weeks, 44-48 trades). Results are directionally
+   encouraging but not statistically conclusive.
+
+NEXT STEPS (revisit ~2026-05-22)
+---------------------------------
+- Rerun backtest_slr_5s.py on MES after 20 more trading days (~2× sample size)
+- Also run on MNQ/ES/NQ once they have a few weeks of 5s history
+- If results hold, consider candidate parameters:
+    20s bars, vol≥5×, move≥10bp — simple and highest EV so far
+    15s bars, vol≥7×, move≥12bp — tighter filter, faster fills
+- Do NOT deploy to live bot until sample is substantially larger
+
+
+================================================================================
+SLR SCALP — 5-SECOND BAR BACKTEST UPDATE (2026-05-02): ES & NQ 15-MONTH DATA
+================================================================================
+
+DATA SOURCE
+-----------
+mizu-trading GitHub repo (free): https://github.com/orgs/mizu-trading/repositories
+  - ES.FUT: 37 ndjson parts, Sep 2, 2024 → Dec 8, 2025
+  - NQ.FUT: 40 ndjson parts, Sep 2, 2024 → Dec 8, 2025
+  - Format: 1s OHLCV ndjson, converted to 5s CSV via src/convert_mizu_ndjson.py
+  - Stored: data/mizu/es/ and data/mizu/nq/
+
+Combined with existing bar_recorder data via merge_and_save() in converter.
+
+CONVERSION
+----------
+  es_hist_5sec.csv: 4,550,314 5s bars  (2024-09-02 → 2025-12-08)
+  nq_hist_5sec.csv: 4,479,522 5s bars  (2024-09-02 → 2025-12-08)
+  Script: python src/convert_mizu_ndjson.py
+
+BACKTEST PARAMETERS (same as initial MES run)
+----------------------------------------------
+  Stop=10bp, Target=15bp, immediate entry (no pullback), RTH only
+  15s: hold ≤ 8 bars (2 min); 20s: hold ≤ 6 bars (2 min)
+  Vol lookback: 40 bars (~10-13 min)
+  Script: python src/backtest_slr_5s.py --csv es_hist_5sec.csv
+
+RESULTS — ES (15 months, ~1 trade every 1-2 days at best thresholds)
+----------------------------------------------------------------------
+15s bars — 500,767 bars; 170 trades at widest threshold
+
+  vol →       ≥5×              ≥7×              ≥9×              ≥11×
+  ──────────────────────────────────────────────────────────────────────
+  ≥8bp   +0.80/170n/1.3m  +0.35/74n/1.3m   -1.28/42n/1.4m   +1.13/30n/1.4m
+  ≥10bp  +1.63/109n/1.1m  +1.58/50n/1.1m   +0.25/29n/1.3m   +1.29/26n/1.2m
+  ≥12bp  +1.30/81n/0.9m   +1.97/36n/0.9m   -0.23/22n/1.1m   +0.67/20n/1.1m
+  ≥14bp  +2.02/63n/0.8m   +2.92/29n/0.7m   -0.29/18n/0.9m   +0.28/17n/0.9m
+
+  Best cell (quality): vol≥7×, move≥14bp → +2.92bp / 29 trades / 0.7m avg hold
+  Best cell (volume):  vol≥5×, move≥10bp → +1.63bp / 109 trades / 1.1m avg hold
+
+20s bars — 375,663 bars; 157 trades at widest threshold
+
+  vol →       ≥5×              ≥7×              ≥9×              ≥11×
+  ──────────────────────────────────────────────────────────────────────
+  ≥8bp   +2.00/157n/1.3m  +0.95/64n/1.2m   +0.11/36n/1.2m   -1.26/22n/1.3m
+  ≥10bp  +1.66/103n/1.2m  -0.53/41n/1.0m   -2.51/23n/1.0m   -4.85/15n/1.2m
+  ≥12bp  +0.83/71n/1.0m   -0.42/35n/0.9m   -2.47/20n/0.9m   -4.93/13n/1.0m
+  ≥14bp  +0.67/56n/0.8m   -0.25/30n/0.8m   -3.11/18n/0.8m   -6.48/11n/0.8m
+
+  Best cell (robust): vol≥5×, move≥8bp → +2.00bp / 157 trades / 1.3m avg hold
+  Note: 20s edge concentrated at vol≥5× only; anything tighter goes negative
+
+RESULTS — NQ (15 months)
+--------------------------
+15s bars — 233 trades at widest threshold
+  Mostly flat to negative. Best: vol≥5×, move≥14bp → +1.56bp / 88 trades
+  vol≥7× and above: all negative across all move thresholds
+
+20s bars — 203 trades at widest threshold
+  Near-zero to negative. Best: vol≥5×, move≥14bp → +0.68bp / 72 trades
+  Generally worse than 15s
+
+NQ CONCLUSION: edge does not exist at these timeframes for NQ. Same vol-surge
+pattern that works on ES does not carry through on the Nasdaq index.
+
+RESULTS — MES (7 weeks, unchanged from prior run)
+--------------------------------------------------
+15s: best vol≥7×, move≥12bp → +0.65bp / 18 trades (consistent with ES direction)
+20s: best vol≥5×, move≥10bp → +2.13bp / 34 trades
+
+KEY CONCLUSIONS
+---------------
+1. ES has clear positive EV at 15s with vol≤7× and move≥10-14bp.
+   NQ does NOT — the strategy is ES-specific at this timeframe.
+
+2. 15s > 20s for ES: cleaner signal, less noise accumulation in the bar.
+   vol≥7×, move≥14bp gives highest EV per trade (+2.92bp) but only ~2 trades/month.
+   vol≥5×, move≥10bp is more practical: +1.63bp, ~1 trade every 2 RTH days.
+
+3. The vol threshold story reverses vs 1-min:
+   - 1-min: higher vol (7-8×) is better
+   - 5s/15s: moderate vol (5-7×) is better; ≥9× degrades or goes negative
+   This makes sense: at 1-min aggregation, high vol is a genuine crowd event;
+   at 15s, individual algo orders register as extreme vol without crowd follow-through.
+
+4. MES 7-week results are consistent directionally with ES 15-month results,
+   confirming the signal is real (ES=MES, same underlying).
+
+CANDIDATE LIVE PARAMETERS (ES, not yet deployed)
+-------------------------------------------------
+  Tier 1 (quality, rare): 15s bars, vol≥7×, move≥14bp
+    → +2.92bp EV, ~2 trades/month, 0.7m avg hold
+  Tier 2 (practical): 15s bars, vol≥5×, move≥10bp
+    → +1.63bp EV, ~1 trade/2 days, 1.1m avg hold
+  Do NOT use NQ at these timeframes.
+
+NEXT STEPS
+----------
+- Continue collecting MES/MNQ/ES/NQ 5s bars via bar_recorder
+- Consider running ES 15s backtest at finer move threshold granularity (11, 12, 13bp)
+  to find the knee of the EV vs frequency curve between 10bp and 14bp
+- MNQ: not yet tested; may have different characteristics to NQ due to smaller size
+  and different participant mix. Test once ~1 month of 5s MNQ data is available.
+- Before live deployment: validate on out-of-sample data (2026 bar_recorder data)
+
+=======================================================================
+PL MOMENTUM STRATEGY — VOL-GATED BACKTEST  (2026-05-02)
+=======================================================================
+Data:  ES/NQ mizu 1s → 5s  (Sep 2024 – Dec 2025, 15 months)
+Fixed: window=30s (6 bars), PL≥0.70, move≥12bp, exit_PL=0.40,
+       stop=10bp, min_hold=10s, max_hold=120s
+
+KEY FINDING: The strategy is genuine, vol-conditional — NOT calendar-specific.
+The roll-month clustering seen in monthly breakdowns is because high-vol days
+co-incide with expiry weeks. The rolling 20-day RVol gate isolates the regime
+directly: strategy works whenever macro vol is elevated, regardless of month.
+
+ROLLING 20-DAY REALISED VOL GATE SWEEP  (annualised %)
+-------------------------------------------------------
+Realised vol is computed daily from 5s log returns:
+  daily_rvol[d] = std(5s log returns on day d) × √4680 × 100
+  gate[d]       = mean of last 20 daily rvols
+Applied at entry time (per-bar); no look-ahead.
+
+ES  (4,550,314 bars)
+  RVol distrib:  p25=1.4%  p50=1.8%  p75=7.3%  p90=10.7%  max=16.2%
+
+  Gate    n       EV(bp)  win%  hold  active_days
+  ------------------------------------------------
+  none    12,733  +6.04   34%   13s   327
+  ≥2%     11,281  +6.84   34%   12s   153
+  ≥3%     10,310  +7.38   33%   12s   131
+  ≥4%      9,311  +7.73   34%   12s   123
+  ≥5%      8,675  +7.75   34%   12s   115
+  ≥6%      7,405  +8.26   34%   12s   104
+  ≥8%      4,180 +11.12   32%   10s    74  ← good balance
+  ≥10%     3,178 +10.54   32%   10s    48
+  ≥12%     1,844 +10.34   33%   10s    23
+
+  Direction at no gate:   LONG  5788n +7.45bp 40%  |  SHORT 6945n +4.87bp 30%
+  Direction at RVol≥5%:   LONG  3894n +9.52bp 40%  |  SHORT 4781n +6.31bp 28%
+  Direction at RVol≥8%:   LONG  1838n+12.98bp 40%  |  SHORT 2342n +9.67bp 26%
+
+NQ  (4,479,522 bars)
+  RVol distrib:  p25=1.0%  p50=1.3%  p75=8.5%  p90=10.8%  max=15.3%
+
+  Gate    n       EV(bp)  win%  hold  active_days
+  ------------------------------------------------
+  none    12,064  +8.19   39%   14s   311
+  ≥2%      9,501 +10.45   38%   13s   128
+  ≥3%      8,407 +11.46   38%   13s   111
+  ≥4%      7,688 +11.41   38%   13s   107
+  ≥5%      7,253 +11.80   38%   13s   103  ← good balance
+  ≥6%      5,941 +10.66   38%   14s    99
+  ≥8%      5,103 +10.71   39%   14s    91
+  ≥10%     1,514 +16.11   37%   12s    36
+  ≥12%       604 +23.99   36%    9s     6  (too thin — expiry days only)
+
+  Direction at no gate:   LONG  5575n +9.15bp 42%  |  SHORT 6489n +7.36bp 35%
+  Direction at RVol≥5%:   LONG  3391n+12.60bp 41%  |  SHORT 3862n+11.09bp 36%
+  Direction at RVol≥8%:   LONG  2416n+11.25bp 40%  |  SHORT 2687n+10.21bp 38%
+
+RECOMMENDED OPERATING POINTS
+-----------------------------
+ES:  RVol20 ≥ 8%  →  EV +11bp, ~4,200 trades / 15 months ≈ 280/mo on active days
+     74 of 327 days active (~23%)
+NQ:  RVol20 ≥ 5%  →  EV +11.8bp, ~7,300 trades / 15 months ≈ 490/mo on active days
+     103 of 311 days active (~33%)
+
+IMPORTANT OBSERVATIONS
+-----------------------
+1. Long edge > Short edge at all thresholds for both instruments.
+   ES at RVol≥8%: LONG +13.0bp (40% win) vs SHORT +9.7bp (26% win).
+   NQ at RVol≥5%: LONG +12.6bp (41% win) vs SHORT +11.1bp (36% win).
+   → Worth considering long-only mode or asymmetric sizing.
+
+2. Max hold analysis: 99%+ of trades exit via PL or stop (not time), confirming
+   the 120s max hold is not binding. The PL exit is the primary exit mechanism.
+
+3. NQ ≥12% case (+24bp) is only 6 active days — this is expiry-week noise.
+   Do not use ≥12% as an operating threshold.
+
+4. Win rate lower than expected (~33-40%) but EV is very high — the strategy is
+   win-rate-low / payout-high: winners are larger than losers.
+
+NEXT STEPS
+----------
+- Implement a rolling daily RVol tracker in the live bot or signal_monitor
+- Test combined ES+NQ portfolio at respective vol gates
+- Determine if RVol gate should use today's RVol or the 20-day rolling avg
+  (today's RVol is only known intraday and grows through the session)
+- Before live deployment: validate on 2026 bar_recorder data (out-of-sample)
+
+
+================================================================================
+SLR SCALP — 5-SECOND BAR BACKTEST UPDATE (2026-06-02)
+================================================================================
+
+DATA (updated from 2026-05-02 run)
+----
+  MES 5s RTH bars: 244,933 bars  (2026-03-12 → 2026-06-02)  [was 156,265 / 7 weeks]
+  MNQ 5s RTH bars:  96,301 bars  (2026-04-30 → 2026-06-02)  [new, ~5 weeks]
+  ES  5s RTH bars: 1,595,116 bars (2024-09-02 → 2026-06-02) [was 500,767 / mizu only]
+  MNQ only 5 weeks — too few trades for firm conclusions; directionally consistent.
+
+RESULTS — MES 15s bars (81,687 bars; 63 trades after dedup)
+-------------------------------------------------------------
+  vol →              ≥5×          ≥7×          ≥9×          ≥11×
+  ──────────────────────────────────────────────────────────────
+  ≥8bp     -0.01/63n/1.3m  +0.53/47n/1.3m  -0.09/36n/1.3m  +0.54/25n/1.4m
+  ≥10bp    -0.68/44n/1.2m  +0.24/34n/1.2m  -0.09/28n/1.2m  -0.31/19n/1.3m
+  ≥12bp    +0.34/31n/1.0m  +1.04/26n/1.0m  +0.74/21n/1.0m  -0.03/15n/1.1m
+  ≥14bp    +0.64/19n/0.9m  +0.52/16n/0.9m  -0.73/13n/1.0m       —
+
+  Best: vol≥7×, move≥12bp → +1.04bp / 26 trades (was +0.65bp / 18 trades) ✓ improving
+
+RESULTS — MES 20s bars (61,269 bars; 65 trades after dedup)
+-------------------------------------------------------------
+  vol →              ≥5×          ≥7×          ≥9×          ≥11×
+  ──────────────────────────────────────────────────────────────
+  ≥8bp     +2.24/65n/1.4m  +0.91/44n/1.4m  -0.02/30n/1.4m  -1.00/22n/1.5m
+  ≥10bp    +2.80/47n/1.3m  +1.19/33n/1.3m  +0.01/24n/1.3m  -0.42/17n/1.4m
+  ≥12bp    +1.39/35n/1.1m  +0.95/23n/1.0m  -1.87/16n/0.9m  -1.28/12n/1.1m
+  ≥14bp    +0.43/19n/0.8m  -0.19/15n/0.8m  -1.84/12n/0.7m       —
+
+  Best: vol≥5×, move≥10bp → +2.80bp / 47 trades (was +2.13bp / 34 trades) ✓ improving
+
+RESULTS — ES 15s bars (533,475 bars; 189 trades after dedup)
+-------------------------------------------------------------
+  vol →              ≥5×           ≥7×           ≥9×           ≥11×
+  ────────────────────────────────────────────────────────────────────
+  ≥8bp     +0.73/189n/1.3m  +0.62/85n/1.3m  -0.97/51n/1.4m  +0.42/38n/1.4m
+  ≥10bp    +1.48/122n/1.1m  +1.68/59n/1.2m  +0.13/36n/1.2m  +0.35/32n/1.2m
+  ≥12bp    +1.15/91n/0.9m   +1.94/44n/0.9m  -0.44/28n/1.1m  -0.52/25n/1.1m
+  ≥14bp    +1.81/70n/0.8m   +2.50/35n/0.8m  -1.09/22n/0.9m  -1.66/20n/0.9m
+
+  Best: vol≥7×, move≥14bp → +2.50bp / 35 trades (was +2.92bp / 29 trades; small decline)
+  vol≥7×, move≥10bp → +1.68bp / 59 trades — best trade frequency/EV balance on ES
+
+RESULTS — ES 20s bars (400,198 bars; 177 trades after dedup)
+-------------------------------------------------------------
+  vol≥5×, move≥8bp: +2.31bp / 177 trades (was +2.00bp) — edge persists
+
+RESULTS — MNQ 5 weeks (too few trades for firm conclusions)
+-------------------------------------------------------------
+  15s best: vol≥7×, move≥8bp → +3.13bp / 10 trades (barely meets 10-trade threshold)
+  20s: all cells below 10 trades at any threshold
+
+KEY OBSERVATIONS
+----------------
+1. Both MES candidate parameters strengthened with 12 weeks vs 7 weeks:
+   - 20s vol≥5× move≥10bp: +2.80bp (up from +2.13bp)
+   - 15s vol≥7× move≥12bp: +1.04bp (up from +0.65bp)
+   Both directionally consistent with ES 15-month data. Signal is real.
+
+2. ES 15s edge still present. Adding 6 months of live 2025-2026 data did not
+   degrade it materially. vol≥7× remains the sweet spot; ≥9× degrades.
+
+3. MNQ: 5 weeks / <15 trades per cell — inconclusive. Check again in 4 weeks.
+
+4. Sample size: MES 20s/vol≥5×/move≥10bp now at 47 trades. Trend encouraging.
+   Target: 100+ trades before live deployment consideration.
+
+CANDIDATE LIVE PARAMETERS (unchanged, confidence higher)
+---------------------------------------------------------
+  MES Tier 1: 20s bars, vol≥5×, move≥10bp → +2.80bp EV, ~1 trade/2 days
+  MES Tier 2: 15s bars, vol≥7×, move≥12bp → +1.04bp EV, ~1 trade/3 days
+  ES  Tier 1: 15s bars, vol≥7×, move≥14bp → +2.50bp EV, ~2 trades/month
+  ES  Tier 2: 15s bars, vol≥7×, move≥10bp → +1.68bp EV, ~1 trade/3 days
+
+NEXT STEPS
+----------
+- Continue collecting 5s bars; revisit MES when approaching 100 trades at Tier 1
+- Run MNQ again in ~4 weeks (expected ~10 weeks of data, more tradeable cells)
+- Run ES backtest at intermediate move thresholds (11, 12, 13bp) to find EV knee
+- Before live deployment: need ~100 trades at chosen parameters
+
+
+================================================================================
+SLR 1-MIN LIVE PERFORMANCE REVIEW (2026-06-02) — MAY REGRESSION ANALYSIS
+================================================================================
+
+SUMMARY
+-------
+  April 2026: 126 trades, +549pts, 52% WR, avg vol 35.4x
+  May   2026:  51 trades, -379pts, 35% WR, avg vol 17.0x
+  The May drawdown is almost entirely explained by low-vol-ratio signals.
+
+ROOT CAUSE: LOW VOL RATIO FILTER
+---------------------------------
+The live bot's vol threshold (≥7×) was unchanged, but the market microstructure
+shifted in May. April had frequent extreme vol spikes (50-250x) representing true
+crowd events; May's signals were predominantly 7-20x — barely above threshold.
+
+Impact of raising the vol ratio floor (all live trades Apr-Jun combined):
+  Floor  |  N   |    PnL    |  WR  | EV/trade
+  ≥7x    |  178 | +162.68pt |  47% |  +0.91pt
+  ≥10x   |  131 | +476.00pt |  51% |  +3.63pt
+  ≥15x   |   95 | +285.09pt |  52% |  +3.00pt
+  ≥20x   |   70 | +467.35pt |  59% |  +6.68pt
+  ≥30x   |   49 | +290.10pt |  59% |  +5.92pt
+
+At ≥20x vol floor, May shrinks from 51 trades → 10 trades, +24.64pts (from -379pts).
+At ≥15x vol floor, May shrinks from 51 trades → 16 trades, +2.21pts.
+This is not curve-fitting: April at ≥20x is also strongly positive (+442pts / 60 trades).
+
+MNQ MAY DETAIL
+--------------
+MNQ was the main culprit: 30 trades, -342pts, 23% WR.
+- May 4-6: 11 trades in 3 days (system firing on every 7-8x vol move)
+- Shorts dominated (17/30) and almost all stopped out
+- May was a strong bull month (US-China tariff truce ~May 12, ~10% ES/NQ rally)
+- Short signals at 7-10x vol into a strong uptrend have no edge
+
+RECOMMENDATION
+--------------
+Raise live bot vol threshold for the 1-min SLR strategy from 7× to 15-20×.
+This would:
+  - Reduce trade frequency by ~40-45% (acceptable)
+  - Improve WR from 47% to ~52-59%
+  - Improve EV per trade from +0.91 to +3-6pt
+  - Dramatically reduce drawdown in low-vol / choppy/trending months
+
+Option: MNQ-specific threshold ≥15-20x (MES at ≥7x was still modestly positive in May).
+
+NEXT STEPS
+----------
+- Decide vol floor: global ≥15x or MNQ-specific ≥15x / MES keep ≥7x
+- If raising: update trading_bot.py vol filter and monitor for 1 month
+
+
+================================================================================
+DOM IMBALANCE IC STUDY (2026-06-02) — MES, RTH, 5-min snapshots
+================================================================================
+
+DATA
+----
+  MES DOM snapshots: 13,490 rows total (Mar 20 → Jun 2, 5-min intervals)
+  RTH only (09:30–16:00 ET): 4,177 usable rows with valid mid price
+  Features: L1/L5/L10 bid-ask imbalance, total bid/ask depth, max wall size
+             and distance each side (10 DOM levels captured)
+  Target: forward mid-price return at +5min / +10min / +15min
+  Script: python src/backtest_dom_ic.py
+
+METHOD
+------
+  Spearman IC, win rate (sign agreement), and quintile spread (top vs bottom 20%)
+  for each DOM feature vs each forward return horizon.
+  Wall proximity study: bucket analysis of wall distance vs forward return.
+
+RESULTS SUMMARY
+---------------
+
+1. IMBALANCE FEATURES — NO PREDICTIVE VALUE
+
+   All bid-ask imbalance metrics (L1, L5, L10, net depth) have essentially
+   zero predictive power for 5-15min forward returns:
+
+     Feature       +5min IC    WR      +10min IC   WR
+     L1 imbalance  +0.003      50.2%   +0.010      50.2%
+     L5 imbalance  -0.006      49.3%   +0.000      49.6%
+     L10 imbalance -0.003      49.3%   -0.022      49.0%
+     Net depth L10 -0.003      49.3%   -0.022      49.0%
+
+   Win rates hover at 49-50% — no better than a coin flip.
+   The decile breakdown for L10 imbalance is non-monotonic (noise):
+     Most imbalanced bid (D1, <-0.14): -0.35bp avg fwd return
+     Moderate bid imbalance (D2):       +0.77bp  ← reversal, not continuation
+     No monotonic pattern at all.
+
+   CONCLUSION: Imbalance at 5-min snapshot granularity has no edge.
+   This is probably not surprising — by the time a 5-min bar closes,
+   the fast DOM signals have already been arbitraged away.
+
+2. WALL FEATURES — WEAK SIGNAL, COUNTERINTUITIVE DIRECTION
+
+   Bid wall distance vs +5min forward return (by distance bucket):
+     Wall dist      N       Avg ret    WR
+     <0.5 pts      719     -0.44bp   46.5%   ← BEARISH (not bullish support)
+     0.5–1 pts     950     +0.15bp   49.7%
+     1–2 pts     1,611     +0.65bp   50.3%
+     2–4 pts       750     +0.66bp   50.8%
+
+   Ask wall distance vs +5min forward return:
+     Wall dist      N       Avg ret    WR
+     <0.5 pts      745     +0.24bp   49.0%   (expected reversal — not found)
+     0.5–1 pts     954     +0.81bp   49.8%   (best return — counterintuitive)
+     1–2 pts     1,556     +0.26bp   49.7%
+     2–4 pts       773     +0.02bp   49.3%
+
+   Overall RTH baseline: +0.35bp avg, 47.9% WR (strong MES bull trend this period)
+
+3. KEY FINDING: BID WALL VERY CLOSE = BEARISH, NOT BULLISH
+
+   When a large bid wall sits within 0.5 pts of mid, the next 5-min return is
+   -0.44bp with WR=46.5% — the WORST bucket. Explanation: a bid wall being
+   tested/very close to current price signals sellers are pushing into support.
+   When that support level is being actively defended (wall close), it frequently
+   fails, and price drops further. This is the opposite of naive intuition.
+
+   Ask wall proximity does NOT produce a clean reversal signal — the 0.5-1pt
+   bucket actually has the BEST return (+0.81bp), not the worst.
+
+4. EXTENDED DEPTH (L5-L10) ADDS NO INFORMATION OVER L1
+
+   L1, L5, and L10 imbalance all have similarly negligible IC. Capturing 10
+   levels provides richer ML training data for the future, but the extra 5-10
+   levels don't improve the 5-min forward return signal beyond L1 alone.
+
+CONCLUSIONS
+-----------
+1. 5-min snapshot DOM data is the wrong granularity for imbalance signals.
+   DOM dynamics operate on sub-second to few-second timescales. By the time
+   we record a 5-min snapshot, any fast order book information is stale.
+
+2. The only actionable finding: bid wall close (<0.5 pts from mid) is a
+   weak bearish signal. Could be used as a LONG entry caution flag.
+
+3. The right use of DOM data is NOT regular-interval snapshots, but rather:
+   - Point-in-time DOM at the exact moment a signal fires (SLR, PL_Mom, VWASLR)
+   - Use DOM state as a signal gate: "don't take this LONG if there's a large
+     ask wall within 1pt of entry"
+   Continue collecting snapshots for future ML experiments with more data.
+
+4. Statistical power note: ~4,000 RTH rows spread over 10 weeks is adequate
+   for IC studies, but the bull trend (MES +20% in the period) creates a
+   positive drift that contaminates all conditional averages.
+
+NEXT STEPS
+----------
+- Implement point-in-time DOM capture at signal fire time (not just 5-min intervals)
+  This would allow: "did the SLR surge happen when the DOM was supporting the move?"
+- Once we have 6+ months of DOM data, re-run with more observations and a
+  more neutral market period for cleaner conditioning
+- Test bid-wall-close as an SLR LONG filter: skip LONG if bid_wall_dist < 0.5 pts
+

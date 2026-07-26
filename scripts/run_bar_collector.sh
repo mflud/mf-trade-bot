@@ -1,26 +1,17 @@
 #!/usr/bin/env bash
 # ──────────────────────────────────────────────────────────────────────────────
-# run_dom_recorder.sh  —  Runs dom_client.py --record and auto-restarts on exit.
+# run_bar_collector.sh  —  Runs bar_collector.py with auto-restart on exit.
 #
-# Usage:
-#   ./scripts/run_dom_recorder.sh &          # background, logs to logs/dom_recorder.log
-#   nohup ./scripts/run_dom_recorder.sh &    # survives terminal close
-#
-# Stop it:
-#   kill $(cat logs/dom_recorder.pid)
+# Managed by launchd via com.mf-trade-bot.bar-collector.plist.
+# launchd provides outer KeepAlive; this wrapper adds exponential back-off so
+# rapid crash loops don't hammer the API.
 # ──────────────────────────────────────────────────────────────────────────────
 
 set -uo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LOG_FILE="$REPO_DIR/logs/dom_recorder.log"
-PID_FILE="$REPO_DIR/logs/dom_recorder.pid"
-
-# Conda env name
-CONDA_ENV="topstep-project"
-
-# dom_client arguments — edit as needed
-DOM_ARGS="--record --record-interval 5"
+LOG_FILE="$REPO_DIR/logs/bar_collector.log"
+PYTHON=/Library/Frameworks/Python.framework/Versions/3.12/bin/python3
 
 # Restart back-off: wait this many seconds between restarts (doubles after each
 # consecutive fast failure, resets after a stable run of STABLE_SECS seconds).
@@ -37,36 +28,10 @@ log() {
 # ── Setup ─────────────────────────────────────────────────────────────────────
 
 cd "$REPO_DIR"
-echo $$ > "$PID_FILE"
-log "Wrapper started (PID=$$)  env=$CONDA_ENV  args: $DOM_ARGS"
-log "Logs → $LOG_FILE   PID file → $PID_FILE"
+log "Wrapper started (PID=$$)"
 
-# Locate conda — launchd doesn't load shell profiles so we search common paths
-CONDA_BASE=""
-for candidate in \
-    "$HOME/anaconda3" \
-    "$HOME/miniconda3" \
-    "$HOME/opt/anaconda3" \
-    "$HOME/opt/miniconda3" \
-    "/opt/anaconda3" \
-    "/opt/miniconda3" \
-    "/usr/local/anaconda3" \
-    "/usr/local/miniconda3"; do
-    if [ -f "$candidate/etc/profile.d/conda.sh" ]; then
-        CONDA_BASE="$candidate"
-        break
-    fi
-done
-
-if [ -z "$CONDA_BASE" ]; then
-    log "ERROR: could not locate conda installation — tried common paths"
-    exit 1
-fi
-
-log "Using conda at $CONDA_BASE"
-# shellcheck source=/dev/null
-source "$CONDA_BASE/etc/profile.d/conda.sh"
-conda activate "$CONDA_ENV"
+export LANG=en_US.UTF-8
+export LC_ALL=en_US.UTF-8
 
 # ── Restart loop ──────────────────────────────────────────────────────────────
 
@@ -92,20 +57,13 @@ while true; do
     start_ts=$(date +%s)
     log "── Attempt $attempt ─────────────────────────────────────────────"
 
-    # Run; capture exit code without triggering set -e
-    python -u src/dom_client.py $DOM_ARGS >> "$LOG_FILE" 2>&1 || true
+    "$PYTHON" -u src/bar_collector.py >> "$LOG_FILE" 2>&1 || true
 
     exit_code=$?
     end_ts=$(date +%s)
     elapsed=$((end_ts - start_ts))
     log "Process exited (code=$exit_code) after ${elapsed}s"
 
-    # Keep log from growing unbounded — trim to last 5000 lines on each restart
-    if [ -f "$LOG_FILE" ]; then
-        tail -5000 "$LOG_FILE" > "${LOG_FILE}.tmp" && mv "${LOG_FILE}.tmp" "$LOG_FILE"
-    fi
-
-    # If it ran stably for a while, reset back-off
     if [ "$elapsed" -ge "$STABLE_SECS" ]; then
         backoff=$MIN_BACKOFF
         log "Ran >${STABLE_SECS}s — resetting back-off to ${backoff}s"

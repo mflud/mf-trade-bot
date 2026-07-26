@@ -30,12 +30,14 @@ import databento as db
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
-DBN_DEFAULT = "glbx-mdp3-20100606-20260312.ohlcv-1m.dbn.zst"
+DBN_DEFAULT = "glbx-mdp3-20190606-20260501.ohlcv-1m.dbn.zst"
 
 # (output csv, expiry_fn key)
 INSTRUMENTS = {
     "MES": ("mes_hist_1min.csv", "third_friday"),
     "MNQ": ("mnq_hist_1min.csv", "third_friday"),
+    "ES":  ("es_hist_1min.csv",  "third_friday"),
+    "NQ":  ("nq_hist_1min.csv",  "third_friday"),
     "MYM": ("mym_hist_1min.csv", "third_friday"),
     "M2K": ("m2k_hist_1min.csv", "third_friday"),
     "NKD": ("nkd_hist_1min.csv", "second_friday"),

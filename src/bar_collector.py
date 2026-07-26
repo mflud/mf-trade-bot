@@ -494,7 +494,7 @@ class SignalRConn:
                 # (12:30 UTC) the next morning.
                 now_utc = datetime.now(timezone.utc)
                 h, m = now_utc.hour, now_utc.minute
-                in_session = (13, 0) <= (h, m) < (21, 0)
+                in_session = (12, 30) <= (h, m) < (21, 0)
                 if not in_session:
                     # Resume at 12:30 UTC (= 08:30 ET) today or tomorrow
                     resume = now_utc.replace(hour=12, minute=30, second=0, microsecond=0)

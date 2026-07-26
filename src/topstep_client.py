@@ -7,6 +7,7 @@ import os
 import time
 import threading
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Literal
 import httpx
 from dotenv import load_dotenv
@@ -14,6 +15,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 BASE_URL = "https://api.topstepx.com"
+
+# Shared token file — bar_collector writes this on login so all other processes
+# can read the same token without each calling loginKey (which creates new sessions).
+_SHARED_TOKEN_FILE = Path("data/auth_token.txt")
 
 # Process-level rate limiter: ensures a minimum gap between outgoing API requests.
 # Serialises concurrent threads (e.g. signal_monitor's ThreadPoolExecutor) so they
@@ -31,7 +36,7 @@ class TopstepClient:
         self._client = httpx.Client(base_url=BASE_URL, timeout=60)
 
     def login(self) -> str:
-        """Authenticate and store the session token. Returns the token."""
+        """Authenticate and store the session token. Writes token to shared file."""
         resp = self._client.post(
             "/api/Auth/loginKey",
             json={"userName": self.username, "apiKey": self.api_key},
@@ -44,7 +49,34 @@ class TopstepClient:
 
         self.token = data["token"]
         self._client.headers["Authorization"] = f"Bearer {self.token}"
+        # Write to shared file so other processes read this token without calling loginKey
+        try:
+            _SHARED_TOKEN_FILE.parent.mkdir(exist_ok=True)
+            _SHARED_TOKEN_FILE.write_text(self.token)
+        except Exception:
+            pass
         return self.token
+
+    def use_shared_token(self, timeout: int = 120) -> str:
+        """Read the token written by bar_collector instead of calling loginKey.
+
+        Waits up to `timeout` seconds for the file to appear (bar_collector may
+        still be starting up).  Rejects tokens older than 20 hours (stale from
+        a prior session).  Falls back to a direct login() call if unavailable.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if _SHARED_TOKEN_FILE.exists():
+                age = time.time() - _SHARED_TOKEN_FILE.stat().st_mtime
+                if age < 20 * 3600:   # reject tokens from a prior session
+                    token = _SHARED_TOKEN_FILE.read_text().strip()
+                    if token:
+                        self.token = token
+                        self._client.headers["Authorization"] = f"Bearer {token}"
+                        return token
+            time.sleep(5)
+        # Fallback: call loginKey directly (bar_collector may not be running)
+        return self.login()
 
     def get_accounts(self) -> list[dict]:
         """Return all active practice/combine accounts."""
@@ -356,6 +388,92 @@ class TopstepClient:
 
     def __exit__(self, *_):
         self._client.close()
+
+
+# ── Bar DB reader (used by signal_monitor / trading_bot when bar_collector runs) ──
+
+import sqlite3 as _sqlite3
+from pathlib import Path as _Path
+
+BARS_DB = _Path("data/bars.db")
+
+
+def get_bars_from_db(symbol: str, minutes: int, limit: int = 600) -> list[dict]:
+    """
+    Read the most recent `limit` completed bars for `symbol` from the shared
+    SQLite bar database written by bar_collector.py.
+
+    Returns a list of dicts (keys: t, o, h, l, c, v) in ascending time order,
+    same format as TopstepClient.get_bars() so callers are interchangeable.
+
+    Returns [] if the DB doesn't exist (bar_collector not running).
+    """
+    if not BARS_DB.exists():
+        return []
+    try:
+        conn = _sqlite3.connect(str(BARS_DB), check_same_thread=False)
+        conn.row_factory = _sqlite3.Row
+        rows = conn.execute("""
+            SELECT ts, open, high, low, close, volume
+            FROM bars
+            WHERE symbol = ? AND minutes = ?
+            ORDER BY ts DESC
+            LIMIT ?
+        """, (symbol, minutes, limit)).fetchall()
+        conn.close()
+        # Reverse to ascending order, matching get_bars() convention
+        return [
+            {"t": r["ts"], "o": r["open"], "h": r["high"],
+             "l": r["low"],  "c": r["close"], "v": r["volume"]}
+            for r in reversed(rows)
+        ]
+    except Exception:
+        return []
+
+
+def get_5s_bars_from_db(symbol: str, limit: int = 60) -> list[dict]:
+    """
+    Read the most recent `limit` completed 5-second bars for `symbol` from
+    the bars5s table written by bar_collector.py.
+
+    Returns a list of dicts (keys: t, o, h, l, c, v) in ascending time order,
+    same format as TopstepClient.get_bars(). Returns [] if table doesn't exist.
+    """
+    if not BARS_DB.exists():
+        return []
+    try:
+        conn = _sqlite3.connect(str(BARS_DB), check_same_thread=False)
+        conn.row_factory = _sqlite3.Row
+        rows = conn.execute("""
+            SELECT ts, open, high, low, close, volume
+            FROM bars5s
+            WHERE symbol = ?
+            ORDER BY ts DESC
+            LIMIT ?
+        """, (symbol, limit)).fetchall()
+        conn.close()
+        return [
+            {"t": r["ts"], "o": r["open"], "h": r["high"],
+             "l": r["low"],  "c": r["close"], "v": r["volume"]}
+            for r in reversed(rows)
+        ]
+    except Exception:
+        return []
+
+
+def bars_db_available() -> bool:
+    """Return True if bar_collector is writing to the DB (DB exists and is recent).
+    Checks both the main DB and WAL file since SQLite WAL mode writes to the WAL
+    first and the main file mtime may lag behind."""
+    if not BARS_DB.exists():
+        return False
+    import time
+    t = time.time()
+    ages = [t - BARS_DB.stat().st_mtime]
+    wal = _Path(str(BARS_DB) + "-wal")
+    if wal.exists():
+        ages.append(t - wal.stat().st_mtime)
+    return min(ages) < 120
 
 
 if __name__ == "__main__":
