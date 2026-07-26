@@ -75,7 +75,8 @@ def _load_all() -> list[dict]:
                             vw = float(r.get("vwaslr", 0) or 0)
                             detail = f"vw={vw:.2f}"
                         elif strat == "ORB":
-                            detail = "ORB"
+                            w = float(r.get("orb_width", 0) or 0)
+                            detail = f"w={w:.2f}pt" if w else "ORB"
                         else:
                             detail = ""
 
