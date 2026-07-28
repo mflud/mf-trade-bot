@@ -168,7 +168,7 @@ PL_MOM_ENTRY_PL        = 0.70
 PL_MOM_MOVE_BPS        = 12.0   # fixed floor (used when sigma not available)
 PL_MOM_EXIT_PL         = 0.40
 PL_MOM_STOP_BPS        = 10.0
-PL_MOM_MIN_HOLD_S      = 10     # seconds before PL exit is checked (stop always active)
+PL_MOM_MIN_HOLD_S      = 30     # seconds before PL exit is checked (stop always active)
 PL_MOM_MAX_HOLD_S      = 120
 PL_MOM_5S_FETCH        = 130    # 5s bars to fetch: covers sigma lookback (120) + window (6) + margin
 PL_MOM_SIGMA_N         = 3.0    # move threshold = max(move_bps_floor, sigma_n × σ_30s_bps)
