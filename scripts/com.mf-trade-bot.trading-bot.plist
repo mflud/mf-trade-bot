@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.mf-trade-bot.trading-bot</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/marek/mf-trade-bot/scripts/start_trading_bot.sh</string>
+    </array>
+
+    <!-- 9:20 AM ET = 6:20 AM MST (Phoenix, UTC-7, no DST) Mon–Fri -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>6</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>6</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>6</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>6</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>6</integer><key>Minute</key><integer>20</integer></dict>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/marek/mf-trade-bot</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/marek/mf-trade-bot/logs/cron.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/marek/mf-trade-bot/logs/cron.log</string>
+</dict>
+</plist>
