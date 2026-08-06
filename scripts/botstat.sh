@@ -15,8 +15,7 @@ check() {
 screen_check() {
     local name=$1
     local session=$2
-    local pattern=$3
-    if /usr/bin/screen -list | grep -q "$session" || pgrep -f "$pattern" > /dev/null 2>&1; then
+    if /usr/bin/screen -list | grep -q "$session"; then
         echo "  [UP]   $name"
     else
         echo "  [DOWN] $name"
@@ -31,10 +30,10 @@ if [ -f "$REPO/logs/bot.disabled" ]; then
     echo ""
 fi
 echo "--- Processes ---"
-screen_check "bar_collector " "bar_collector" "bar_collector.py"
-screen_check "mes_monitor   " "mes_monitor" "mes_monitor.py"
-screen_check "trading_bot   " "trading_bot" "trading_bot.py"
-check        "bar_recorder  " "bar_recorder"
+check        "bar_collector " "bar_collector.py"
+screen_check "mes_monitor   " "mes_monitor"
+check        "trading_bot   " "trading_bot.py"
+check        "bar_recorder  " "bar_recorder.py"
 echo ""
 
 echo "--- Bar DB ---"
