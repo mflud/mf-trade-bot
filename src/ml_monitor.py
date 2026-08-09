@@ -304,8 +304,10 @@ def build_position_panel(state: dict) -> Panel:
     prob       = pos["prob"]
     vol_regime = pos["vol_regime"]
     current    = feat.get("close", entry)
-    tgt_pts    = thr.get("target_pts", 5.0)
-    stp_pts    = thr.get("stop_pts",   3.0)
+    tgt_bps    = thr.get("target_bps", 16.0)
+    stp_bps    = thr.get("stop_bps",    9.0)
+    tgt_pts    = entry * tgt_bps / 10000.0
+    stp_pts    = entry * stp_bps / 10000.0
 
     is_long = direction == "LONG"
     pnl     = (current - entry) if is_long else (entry - current)
@@ -321,8 +323,8 @@ def build_position_panel(state: dict) -> Panel:
     t.add_row("Entry",      f"{entry:.2f}")
     t.add_row("Current",    f"{current:.2f}")
     t.add_row("P&L (est.)", fmt_pts(pnl))
-    t.add_row("Target",     f"{target:.2f}  (+{tgt_pts:.1f}pts)")
-    t.add_row("Stop",       f"{stop:.2f}  (-{stp_pts:.1f}pts)")
+    t.add_row("Target",     f"{target:.2f}  (+{tgt_pts:.2f}pt / {tgt_bps:.0f}bp)")
+    t.add_row("Stop",       f"{stop:.2f}  (-{stp_pts:.2f}pt / {stp_bps:.0f}bp)")
     t.add_row("Bars held",  f"{bars_held}  ({bars_held*2} min)")
     t.add_row("Entry prob", f"{prob:.3f}")
     t.add_row("Entry vReg", f"{vol_regime:.2f}")
@@ -403,7 +405,7 @@ def build_stats_panel(state: dict) -> Panel:
     t.add_row(
         f"Bars seen: {bars}  (~{bars*2} min)",
         f"Thr: prob≥{thr.get('prob',0.65):.2f} vReg≥{thr.get('vol_regime',0.50):.2f}",
-        f"Tgt:{thr.get('target_pts',5.0):.1f}pt  Stp:{thr.get('stop_pts',3.0):.1f}pt",
+        f"Tgt:{thr.get('target_bps',16.0):.0f}bp  Stp:{thr.get('stop_bps',9.0):.0f}bp",
     )
 
     # Model info row

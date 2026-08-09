@@ -87,13 +87,19 @@ ASK = 2
 
 @dataclass
 class SymbolConfig:
-    symbol:      str
-    tick_size:   float
-    point_value: float   # $ per point per contract
-    hist_csv:    Path
-    threshold_bps: float  # RF model target threshold in basis points (training)
-    target_pts:  float    # live trade profit target
-    stop_pts:    float    # live trade stop loss
+    symbol:        str
+    tick_size:     float
+    point_value:   float   # $ per point per contract
+    hist_csv:      Path
+    threshold_bps: float   # RF model target threshold in basis points (training)
+    target_bps:    float   # live profit target in basis points
+    stop_bps:      float   # live stop loss in basis points
+
+    def pts_from_bps(self, price: float, bps: float) -> float:
+        """Convert bps to points, rounded UP to the nearest tick."""
+        raw = price * bps / 10000.0
+        ticks = int(raw / self.tick_size) + (1 if raw % self.tick_size > 0 else 0)
+        return round(ticks * self.tick_size, 4)
 
     @property
     def state_file(self) -> Path:
@@ -110,18 +116,18 @@ SYMBOL_CONFIGS: dict[str, SymbolConfig] = {
         tick_size     = 0.25,
         point_value   = 5.0,
         hist_csv      = Path("mes_hist_1min.csv"),
-        threshold_bps = 9.0,    # AUC=0.867 @ ±9bp H=1 (≈5pt at current MES ~5600)
-        target_pts    = 5.0,
-        stop_pts      = 3.0,
+        threshold_bps = 9.0,    # AUC=0.867 @ ±9bp H=1
+        target_bps    = 16.0,   # sweep optimum: E=+0.94bp, WR=39%, R:R=1.8
+        stop_bps      = 9.0,    # (≈9pt / 5.25pt at MES ~5600)
     ),
     "MNQ": SymbolConfig(
         symbol        = "MNQ",
         tick_size     = 0.25,
         point_value   = 2.0,
         hist_csv      = Path("mnq_hist_1min.csv"),
-        threshold_bps = 13.0,   # AUC=0.865 @ ±13bp H=1 (≈25pt at current MNQ ~19200)
-        target_pts    = 20.0,
-        stop_pts      = 12.0,
+        threshold_bps = 13.0,   # AUC=0.865 @ ±13bp H=1
+        target_bps    = 17.0,   # sweep optimum: E=+1.12bp, WR=43%, R:R=1.5
+        stop_bps      = 11.0,   # (≈33.75pt / 22pt at MNQ ~19800)
     ),
 }
 
@@ -332,8 +338,8 @@ def train_model(df1: pd.DataFrame, cfg: SymbolConfig) -> tuple[RandomForestClass
         "base_rate":       round(float(base), 4),
         "symbol":          cfg.symbol,
         "threshold_bps":   cfg.threshold_bps,
-        "target_pts":      cfg.target_pts,
-        "stop_pts":        cfg.stop_pts,
+        "target_bps":      cfg.target_bps,
+        "stop_bps":        cfg.stop_bps,
         "horizon_bars":    1,
     }
     return clf, fcols, info
@@ -476,8 +482,8 @@ def write_state(feat: dict | None, signal: dict | None,
         "thresholds": {
             "prob":       PROB_THRESHOLD,
             "vol_regime": VOL_REGIME_MIN,
-            "target_pts": cfg.target_pts,
-            "stop_pts":   cfg.stop_pts,
+            "target_bps": cfg.target_bps,
+            "stop_bps":   cfg.stop_bps,
         },
     }
     cfg.state_file.parent.mkdir(exist_ok=True)
@@ -523,8 +529,8 @@ def get_contract_id(client: TopstepClient, cfg: SymbolConfig) -> str:
 def run(cfg: SymbolConfig, paper: bool = False):
     log.info("=" * 60)
     log.info(f"ml_trading_bot starting  symbol={cfg.symbol}  paper={paper}")
-    log.info(f"  threshold={cfg.threshold_bps}bp  target={cfg.target_pts}pt  "
-             f"stop={cfg.stop_pts}pt")
+    log.info(f"  threshold={cfg.threshold_bps}bp  target={cfg.target_bps}bp  "
+             f"stop={cfg.stop_bps}bp")
     log.info("=" * 60)
 
     # ── Account setup ──────────────────────────────────────────────────────────
@@ -616,8 +622,8 @@ def run(cfg: SymbolConfig, paper: bool = False):
                     # Bracket closed the position — infer outcome from bar extremes
                     entry   = position.entry_pts
                     is_long = position.direction == "LONG"
-                    tgt     = cfg.target_pts
-                    stp     = cfg.stop_pts
+                    tgt     = cfg.pts_from_bps(entry, cfg.target_bps)
+                    stp     = cfg.pts_from_bps(entry, cfg.stop_bps)
 
                     if is_long:
                         if feat["high"] >= entry + tgt:
@@ -668,8 +674,8 @@ def run(cfg: SymbolConfig, paper: bool = False):
                 close     = feat["close"]
                 is_long   = direction == "LONG"
                 side      = BID if is_long else ASK
-                tgt_ticks = int(round(cfg.target_pts / cfg.tick_size))
-                stp_ticks = int(round(cfg.stop_pts   / cfg.tick_size))
+                tgt_ticks = int(cfg.pts_from_bps(close, cfg.target_bps) / cfg.tick_size)
+                stp_ticks = int(cfg.pts_from_bps(close, cfg.stop_bps)   / cfg.tick_size)
 
                 session_stats["signals"] += 1
                 last_signal_ts = bar_ts
