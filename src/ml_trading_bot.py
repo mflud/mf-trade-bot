@@ -91,7 +91,7 @@ class SymbolConfig:
     tick_size:   float
     point_value: float   # $ per point per contract
     hist_csv:    Path
-    threshold_pts: float  # RF model target threshold (training)
+    threshold_bps: float  # RF model target threshold in basis points (training)
     target_pts:  float    # live trade profit target
     stop_pts:    float    # live trade stop loss
 
@@ -110,7 +110,7 @@ SYMBOL_CONFIGS: dict[str, SymbolConfig] = {
         tick_size     = 0.25,
         point_value   = 5.0,
         hist_csv      = Path("mes_hist_1min.csv"),
-        threshold_pts = 5.0,    # AUC=0.855 @ ±5pt H=1
+        threshold_bps = 9.0,    # AUC=0.867 @ ±9bp H=1 (≈5pt at current MES ~5600)
         target_pts    = 5.0,
         stop_pts      = 3.0,
     ),
@@ -119,7 +119,7 @@ SYMBOL_CONFIGS: dict[str, SymbolConfig] = {
         tick_size     = 0.25,
         point_value   = 2.0,
         hist_csv      = Path("mnq_hist_1min.csv"),
-        threshold_pts = 25.0,   # AUC=0.850 @ ±25pt H=1 (same base rate as MES ±5pt)
+        threshold_bps = 13.0,   # AUC=0.865 @ ±13bp H=1 (≈25pt at current MNQ ~19200)
         target_pts    = 20.0,
         stop_pts      = 12.0,
     ),
@@ -271,7 +271,7 @@ def get_feature_cols() -> list[str]:
             + ["ret_open", "realized_vol", "atr_ratio", "vol_regime"])
 
 
-def add_targets(df2: pd.DataFrame, threshold: float = 5.0,
+def add_targets(df2: pd.DataFrame, threshold_bps: float = 9.0,
                 horizon: int = 1) -> pd.DataFrame:
     highs  = df2["high"].values
     lows   = df2["low"].values
@@ -283,8 +283,9 @@ def add_targets(df2: pd.DataFrame, threshold: float = 5.0,
         fd = dates[i + 1 : i + 1 + horizon]
         if len(fd) < horizon or fd[0] != fd[-1] or fd[0] != dates[i]:
             continue
-        targets[i] = int(highs[i+1:i+1+horizon].max() >= closes[i] + threshold or
-                         lows[i+1:i+1+horizon].min()  <= closes[i] - threshold)
+        thr = closes[i] * threshold_bps / 10000.0
+        targets[i] = int(highs[i+1:i+1+horizon].max() >= closes[i] + thr or
+                         lows[i+1:i+1+horizon].min()  <= closes[i] - thr)
     df2 = df2.copy()
     df2["target"] = targets
     return df2.dropna(subset=["target"])
@@ -296,7 +297,7 @@ def train_model(df1: pd.DataFrame, cfg: SymbolConfig) -> tuple[RandomForestClass
     """Train RF model. Returns (clf, feature_cols, training_info)."""
     log.info("Building 2-min feature matrix …")
     df2 = build_2min_features(df1)
-    df2_tgt = add_targets(df2, threshold=cfg.threshold_pts, horizon=1)
+    df2_tgt = add_targets(df2, threshold_bps=cfg.threshold_bps, horizon=1)
 
     fcols = get_feature_cols()
     dates = sorted(df2_tgt["date"].unique())
@@ -330,7 +331,7 @@ def train_model(df1: pd.DataFrame, cfg: SymbolConfig) -> tuple[RandomForestClass
         "auc":             round(auc, 4),
         "base_rate":       round(float(base), 4),
         "symbol":          cfg.symbol,
-        "threshold_pts":   cfg.threshold_pts,
+        "threshold_bps":   cfg.threshold_bps,
         "target_pts":      cfg.target_pts,
         "stop_pts":        cfg.stop_pts,
         "horizon_bars":    1,
@@ -522,7 +523,7 @@ def get_contract_id(client: TopstepClient, cfg: SymbolConfig) -> str:
 def run(cfg: SymbolConfig, paper: bool = False):
     log.info("=" * 60)
     log.info(f"ml_trading_bot starting  symbol={cfg.symbol}  paper={paper}")
-    log.info(f"  threshold={cfg.threshold_pts}pt  target={cfg.target_pts}pt  "
+    log.info(f"  threshold={cfg.threshold_bps}bp  target={cfg.target_pts}pt  "
              f"stop={cfg.stop_pts}pt")
     log.info("=" * 60)
 

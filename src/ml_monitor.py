@@ -415,10 +415,10 @@ def build_stats_panel(state: dict) -> Panel:
     base    = minfo.get("base_rate", 0)
 
     sym    = minfo.get("symbol", "?")
-    x_pt   = minfo.get("threshold_pts", 5.0)
+    x_bps  = minfo.get("threshold_bps", 9.0)
     h_bars = minfo.get("horizon_bars", 1)
     t.add_row(
-        f"{sym}  lb=15  X={x_pt:.0f}pt  H={h_bars}",
+        f"{sym}  lb=15  X={x_bps:.0f}bp  H={h_bars}",
         f"Train: {n_train:,} bars  AUC={auc:.4f}",
         f"Data: {d_from} → {d_to}  base={base*100:.1f}%",
     )
