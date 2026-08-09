@@ -1853,3 +1853,129 @@ NEXT STEPS
   more neutral market period for cleaner conditioning
 - Test bid-wall-close as an SLR LONG filter: skip LONG if bid_wall_dist < 0.5 pts
 
+
+
+================================================================================
+ML STRATEGIES
+================================================================================
+Last updated: 2026-08-09
+
+OVERVIEW
+--------
+A Random Forest classifier approach for MES and MNQ intraday trading. The model
+predicts whether price will make a directional move of at least X basis points
+within the next 2-minute bar, then places a bracketed OCO order (target + stop)
+sized in basis points and computed dynamically at entry time.
+
+Both bots run concurrently during RTH, managed independently with per-symbol
+state files and trade logs.
+
+INSTRUMENT CONFIGS
+------------------
+  MES:  training threshold = 9bp,  target = 16bp,  stop = 9bp   (R:R 1.8)
+  MNQ:  training threshold = 13bp, target = 17bp,  stop = 11bp  (R:R 1.5)
+
+All thresholds in basis points, normalized to entry price. The bot calls
+pts_from_bps(entry, bps) at order time, rounding UP to the nearest 0.25pt tick.
+This keeps the strategy consistent across market levels (avoids the drift that
+plagued fixed-point thresholds — see "Why Basis Points" below).
+
+MODEL
+-----
+Algorithm:    Random Forest classifier (sklearn)
+              n_estimators=300, max_depth=8, min_samples_leaf=20,
+              class_weight="balanced", random_state=42
+
+Training data: Historical 1-min RTH bars (mes_hist_1min.csv / mnq_hist_1min.csv,
+               sourced from Databento) + live bars from bars.db, deduplicated.
+               RTH only: 09:30–16:00 ET. ~7 years of data.
+
+Train/test:   Walk-forward 75/25 split by date (no random shuffle).
+              MES cutoff: 2024-09-13.  MNQ cutoff: 2024-09-13.
+
+Bar interval: 1-min bars resampled to 2-min for features and target.
+              First 60 min of each day dropped (need 30 bars to fill lag window).
+
+Target:       Binary — does next 2-min bar's high or low cross ±threshold_bps
+              from the current close? Threshold is price-normalised:
+              thr_pts = close * threshold_bps / 10000
+
+FEATURES (21 total)
+-------------------
+  r2m_1 … r2m_14   14 lagged 2-min log returns (most important group ~50%)
+  r1m_1 … r1m_6     6 lagged 1-min log returns (~36%)
+  ret_open           log return from 9:30 open to current close (~12%)
+  realized_vol       std of last 10 2-min log returns (dominant single feature,
+                     40–44% importance on its own)
+  atr_ratio          current bar range / 14-bar avg range
+  vol_regime         percentile rank of realized_vol over rolling 60-bar window
+
+SIGNAL GATES (all must pass to enter)
+--------------------------------------
+  1. prob >= 0.65          RF probability score
+  2. vol_regime >= 0.50    must be in top half of recent volatility
+  3. direction agreement   r2m_1 and ret_open must have the same sign
+  4. time window           09:40–15:45 ET (9:30–9:40 blackout, close before 15:45)
+  5. no open position      one position at a time per symbol
+
+PERFORMANCE (test set: Sep 2024 – Aug 2026)
+--------------------------------------------
+                    MES          MNQ
+  Test days:        461          462
+  Trades/day:       1.9          1.5
+  Win rate:        39.3%        43.1%
+  E per trade:    +0.94bp      +1.12bp
+  P&L per day:    +7.96bp      +9.58bp
+  AUC:             0.867        0.865
+
+  Time of day breakdown (MES):
+    09:40–11:30:   0 trades    (feature warmup window, vol_regime stabilising)
+    11:30–13:30:   0.4/day     WR=64.6%   P&L=+0.97bp/day
+    13:30–15:45:   1.5/day     WR=68.7%   P&L=+3.69bp/day
+  Afternoon dominates — model performs better once vol regime has stabilised.
+
+WHY BASIS POINTS (not fixed points)
+-------------------------------------
+Fixed-point thresholds degrade badly across market levels. With MES at 5pt fixed:
+  2019 (MES~2983): 5pt = 16.8bp  → base rate 2.2%  (nearly impossible to hit)
+  2025 (MES~6239): 5pt =  8.0bp  → base rate 18.8% (hits constantly)
+This 9× base rate variation meant the model was trained on wildly inconsistent
+targets across years, depressing AUC.
+
+Switching to 9bp for MES and 13bp for MNQ:
+  AUC improvement:  MES +0.017 (0.850→0.867),  MNQ +0.020 (0.845→0.865)
+
+Likewise, fixed PT/SL in points drift in bp value as the market moves. The old
+fixed values (MES 5pt/3pt ≈ 8.9bp/5.4bp, MNQ 20pt/12pt ≈ 10.1bp/6.1bp) were
+suboptimal vs the swept bps values:
+  MES: old E=+0.60bp/trade → new E=+0.94bp/trade  (+57%)
+  MNQ: old E=+0.45bp/trade → new E=+1.12bp/trade  (+149%)
+
+EXECUTION
+---------
+- Native bracket orders via TopstepX API: stop_loss_ticks + take_profit_ticks
+  placed as exchange-managed OCO at entry. No manual exit logic needed.
+- Bot polls bars.db every 3s for new 2-min bars.
+- Outcome inferred from bar high/low when position disappears from API.
+- State written to logs/ml_state_{MES,MNQ}.json every poll cycle for monitor.
+- Trades logged to logs/ml_trades_{MES,MNQ}.csv.
+
+PROCESS MANAGEMENT
+------------------
+- ml_trading_bot.py --symbol MES  (nohup background process)
+- ml_trading_bot.py --symbol MNQ  (nohup background process)
+- Watchdog (launchd, every 5 min) calls start_ml_trading_bot.sh to restart
+  either bot if it crashes during session hours.
+- ml_monitor.py runs in a detached screen session (start_ml_monitor.sh).
+- botstat.sh shows per-symbol UP/DOWN status and live state summary.
+- Safety: bot refuses to trade on any account other than the hardcoded
+  practice account ID.
+
+BACKTEST FILES
+--------------
+  src/backtest_rf_momentum.py       Initial RF sweep (lb, threshold, horizon)
+  src/backtest_rf_feat_importance.py Bar interval + feature group importances
+  src/backtest_rf_feat_v2.py        Ablation: ret_open², mins_since_open
+  src/backtest_rf_feat_v3.py        Volume vs volatility feature comparison
+  src/backtest_rf_vol_regime.py     Vol regime separation (LOW/MED/HIGH)
+  src/backtest_rf_direction.py      Directional conditioning (dropped, AUC=0.61)
