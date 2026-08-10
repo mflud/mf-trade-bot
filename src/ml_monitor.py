@@ -203,7 +203,7 @@ def build_header(state: dict) -> Panel:
     t.add_column(width=20)
     t.add_row(
         f"[bold]{now_et.strftime('%H:%M:%S')} ET[/]",
-        f"MES  [bold]{close:.2f}[/]  (bar {bar_ts})",
+        f"{state.get('symbol','MES')}  [bold]{close:.2f}[/]  (bar {bar_ts})",
         Text.assemble("Vol Regime  ", regime_bar(feat.get("vol_regime", 0))),
         mode,
     )
@@ -238,7 +238,7 @@ def build_model_panel(state: dict) -> Panel:
     sym, sty = gate_icon(signal.get("vol_ok", False))
     gates.append("vol  "); gates.append(sym, style=sty); gates.append("  ")
     sym, sty = gate_icon(signal.get("dir_ok", False))
-    gates.append("dir  "); gates.append(sym, style=sty)
+    gates.append("move "); gates.append(sym, style=sty)
     t.add_row("Gates", gates)
 
     # Direction
@@ -282,6 +282,9 @@ def build_features_panel(state: dict) -> Panel:
               Text.assemble(sparkline(r2m), f" lag1→{LOOKBACK-1}"))
     t.add_row("1-min returns",
               Text.assemble(sparkline(r1m), f" lag1→{SHORT_N}"))
+    move_bps = feat.get("move_size_bps", 0.0) or 0.0
+    move_color = "green" if move_bps > 0 else "dim"
+    t.add_row("move (gate)",   Text(f"{move_bps:.1f}bp", style=move_color))
     t.add_row("r2m_1 (last)",  fmt_ret(r2m_1))
     t.add_row("r1m_1 (last)",  fmt_ret(r1m_1))
     t.add_row("ret_open",      fmt_ret(ret_open))
