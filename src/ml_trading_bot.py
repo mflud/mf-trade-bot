@@ -200,7 +200,7 @@ def load_training_data(cfg: SymbolConfig) -> pd.DataFrame:
     return df
 
 
-def build_2min_features(df1: pd.DataFrame) -> pd.DataFrame:
+def build_2min_features(df1: pd.DataFrame, drop_warmup: bool = True) -> pd.DataFrame:
     """
     Build full 2-min feature DataFrame from 1-min RTH bars.
     Matches feature engineering in backtest_rf_feat_v3.py.
@@ -267,7 +267,10 @@ def build_2min_features(df1: pd.DataFrame) -> pd.DataFrame:
     vola_cols = ["realized_vol", "atr_ratio", "vol_regime"]
     all_need  = r2m_cols + r1m_cols + ["ret_open"] + vola_cols
     df2 = df2.dropna(subset=all_need)
-    df2 = df2[df2.groupby("date").cumcount() >= LOOKBACK * 2].reset_index(drop=True)
+    if drop_warmup:
+        df2 = df2[df2.groupby("date").cumcount() >= LOOKBACK * 2].reset_index(drop=True)
+    else:
+        df2 = df2.reset_index(drop=True)
     return df2
 
 
@@ -372,7 +375,7 @@ def compute_live_features(df1_buf: pd.DataFrame) -> dict | None:
         return None
 
     try:
-        df2 = build_2min_features(df1_buf)
+        df2 = build_2min_features(df1_buf, drop_warmup=False)
         if df2.empty:
             return None
 
