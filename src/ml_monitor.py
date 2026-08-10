@@ -177,8 +177,9 @@ def fmt_ret(v: float) -> Text:
     return Text(f"−{abs(bp):.1f}bp", style="red")
 
 
-def gate_icon(ok: bool) -> str:
-    return "[green]✓[/]" if ok else "[red]✗[/]"
+def gate_icon(ok: bool) -> tuple[str, str]:
+    """Returns (symbol, style) for use with Text.append()."""
+    return ("✓", "green") if ok else ("✗", "red")
 
 
 # ── Panel builders ─────────────────────────────────────────────────────────────
@@ -232,9 +233,12 @@ def build_model_panel(state: dict) -> Panel:
 
     # Gate status
     gates = Text()
-    gates.append(f"prob {gate_icon(signal.get('prob_ok', False))}  ", style="")
-    gates.append(f"vol  {gate_icon(signal.get('vol_ok',  False))}  ", style="")
-    gates.append(f"dir  {gate_icon(signal.get('dir_ok',  False))}", style="")
+    sym, sty = gate_icon(signal.get("prob_ok", False))
+    gates.append("prob "); gates.append(sym, style=sty); gates.append("  ")
+    sym, sty = gate_icon(signal.get("vol_ok", False))
+    gates.append("vol  "); gates.append(sym, style=sty); gates.append("  ")
+    sym, sty = gate_icon(signal.get("dir_ok", False))
+    gates.append("dir  "); gates.append(sym, style=sty)
     t.add_row("Gates", gates)
 
     # Direction
