@@ -254,7 +254,8 @@ def build_model_panel(state: dict) -> Panel:
         sig_txt = Text("○ no signal", style="dim")
     t.add_row("Signal", sig_txt)
 
-    return Panel(t, title="Model", border_style="blue", expand=False)
+    sym = state.get("symbol", "")
+    return Panel(t, title=f"Model  {sym}", border_style="blue", expand=False)
 
 
 def build_features_panel(state: dict) -> Panel:
@@ -288,7 +289,8 @@ def build_features_panel(state: dict) -> Panel:
     t.add_row("ATR ratio",
               Text(f"{atr_ratio:.2f}×", style=atr_color))
 
-    return Panel(t, title="Features", border_style="blue", expand=False)
+    sym = state.get("symbol", "")
+    return Panel(t, title=f"Features  {sym}", border_style="blue", expand=False)
 
 
 def build_position_panel(state: dict) -> Panel:
@@ -297,8 +299,9 @@ def build_position_panel(state: dict) -> Panel:
     thr  = state.get("thresholds") or {}
 
     if pos is None:
+        sym = state.get("symbol", "")
         return Panel(Text("  No position", style="dim"),
-                     title="Position", border_style="blue", expand=False)
+                     title=f"Position  {sym}", border_style="blue", expand=False)
 
     direction  = pos["direction"]
     entry      = pos["entry_pts"]
@@ -331,7 +334,8 @@ def build_position_panel(state: dict) -> Panel:
     t.add_row("Entry prob", f"{prob:.3f}")
     t.add_row("Entry vReg", f"{vol_regime:.2f}")
 
-    return Panel(t, title="Position", border_style="green" if pnl >= 0 else "red",
+    sym = state.get("symbol", "")
+    return Panel(t, title=f"Position  {sym}", border_style="green" if pnl >= 0 else "red",
                  expand=False)
 
 
@@ -441,7 +445,8 @@ def build_stats_panel(state: dict) -> Panel:
         f"Data: {d_from} → {d_to}  base={base*100:.1f}%",
     )
 
-    return Panel(t, title="Session Stats  ·  Model Info", border_style="blue", expand=True)
+    sym = state.get("symbol", "")
+    return Panel(t, title=f"Session Stats  ·  Model Info  {sym}", border_style="blue", expand=True)
 
 
 def build_no_state_panel() -> Panel:
