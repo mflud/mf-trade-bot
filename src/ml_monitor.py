@@ -404,7 +404,7 @@ def build_stats_panel(state: dict) -> Panel:
     )
     tgt_bps = thr.get("target_bps", 16.0)
     stp_bps = thr.get("stop_bps",   9.0)
-    close   = (state.get("feat") or {}).get("close", 0)
+    close   = (state.get("feat") or {}).get("close") or state.get("last_close", 0)
     if close:
         tgt_pts = close * tgt_bps / 10000.0
         stp_pts = close * stp_bps / 10000.0

@@ -461,13 +461,15 @@ def write_state(feat: dict | None, signal: dict | None,
                 position: Position | None,
                 model_info: dict, session_stats: dict,
                 bar_ts: str | None, paper: bool,
-                cfg: SymbolConfig):
+                cfg: SymbolConfig,
+                last_close: float | None = None):
     state = {
-        "updated_at": datetime.now(ET).isoformat(),
-        "bar_ts":     bar_ts,
-        "paper":      paper,
-        "symbol":     cfg.symbol,
-        "feat":       feat,
+        "updated_at":  datetime.now(ET).isoformat(),
+        "bar_ts":      bar_ts,
+        "paper":       paper,
+        "symbol":      cfg.symbol,
+        "last_close":  feat["close"] if feat else last_close,
+        "feat":        feat,
         "signal":     signal,
         "position":   {
             "direction":  position.direction,
@@ -590,8 +592,10 @@ def run(cfg: SymbolConfig, paper: bool = False):
             # ── Compute features on latest 2-min bar ───────────────────────────
             feat = compute_live_features(df1_buf)
             if feat is None:
+                last_close = float(df1_buf["close"].iloc[-1]) if not df1_buf.empty else None
                 write_state(None, None, position, model_info,
-                            session_stats, last_bar_ts, paper, cfg)
+                            session_stats, last_bar_ts, paper, cfg,
+                            last_close=last_close)
                 time.sleep(POLL_S)
                 continue
 
