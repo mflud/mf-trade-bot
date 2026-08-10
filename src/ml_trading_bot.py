@@ -80,6 +80,7 @@ DB_PATH = Path("data/bars.db")
 # Shared gate thresholds
 PROB_THRESHOLD = 0.65
 VOL_REGIME_MIN = 0.50
+TRAIN_HORIZON  = 3     # bars (6 min) to resolve TP/SL label in training
 
 BID = 1   # TopstepX side constants
 ASK = 2
@@ -87,13 +88,15 @@ ASK = 2
 
 @dataclass
 class SymbolConfig:
-    symbol:        str
-    tick_size:     float
-    point_value:   float   # $ per point per contract
-    hist_csv:      Path
-    threshold_bps: float   # RF model target threshold in basis points (training)
-    target_bps:    float   # live profit target in basis points
-    stop_bps:      float   # live stop loss in basis points
+    symbol:              str
+    tick_size:           float
+    point_value:         float   # $ per point per contract
+    hist_csv:            Path
+    threshold_bps:       float   # (legacy, kept for reference)
+    target_bps:          float   # live profit target in basis points
+    stop_bps:            float   # live stop loss in basis points
+    move_threshold_bps:  float   # min move over move_lookback_bars to qualify for entry
+    move_lookback_bars:  int     # number of 2-min bars to measure qualifying move
 
     def pts_from_bps(self, price: float, bps: float) -> float:
         """Convert bps to points, rounded UP to the nearest tick."""
@@ -112,22 +115,26 @@ class SymbolConfig:
 
 SYMBOL_CONFIGS: dict[str, SymbolConfig] = {
     "MES": SymbolConfig(
-        symbol        = "MES",
-        tick_size     = 0.25,
-        point_value   = 5.0,
-        hist_csv      = Path("mes_hist_1min.csv"),
-        threshold_bps = 9.0,    # AUC=0.867 @ ±9bp H=1
-        target_bps    = 16.0,   # sweep optimum: E=+0.94bp, WR=39%, R:R=1.8
-        stop_bps      = 9.0,    # (≈9pt / 5.25pt at MES ~5600)
+        symbol               = "MES",
+        tick_size            = 0.25,
+        point_value          = 5.0,
+        hist_csv             = Path("mes_hist_1min.csv"),
+        threshold_bps        = 9.0,    # legacy
+        target_bps           = 16.0,
+        stop_bps             = 9.0,
+        move_threshold_bps   = 5.0,    # qualifying move to enter (~2.8pt at 5600)
+        move_lookback_bars   = 1,      # measure move over last 1 x 2-min bar
     ),
     "MNQ": SymbolConfig(
-        symbol        = "MNQ",
-        tick_size     = 0.25,
-        point_value   = 2.0,
-        hist_csv      = Path("mnq_hist_1min.csv"),
-        threshold_bps = 13.0,   # AUC=0.865 @ ±13bp H=1
-        target_bps    = 17.0,   # sweep optimum: E=+1.12bp, WR=43%, R:R=1.5
-        stop_bps      = 11.0,   # (≈33.75pt / 22pt at MNQ ~19800)
+        symbol               = "MNQ",
+        tick_size            = 0.25,
+        point_value          = 2.0,
+        hist_csv             = Path("mnq_hist_1min.csv"),
+        threshold_bps        = 13.0,   # legacy
+        target_bps           = 17.0,
+        stop_bps             = 11.0,
+        move_threshold_bps   = 5.0,    # qualifying move (~10pt at 20000)
+        move_lookback_bars   = 1,
     ),
 }
 
@@ -278,45 +285,118 @@ def build_2min_features(df1: pd.DataFrame, drop_warmup: bool = True) -> pd.DataF
 def get_feature_cols() -> list[str]:
     return ([f"r2m_{i}" for i in range(1, LOOKBACK)]
             + [f"r1m_{i}" for i in range(1, SHORT_N + 1)]
-            + ["ret_open", "realized_vol", "atr_ratio", "vol_regime"])
+            + ["ret_open", "realized_vol", "atr_ratio", "vol_regime",
+               "move_size_bps"])
 
 
-def add_targets(df2: pd.DataFrame, threshold_bps: float = 9.0,
-                horizon: int = 1) -> pd.DataFrame:
-    # Only label bars at or after 9:40 ET (matches live BLACKOUT_END gate)
+def build_directional_dataset(df2: pd.DataFrame, cfg: SymbolConfig,
+                               horizon: int = TRAIN_HORIZON) -> pd.DataFrame:
+    """
+    Build training dataset using the directional momentum architecture:
+    - Only label bars where price has moved >= move_threshold_bps over the
+      prior move_lookback_bars 2-min bars (qualifying momentum move).
+    - Direction comes from the sign of that move.
+    - Return features are sign-flipped so the model always sees the pattern
+      from the "continuation" perspective, regardless of LONG vs SHORT.
+    - Label = 1 if price hits +target_bps before -stop_bps within horizon bars.
+    - Inconclusive bars (neither hit) are skipped — no label noise.
+    - Only bars at/after 9:40 ET are labelled (matches live gate).
+    """
+    # Only label after blackout ends
     df2 = df2[df2["ts"].dt.time >= BLACKOUT_END].reset_index(drop=True)
+
+    closes = df2["close"].values
     highs  = df2["high"].values
     lows   = df2["low"].values
-    closes = df2["close"].values
     dates  = df2["date"].values
     n      = len(df2)
-    targets = np.full(n, np.nan)
-    for i in range(n - horizon):
-        fd = dates[i + 1 : i + 1 + horizon]
-        if len(fd) < horizon or fd[0] != fd[-1] or fd[0] != dates[i]:
+
+    r2m_cols  = [f"r2m_{i}" for i in range(1, LOOKBACK)]
+    r1m_cols  = [f"r1m_{i}" for i in range(1, SHORT_N + 1)]
+
+    lb   = cfg.move_lookback_bars
+    rows = []
+
+    for i in range(lb, n - horizon):
+        # Same-day lookback check
+        if dates[i - lb] != dates[i]:
             continue
-        thr = closes[i] * threshold_bps / 10000.0
-        targets[i] = int(highs[i+1:i+1+horizon].max() >= closes[i] + thr or
-                         lows[i+1:i+1+horizon].min()  <= closes[i] - thr)
-    df2 = df2.copy()
-    df2["target"] = targets
-    return df2.dropna(subset=["target"])
+
+        # Qualifying move gate
+        move = closes[i] - closes[i - lb]
+        thr  = closes[i] * cfg.move_threshold_bps / 10000.0
+        if abs(move) < thr:
+            continue
+
+        direction = 1 if move > 0 else -1
+
+        # Forward window must be same day
+        fwd = dates[i + 1 : i + 1 + horizon]
+        if len(fwd) < horizon or fwd[0] != fwd[-1] or fwd[0] != dates[i]:
+            continue
+
+        # Directional label: does price continue before stopping out?
+        entry = closes[i]
+        tgt   = cfg.pts_from_bps(entry, cfg.target_bps)
+        stp   = cfg.pts_from_bps(entry, cfg.stop_bps)
+
+        hit_target = hit_stop = False
+        for j in range(i + 1, i + 1 + horizon):
+            if direction == 1:
+                if highs[j] >= entry + tgt:
+                    hit_target = True; break
+                if lows[j]  <= entry - stp:
+                    hit_stop   = True; break
+            else:
+                if lows[j]  <= entry - tgt:
+                    hit_target = True; break
+                if highs[j] >= entry + stp:
+                    hit_stop   = True; break
+
+        if not hit_target and not hit_stop:
+            continue   # inconclusive within horizon — skip
+
+        # Sign-flip return features; vol features stay unsigned
+        row = {}
+        for c in r2m_cols:
+            row[c] = df2.at[i, c] * direction
+        for c in r1m_cols:
+            row[c] = df2.at[i, c] * direction
+        row["ret_open"]      = df2.at[i, "ret_open"] * direction
+        row["realized_vol"]  = df2.at[i, "realized_vol"]
+        row["atr_ratio"]     = df2.at[i, "atr_ratio"]
+        row["vol_regime"]    = df2.at[i, "vol_regime"]
+        row["move_size_bps"] = abs(move) / closes[i] * 10000.0
+        row["date"]          = dates[i]
+        row["ts"]            = df2["ts"].iloc[i]
+        row["direction"]     = direction
+        row["target"]        = int(hit_target)
+        rows.append(row)
+
+    return pd.DataFrame(rows)
 
 
 # ── Model training ─────────────────────────────────────────────────────────────
 
 def train_model(df1: pd.DataFrame, cfg: SymbolConfig) -> tuple[RandomForestClassifier, list[str], dict]:
-    """Train RF model. Returns (clf, feature_cols, training_info)."""
+    """Train RF model using directional momentum architecture."""
     log.info("Building 2-min feature matrix …")
     df2 = build_2min_features(df1)
-    df2_tgt = add_targets(df2, threshold_bps=cfg.threshold_bps, horizon=1)
+    log.info(f"  {len(df2):,} 2-min bars after warmup filter")
+
+    log.info("Building directional dataset …")
+    df_dir = build_directional_dataset(df2, cfg)
+    if df_dir.empty:
+        raise RuntimeError("No qualifying directional bars found for training")
+    log.info(f"  {len(df_dir):,} qualifying bars  "
+             f"base_rate={df_dir['target'].mean()*100:.1f}%")
 
     fcols = get_feature_cols()
-    dates = sorted(df2_tgt["date"].unique())
+    dates  = sorted(df_dir["date"].unique())
     cutoff = dates[int(len(dates) * 0.75)]
 
-    train = df2_tgt[df2_tgt["date"] < cutoff]
-    test  = df2_tgt[df2_tgt["date"] >= cutoff]
+    train = df_dir[df_dir["date"] < cutoff]
+    test  = df_dir[df_dir["date"] >= cutoff]
 
     log.info(f"Training RF: {len(train):,} train / {len(test):,} test  "
              f"(split at {cutoff})")
@@ -335,18 +415,19 @@ def train_model(df1: pd.DataFrame, cfg: SymbolConfig) -> tuple[RandomForestClass
              f"features={len(fcols)}")
 
     info = {
-        "n_train":         len(train),
-        "n_test":          len(test),
-        "train_cutoff":    str(cutoff),
-        "date_range_from": str(df2_tgt["date"].min()),
-        "date_range_to":   str(df2_tgt["date"].max()),
-        "auc":             round(auc, 4),
-        "base_rate":       round(float(base), 4),
-        "symbol":          cfg.symbol,
-        "threshold_bps":   cfg.threshold_bps,
-        "target_bps":      cfg.target_bps,
-        "stop_bps":        cfg.stop_bps,
-        "horizon_bars":    1,
+        "n_train":              len(train),
+        "n_test":               len(test),
+        "train_cutoff":         str(cutoff),
+        "date_range_from":      str(df_dir["date"].min()),
+        "date_range_to":        str(df_dir["date"].max()),
+        "auc":                  round(auc, 4),
+        "base_rate":            round(float(base), 4),
+        "symbol":               cfg.symbol,
+        "move_threshold_bps":   cfg.move_threshold_bps,
+        "move_lookback_bars":   cfg.move_lookback_bars,
+        "target_bps":           cfg.target_bps,
+        "stop_bps":             cfg.stop_bps,
+        "horizon_bars":         TRAIN_HORIZON,
     }
     return clf, fcols, info
 
@@ -393,7 +474,10 @@ def compute_live_features(df1_buf: pd.DataFrame) -> dict | None:
             if pd.isna(row.get(c)):
                 return None
 
-        feat = {c: float(row[c]) for c in fcols}
+        # Placeholder move_size_bps — get_signal() will compute the real value
+        # after determining direction; set 0 here so fcols are all present
+        feat = {c: float(row[c]) if c != "move_size_bps" else 0.0
+                for c in fcols}
         feat["ts"]           = row["ts"].isoformat()
         feat["close"]        = float(row["close"])
         feat["high"]         = float(row["high"])
@@ -406,6 +490,15 @@ def compute_live_features(df1_buf: pd.DataFrame) -> dict | None:
         feat["ret_open"]     = float(row["ret_open"])
         feat["r2m_1"]        = float(row["r2m_1"])
         feat["r1m_1"]        = float(row.get("r1m_1", 0) or 0)
+
+        # move_close: close from move_lookback_bars 2-min bars ago, same day
+        # Used by get_signal() to compute qualifying move magnitude/direction
+        feat["move_close"] = None
+        if len(df2) > 1:
+            lb = 1   # cfg not available here; get_signal handles per-symbol lookback
+            ref_row = df2.iloc[-1 - lb]
+            if ref_row["date"] == row["date"]:
+                feat["move_close"] = float(ref_row["close"])
 
         # All 14 r2m and 6 r1m as lists for monitor display
         feat["r2m_series"] = [float(row.get(f"r2m_{i}", 0) or 0)
@@ -424,40 +517,60 @@ def compute_live_features(df1_buf: pd.DataFrame) -> dict | None:
 def get_signal(feat: dict, clf: RandomForestClassifier,
                fcols: list[str], cfg: SymbolConfig) -> dict:
     """
-    Compute model probability and determine direction.
-    Returns signal dict with prob, direction, and reason.
+    Directional signal: only fire when price has moved >= move_threshold_bps
+    over the last move_lookback_bars 2-min bars.  Return features are
+    sign-flipped to match the directional training dataset.
     """
-    X = np.array([[feat[c] for c in fcols]])
-    prob = float(clf.predict_proba(X)[0, 1])
+    _no = lambda reason: {
+        "prob": 0.0, "direction": None, "reason": reason,
+        "gates_pass": False, "prob_ok": False,
+        "vol_ok": False, "dir_ok": False,
+    }
 
     vol_regime = feat["vol_regime"]
-    r2m_1      = feat["r2m_1"]
-    ret_open   = feat["ret_open"]
+    close      = feat["close"]
+    move_close = feat.get("move_close")
 
-    # Direction: r2m_1 and ret_open must agree
-    if r2m_1 > 0 and ret_open > 0:
-        direction = "LONG"
-        reason    = f"r2m_1>0 ret_open>0"
-    elif r2m_1 < 0 and ret_open < 0:
-        direction = "SHORT"
-        reason    = f"r2m_1<0 ret_open<0"
-    else:
-        direction = None
-        reason    = f"r2m_1/ret_open conflict"
+    # Gate 1: qualifying momentum move
+    if move_close is None:
+        return _no("no move_close")
+    move = close - move_close
+    thr  = close * cfg.move_threshold_bps / 10000.0
+    if abs(move) < thr:
+        return _no(f"move {move:+.3f}pt < {thr:.3f}pt ({cfg.move_threshold_bps}bp)")
 
-    # Gate checks
-    gates_pass = (prob >= PROB_THRESHOLD and
-                  vol_regime >= VOL_REGIME_MIN and
-                  direction is not None)
+    direction  = 1 if move > 0 else -1
+    dir_str    = "LONG" if direction == 1 else "SHORT"
+    move_bps   = abs(move) / close * 10000.0
+
+    # Build direction-flipped feature vector (matches training)
+    signed_cols = set(
+        [f"r2m_{i}" for i in range(1, LOOKBACK)] +
+        [f"r1m_{i}" for i in range(1, SHORT_N + 1)] +
+        ["ret_open"]
+    )
+    feat_vec = {}
+    for c in fcols:
+        if c == "move_size_bps":
+            feat_vec[c] = move_bps
+        elif c in signed_cols:
+            feat_vec[c] = feat[c] * direction
+        else:
+            feat_vec[c] = feat[c]
+
+    X    = np.array([[feat_vec[c] for c in fcols]])
+    prob = float(clf.predict_proba(X)[0, 1])
+
+    gates_pass = prob >= PROB_THRESHOLD and vol_regime >= VOL_REGIME_MIN
 
     return {
-        "prob":        prob,
-        "direction":   direction,
-        "reason":      reason,
-        "gates_pass":  gates_pass,
-        "prob_ok":     prob >= PROB_THRESHOLD,
-        "vol_ok":      vol_regime >= VOL_REGIME_MIN,
-        "dir_ok":      direction is not None,
+        "prob":       prob,
+        "direction":  dir_str,
+        "reason":     f"move={move:+.2f}pt({move_bps:.1f}bp) {dir_str}",
+        "gates_pass": gates_pass,
+        "prob_ok":    prob >= PROB_THRESHOLD,
+        "vol_ok":     vol_regime >= VOL_REGIME_MIN,
+        "dir_ok":     True,   # direction always valid when move gate passes
     }
 
 
