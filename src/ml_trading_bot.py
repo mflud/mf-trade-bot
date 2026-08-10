@@ -122,8 +122,8 @@ SYMBOL_CONFIGS: dict[str, SymbolConfig] = {
         threshold_bps        = 9.0,    # legacy
         target_bps           = 16.0,
         stop_bps             = 9.0,
-        move_threshold_bps   = 5.0,    # qualifying move to enter (~2.8pt at 5600)
-        move_lookback_bars   = 1,      # measure move over last 1 x 2-min bar
+        move_threshold_bps   = 4.0,    # sweep optimum: best P&L, 0.30/day
+        move_lookback_bars   = 2,      # measure move over last 2 x 2-min bars (4 min)
     ),
     "MNQ": SymbolConfig(
         symbol               = "MNQ",
@@ -133,8 +133,8 @@ SYMBOL_CONFIGS: dict[str, SymbolConfig] = {
         threshold_bps        = 13.0,   # legacy
         target_bps           = 17.0,
         stop_bps             = 11.0,
-        move_threshold_bps   = 5.0,    # qualifying move (~10pt at 20000)
-        move_lookback_bars   = 1,
+        move_threshold_bps   = 4.0,    # sweep optimum: best P&L, 77.5% WR
+        move_lookback_bars   = 1,      # measure move over last 1 x 2-min bar (2 min)
     ),
 }
 
