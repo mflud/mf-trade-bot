@@ -402,10 +402,19 @@ def build_stats_panel(state: dict) -> Panel:
         f"W:{wins} L:{losses}  WR:{wr}",
         Text.assemble("P&L: ", fmt_pts(pnl), " pts"),
     )
+    tgt_bps = thr.get("target_bps", 16.0)
+    stp_bps = thr.get("stop_bps",   9.0)
+    close   = (state.get("feat") or {}).get("close", 0)
+    if close:
+        tgt_pts = close * tgt_bps / 10000.0
+        stp_pts = close * stp_bps / 10000.0
+        tgt_str = f"Tgt:{tgt_bps:.0f}bp ({tgt_pts:.2f}pt)  Stp:{stp_bps:.0f}bp ({stp_pts:.2f}pt)"
+    else:
+        tgt_str = f"Tgt:{tgt_bps:.0f}bp  Stp:{stp_bps:.0f}bp"
     t.add_row(
         f"Bars seen: {bars}  (~{bars*2} min)",
         f"Thr: prob≥{thr.get('prob',0.65):.2f} vReg≥{thr.get('vol_regime',0.50):.2f}",
-        f"Tgt:{thr.get('target_bps',16.0):.0f}bp  Stp:{thr.get('stop_bps',9.0):.0f}bp",
+        tgt_str,
     )
 
     # Model info row
