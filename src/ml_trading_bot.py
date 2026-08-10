@@ -122,7 +122,7 @@ SYMBOL_CONFIGS: dict[str, SymbolConfig] = {
         threshold_bps        = 9.0,    # legacy
         target_bps           = 16.0,
         stop_bps             = 9.0,
-        move_threshold_bps   = 4.0,    # sweep optimum: best P&L, 0.30/day
+        move_threshold_bps   = 3.0,    # sweep optimum (re-entry): 0.33/day, 59.7% WR
         move_lookback_bars   = 2,      # measure move over last 2 x 2-min bars (4 min)
     ),
     "MNQ": SymbolConfig(
@@ -686,7 +686,6 @@ def run(cfg: SymbolConfig, paper: bool = False):
 
     position: Position | None  = None
     last_bar_ts: str | None    = None
-    last_signal_ts: str | None = None
 
     log.info("Entering main loop …")
 
@@ -786,11 +785,10 @@ def run(cfg: SymbolConfig, paper: bool = False):
                     log.info(f"Position closed: {outcome}  pnl={pnl:+.2f}pts")
                     position = None
 
-            # ── Entry logic ────────────────────────────────────────────────────
+            # ── Entry logic (re-entry allowed after each closed trade) ──────────
             if (position is None
                     and signal["gates_pass"]
                     and is_new_bar
-                    and bar_ts != last_signal_ts
                     and BLACKOUT_END <= now_t < SESSION_END):
 
                 direction = signal["direction"]
@@ -801,7 +799,6 @@ def run(cfg: SymbolConfig, paper: bool = False):
                 stp_ticks = int(cfg.pts_from_bps(close, cfg.stop_bps)   / cfg.tick_size)
 
                 session_stats["signals"] += 1
-                last_signal_ts = bar_ts
                 log.info(
                     f"SIGNAL {cfg.symbol} {direction}  close={close:.2f}  "
                     f"prob={signal['prob']:.3f}  "
