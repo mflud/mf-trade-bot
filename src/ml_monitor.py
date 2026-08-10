@@ -40,6 +40,8 @@ MST   = ZoneInfo("America/Phoenix")
 LOOKBACK = 15   # 2-min lagged returns shown in sparkline
 SHORT_N  = 6    # 1-min lagged returns shown in sparkline
 
+_close_cache: dict[str, float] = {}   # last known close per symbol, avoids flashing
+
 STATE_FILES = {
     "MES": Path("logs/ml_state_MES.json"),
     "MNQ": Path("logs/ml_state_MNQ.json"),
@@ -393,9 +395,9 @@ def build_stats_panel(state: dict) -> Panel:
     wr = f"{wins/trades*100:.0f}%" if trades > 0 else "—"
 
     t = Table(box=None, show_header=False, padding=(0, 2))
-    t.add_column(width=22)
-    t.add_column(width=22)
-    t.add_column(width=30)
+    t.add_column(width=26)
+    t.add_column(width=34)
+    t.add_column(width=48)
 
     t.add_row(
         f"Signals: {sigs}   Trades: {trades}",
@@ -404,7 +406,12 @@ def build_stats_panel(state: dict) -> Panel:
     )
     tgt_bps = thr.get("target_bps", 16.0)
     stp_bps = thr.get("stop_bps",   9.0)
-    close   = (state.get("feat") or {}).get("close") or state.get("last_close", 0)
+    sym_key = state.get("symbol", "")
+    close   = (state.get("feat") or {}).get("close") or state.get("last_close") or 0
+    if close:
+        _close_cache[sym_key] = close
+    else:
+        close = _close_cache.get(sym_key, 0)
     if close:
         tgt_pts = close * tgt_bps / 10000.0
         stp_pts = close * stp_bps / 10000.0
@@ -413,8 +420,8 @@ def build_stats_panel(state: dict) -> Panel:
         tgt_str = f"Tgt:{tgt_bps:.0f}bp  Stp:{stp_bps:.0f}bp"
     t.add_row(
         f"Bars seen: {bars}  (~{bars*2} min)",
-        f"Thr: prob≥{thr.get('prob',0.65):.2f} vReg≥{thr.get('vol_regime',0.50):.2f}",
-        tgt_str,
+        f"Thr: prob≥{thr.get('prob',0.65):.2f}  vReg≥{thr.get('vol_regime',0.50):.2f}  {tgt_str}",
+        "",
     )
 
     # Model info row
