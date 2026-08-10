@@ -132,6 +132,7 @@ SYMBOL_CONFIGS: dict[str, SymbolConfig] = {
 }
 
 ET        = ZoneInfo("America/New_York")
+PRE_START = dtime(8, 30)   # pre-market bars loaded for feature warmup
 RTH_START = dtime(9, 30)
 RTH_END   = dtime(16, 0)
 
@@ -177,7 +178,7 @@ def load_training_data(cfg: SymbolConfig) -> pd.DataFrame:
         df_h = pd.read_csv(cfg.hist_csv, parse_dates=["ts"])
         df_h["ts"] = pd.to_datetime(df_h["ts"], utc=True).dt.tz_convert(ET)
         t = df_h["ts"].dt.time
-        df_h = df_h[(t >= RTH_START) & (t < RTH_END)]
+        df_h = df_h[(t >= PRE_START) & (t < RTH_END)]
         frames.append(df_h)
         log.info(f"  Historical: {len(df_h):,} bars  "
                  f"({df_h['ts'].dt.date.min()} → {df_h['ts'].dt.date.max()})")
@@ -188,7 +189,7 @@ def load_training_data(cfg: SymbolConfig) -> pd.DataFrame:
     db.close()
     df_db["ts"] = pd.to_datetime(df_db["ts"], utc=True).dt.tz_convert(ET)
     t = df_db["ts"].dt.time
-    df_db = df_db[(t >= RTH_START) & (t < RTH_END)]
+    df_db = df_db[(t >= PRE_START) & (t < RTH_END)]
     frames.append(df_db)
     log.info(f"  Live DB: {len(df_db):,} bars  "
              f"({df_db['ts'].dt.date.min()} → {df_db['ts'].dt.date.max()})")
@@ -231,7 +232,7 @@ def build_2min_features(df1: pd.DataFrame, drop_warmup: bool = True) -> pd.DataF
           volume=("volume","sum")).dropna(subset=["close"])
     df2.index = df2.index.tz_convert(ET)
     t2 = df2.index.time
-    df2 = df2[(t2 >= RTH_START) & (t2 < RTH_END)].reset_index()
+    df2 = df2[(t2 >= PRE_START) & (t2 < RTH_END)].reset_index()
     df2["date"] = df2["ts"].dt.date
 
     # 2-min log returns
@@ -282,6 +283,8 @@ def get_feature_cols() -> list[str]:
 
 def add_targets(df2: pd.DataFrame, threshold_bps: float = 9.0,
                 horizon: int = 1) -> pd.DataFrame:
+    # Only label bars at or after 9:40 ET (matches live BLACKOUT_END gate)
+    df2 = df2[df2["ts"].dt.time >= BLACKOUT_END].reset_index(drop=True)
     highs  = df2["high"].values
     lows   = df2["low"].values
     closes = df2["close"].values
@@ -363,7 +366,7 @@ def load_live_1min(cfg: SymbolConfig, limit: int = 600) -> pd.DataFrame:
     df = df.iloc[::-1].reset_index(drop=True)
     df["ts"] = pd.to_datetime(df["ts"], utc=True).dt.tz_convert(ET)
     t = df["ts"].dt.time
-    return df[(t >= RTH_START) & (t < RTH_END)].reset_index(drop=True)
+    return df[(t >= PRE_START) & (t < RTH_END)].reset_index(drop=True)
 
 
 def compute_live_features(df1_buf: pd.DataFrame) -> dict | None:
