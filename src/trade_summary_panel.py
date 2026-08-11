@@ -18,20 +18,23 @@ ET  = ZoneInfo("America/New_York")
 MST = ZoneInfo("America/Phoenix")
 
 TRADE_LOGS = {
-    "CSR":    Path("logs/bot_trades.csv"),
-    "ORB":    Path("logs/orb_trades.csv"),
-    "VWASLR": Path("logs/vwaslr_trades.csv"),
-    "SLR":    Path("logs/slr_trades.csv"),
-    "PL MOM": Path("logs/pl_mom_trades.csv"),
-    "PL REV": Path("logs/pl_rev_trades.csv"),
+    "CSR":      Path("logs/bot_trades.csv"),
+    "ORB":      Path("logs/orb_trades.csv"),
+    "VWASLR":   Path("logs/vwaslr_trades.csv"),
+    "SLR":      Path("logs/slr_trades.csv"),
+    "PL MOM":   Path("logs/pl_mom_trades.csv"),
+    "PL REV":   Path("logs/pl_rev_trades.csv"),
+    "WALL BRK": Path("logs/wall_break_trades.csv"),
 }
 
 STRAT_STYLE = {
-    "CSR":    "cyan",
-    "ORB":    "yellow",
-    "VWASLR": "blue",
-    "SLR":    "blue",
-    "PL MOM": "magenta",
+    "CSR":      "cyan",
+    "ORB":      "yellow",
+    "VWASLR":   "blue",
+    "SLR":      "blue",
+    "PL MOM":   "magenta",
+    "PL REV":   "green",
+    "WALL BRK": "white",
 }
 
 MES_MNQ = {"MES", "MNQ"}
