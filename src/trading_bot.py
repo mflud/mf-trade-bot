@@ -1,11 +1,11 @@
 """
-Automated trading bot — MES (6 strategies) and MNQ (ORB only).
+Automated trading bot — MES and MNQ micro futures.
 
 Places market orders with native API bracket stops/targets. Only one open
 position per instrument at a time across all strategies.
 
 Logs: bot_trades.csv (CSR), orb_trades.csv, vwaslr_trades.csv,
-      slr_trades.csv, pl_mom_trades.csv, wall_break_trades.csv
+      slr_trades.csv, pl_rev_trades.csv, wall_break_trades.csv
 
 ━━━ MES strategies ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -13,7 +13,6 @@ Logs: bot_trades.csv (CSR), orb_trades.csv, vwaslr_trades.csv,
     Entry : 5-min bar return ≥ 3σ, volume ≥ 1.5× mean, 40-min CSR aligned
     Stop  : 2σ bracket (safety net) + 0.5σ software trailing stop
     Target: 3σ bracket; force-close after 25 min if neither hit
-    Filter: |scaled| ≤ 5.0 (blocks extreme-event spikes)
 
   ORB (opening range breakout) — active 9:45–10:45 ET
     Entry : First 5-min close outside 15-min opening range (9:30–9:45),
@@ -33,15 +32,21 @@ Logs: bot_trades.csv (CSR), orb_trades.csv, vwaslr_trades.csv,
     Stop  : 10bp
     Target: 15bp; max hold 10 min
 
-  PL_MOM (price linearity momentum) — active 9:40–16:00 ET
-    Entry : 5s bars: PL ≥ 0.80, price move ≥ 8bp (adaptive floor)
-    Stop  : 7bp
-    Exit  : PL drops below 0.40
+  PL_REV (price linearity reversion) — active 10:00–16:00 ET
+    Entry : 5s bars: PL ≥ 0.80, move ≥ 20bp, ADX(9:00-10:00 ET) ≤ 25
+            Fades the momentum move (enters OPPOSITE to PL_MOM direction)
+    Stop  : 15bp (continuation confirmed = wrong trade)
+    Target: 12bp (reversion hit)
+    Exit  : Native OCO bracket; early exit if PL resumes ≥ 0.70; 120s max
+    Backtest (excl Apr-2025): WR 91-97%, EV +6-9bp on MES
 
   Wall Break (DOM resting-order breakout) — active 9:40–16:00 ET
     Entry : DOM wall (peak 100–300 lots, tested ≥ 2×) breaks out
     Stop  : 4–5pt adaptive (clamped to trailing 100-min σ)
     Target: 12pt; max hold 15 min
+
+  Note: PL_MOM (continuation) is disabled — no base-rate edge outside
+  April 2025 extreme vol. PL_REV replaced it.
 
 ━━━ MNQ strategies ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -51,14 +56,14 @@ Logs: bot_trades.csv (CSR), orb_trades.csv, vwaslr_trades.csv,
             ORB width 0.10%–1.00% of price
     Stop  : Opposite ORB edge (orb_low); full-range stop
     Target: 0.75× ORB width
-    Backtest (Apr–Jul 2026): 86% WR, +32 pts EV, 21 trades
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 Usage:
-  python src/trading_bot.py                  # live trading (requires .env)
-  python src/trading_bot.py --paper          # paper mode: signals logged, no orders placed
-  python src/trading_bot.py --account 12345  # specify account ID explicitly
+  python src/trading_bot.py                         # all enabled strategies
+  python src/trading_bot.py --paper                 # paper mode (no orders)
+  python src/trading_bot.py --strategies pl_rev,orb # selected strategies only
+  python src/trading_bot.py --account 12345         # specify account ID
 """
 
 import argparse
