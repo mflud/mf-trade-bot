@@ -24,7 +24,7 @@ TRADE_LOGS = {
     "SLR":      Path("logs/slr_trades.csv"),
     "PL MOM":   Path("logs/pl_mom_trades.csv"),
     "PL REV":   Path("logs/pl_rev_trades.csv"),
-    "WALL BRK": Path("logs/wall_break_trades.csv"),
+    "WBRK": Path("logs/wall_break_trades.csv"),
 }
 
 STRAT_STYLE = {
@@ -34,7 +34,7 @@ STRAT_STYLE = {
     "SLR":      "blue",
     "PL MOM":   "magenta",
     "PL REV":   "green",
-    "WALL BRK": "white",
+    "WBRK": "white",
 }
 
 MES_MNQ = {"MES", "MNQ"}
@@ -81,6 +81,13 @@ def _load_all() -> list[dict]:
                         elif strat == "ORB":
                             w = float(r.get("orb_width", 0) or 0)
                             detail = f"w={w:.2f}pt" if w else "ORB"
+                        elif strat == "PL REV":
+                            pl  = float(r.get("pl",       0) or 0)
+                            mbp = float(r.get("move_bps", 0) or 0)
+                            detail = f"PL={pl:.2f} {mbp:.0f}bp"
+                        elif strat == "WBRK":
+                            pk = int(float(r.get("peak_size", 0) or 0))
+                            detail = f"pk={pk}"
                         else:
                             detail = ""
 
