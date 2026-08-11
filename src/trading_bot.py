@@ -583,7 +583,8 @@ class BotInstrument:
     target_sigma: float = 3.0
     tick_size:    float = 0.25   # minimum price increment
     point_value:  float = 5.00  # $ per point (informational only)
-    csr_enabled: bool = True   # CSR/3σ continuation signal; disable via --strategies flag
+    csr_enabled:  bool = True   # CSR/3σ continuation signal; disable via --strategies flag
+    wall_enabled: bool = True   # Wall breakout signal; disable via --strategies flag
     # Dynamic CSR window: list of (gk_ann_vol_upper_bound, mom_bars)
     csr_vol_windows: list = field(default_factory=lambda: [(1.0, 8)])
     # Per-instrument blackout windows: (start_h, start_m, end_h, end_m, conditional)
@@ -3905,6 +3906,7 @@ def _apply_strategy_filter(inst: BotInstrument, strategies: set[str]) -> BotInst
     if "sun"    not in strategies: overrides["sun_gap_enabled"] = False
     if "pl_mom" not in strategies: overrides["pl_mom_enabled"]  = False
     if "pl_rev" not in strategies: overrides["pl_rev_enabled"]  = False
+    if "wall"   not in strategies: overrides["wall_enabled"]    = False
     return replace(inst, **overrides) if overrides else inst
 
 
@@ -4226,7 +4228,7 @@ def run(account_id: int | None, paper: bool, strategies: set[str] | None = None)
                                                     account_id, paper, now)
 
                 # Wall Breakout signal: RTH only, 9:40–16:00 ET, no position
-                if no_position and not past_cutoff and (9, 40) <= now_et_hm < (16, 0):
+                if no_position and not past_cutoff and state.instrument.wall_enabled and (9, 40) <= now_et_hm < (16, 0):
                     wb_sig = evaluate_wall_break(state, now)
                     if wb_sig:
                         place_wall_break_signal(client, state, wb_sig, account_id, paper)
