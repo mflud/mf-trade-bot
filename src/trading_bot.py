@@ -188,7 +188,7 @@ PL_REV_MIN_HOLD_S  = 10     # seconds before RESUME_PL check is active (stop alw
 PL_REV_MAX_HOLD_S  = 120    # max hold in seconds (same as PL_MOM)
 PL_REV_ADX_PERIOD  = 14     # ADX period (Wilder)
 PL_REV_ADX_GATE    = 25.0   # suppress reversion if ADX > this (trending open)
-PL_REV_ADX_BARS    = 80     # 1-min bars to fetch for ADX warmup (covers 9:00-10:00 ET)
+PL_REV_ADX_BARS    = 430    # 1-min bars to fetch: covers 9:00-10:00 ET from anywhere in RTH (max ~420 min)
 
 # ── Evening Resumption parameters ────────────────────────────────────────────
 # At 18:00 ET daily (CME resumes after 16:00–18:00 ET settlement gap):
@@ -3104,6 +3104,25 @@ def _log_pl_rev_trade(trade: ActivePLRevTrade, outcome: str,
     )
 
 
+PL_REV_STATE_PATH = Path("logs/pl_rev_state.json")
+
+
+def _write_pl_rev_state(state: InstrumentState):
+    """Write PL_REV ADX state to a JSON file for mes_monitor to display."""
+    try:
+        data = {
+            "symbol":   state.instrument.symbol,
+            "adx":      round(state.pl_rev_adx, 2),
+            "adx_gate": PL_REV_ADX_GATE,
+            "gate_open": state.pl_rev_adx <= PL_REV_ADX_GATE or state.pl_rev_adx == 0.0,
+            "date":     state.pl_rev_adx_date.isoformat() if state.pl_rev_adx_date else None,
+        }
+        PL_REV_STATE_PATH.parent.mkdir(exist_ok=True)
+        PL_REV_STATE_PATH.write_text(json.dumps(data))
+    except Exception as e:
+        log.debug(f"PL_REV state write failed: {e}")
+
+
 def _compute_pl_rev_adx(client: TopstepClient, state: InstrumentState,
                         now_et: datetime) -> float:
     """
@@ -3116,11 +3135,13 @@ def _compute_pl_rev_adx(client: TopstepClient, state: InstrumentState,
         if bars_db_available():
             raw_bars = get_bars_from_db(symbol, 1, PL_REV_ADX_BARS)
         else:
+            # Anchor start to 9:00 ET today so the window is always covered
+            from datetime import time as _time
+            nine_et   = datetime.combine(now_et.date(), _time(9, 0)).replace(tzinfo=ET)
             end_utc   = datetime.now(timezone.utc)
-            start_utc = end_utc - timedelta(minutes=PL_REV_ADX_BARS + 5)
             raw_bars  = list(reversed(client.get_bars(
                 contract_id=state.contract_id,
-                start=start_utc, end=end_utc,
+                start=nine_et.astimezone(timezone.utc), end=end_utc,
                 unit=TopstepClient.MINUTE, unit_number=1,
                 limit=PL_REV_ADX_BARS,
             )))
@@ -3129,6 +3150,7 @@ def _compute_pl_rev_adx(client: TopstepClient, state: InstrumentState,
         return 0.0
 
     if not raw_bars:
+        log.warning(f"PL_REV {symbol}: ADX fetch returned no bars")
         return 0.0
 
     # Normalise: DB returns dicts with "t"/"o"/"h"/"l"/"c"; REST returns same shape
@@ -3138,10 +3160,12 @@ def _compute_pl_rev_adx(client: TopstepClient, state: InstrumentState,
                 return b[k]
         return None
 
-    today_et = now_et.date()
-    window_start = dtime(9, 0)
-    window_end   = dtime(10, 0)
+    from datetime import time as _time
+    window_start = _time(9, 0)
+    window_end   = _time(10, 0)
 
+    # No date filter needed: 80 1-min bars from now only span ~80 min, so yesterday's
+    # 9:00-10:00 ET bars are never in the fetch window when called after 10:00 ET.
     filtered = []
     for b in raw_bars:
         ts_raw = _get(b, "t", "ts")
@@ -3154,7 +3178,7 @@ def _compute_pl_rev_adx(client: TopstepClient, state: InstrumentState,
         if ts_utc.tzinfo is None:
             ts_utc = ts_utc.replace(tzinfo=timezone.utc)
         ts_et = ts_utc.astimezone(ET)
-        if ts_et.date() == today_et and window_start <= ts_et.time() < window_end:
+        if window_start <= ts_et.time() < window_end:
             filtered.append({
                 "h": _get(b, "h", "high"),
                 "l": _get(b, "l", "low"),
@@ -3164,7 +3188,7 @@ def _compute_pl_rev_adx(client: TopstepClient, state: InstrumentState,
     n = len(filtered)
     period = PL_REV_ADX_PERIOD
     if n < period + 1:
-        log.debug(f"PL_REV {symbol}: only {n} bars for ADX window, skipping gate")
+        log.warning(f"PL_REV {symbol}: only {n} bars in 9-10 ET window (need {period+1}), skipping ADX gate")
         return 0.0
 
     highs  = np.array([b["h"] for b in filtered], dtype=float)
@@ -4183,6 +4207,8 @@ def run(account_id: int | None, paper: bool, strategies: set[str] | None = None)
                         if state.pl_rev_adx_date != today_et:
                             state.pl_rev_adx      = _compute_pl_rev_adx(client, state, now_et)
                             state.pl_rev_adx_date = today_et
+                            # Write state for mes_monitor to read
+                            _write_pl_rev_state(state)
 
                     # Re-check: PL_MOM may have just fired this iteration (same bar, opposite direction)
                     no_position_rev = no_position and not state.active_pl_mom_trade

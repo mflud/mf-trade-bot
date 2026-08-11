@@ -77,8 +77,20 @@ PL_REV_ENTRY_PL  = 0.80
 PL_REV_MOVE_BPS  = 20.0
 PL_REV_TP_BPS    = 12.0
 PL_REV_STOP_BPS  = 15.0
-PL_REV_RESUME_PL = 0.70
-PL_REV_ADX_GATE  = 25.0
+PL_REV_RESUME_PL  = 0.70
+PL_REV_ADX_GATE   = 25.0
+PL_REV_STATE_PATH = Path("logs/pl_rev_state.json")
+
+
+def _read_pl_rev_state() -> dict:
+    """Read ADX state written by trading_bot. Returns empty dict if unavailable."""
+    try:
+        if PL_REV_STATE_PATH.exists():
+            import json
+            return json.loads(PL_REV_STATE_PATH.read_text())
+    except Exception:
+        pass
+    return {}
 
 # ── DOM constants ─────────────────────────────────────────────────────────────
 WALL_MULT      = 2.5
@@ -441,23 +453,30 @@ def _centered_bar(ratio: float, is_long: bool, half: int = 6) -> str:
 
 def build_pl_mom_panel(state: MonitorState, now: datetime) -> Panel:
     """PL Reversion panel — shows the fade signal (opposite to momentum direction)."""
-    sig     = state.pl_mom_sig
-    closing = state.close_until is not None and now < state.close_until
+    sig       = state.pl_mom_sig
+    closing   = state.close_until is not None and now < state.close_until
+    adx_state = _read_pl_rev_state()
+    adx_val   = adx_state.get("adx", 0.0)
+    gate_open = adx_state.get("gate_open", True)   # True if no data yet (allow trade)
+    adx_known = bool(adx_state)
 
     # Reversion: qualify on same PL/move bars but enter OPPOSITE direction
     # sig.direction is the momentum direction; fade = -direction
     rev_qualifies = (sig is not None
                      and sig.pl >= PL_REV_ENTRY_PL
-                     and sig.move_bps >= PL_REV_MOVE_BPS)
+                     and sig.move_bps >= PL_REV_MOVE_BPS
+                     and gate_open)
 
     if closing:
         status, style, border = "CLOSE TRD",   "bold yellow on black", "yellow"
+    elif adx_known and not gate_open:
+        status, style, border = "ADX BLOCKED", "bold yellow",           "yellow"
     elif not rev_qualifies:
-        status, style, border = "WATCHING",    "bold",                 "default"
+        status, style, border = "WATCHING",    "bold",                  "default"
     elif sig.direction == 1:   # momentum up → fade SHORT
-        status, style, border = "FADE SHORT",  "bold red",             "red"
+        status, style, border = "FADE SHORT",  "bold red",              "red"
     else:                      # momentum down → fade LONG
-        status, style, border = "FADE LONG",   "bold green",           "green"
+        status, style, border = "FADE LONG",   "bold green",            "green"
 
     root = Table.grid(padding=(0, 0))
     root.add_column(justify="center")
@@ -520,9 +539,15 @@ def build_pl_mom_panel(state: MonitorState, now: datetime) -> Panel:
     thresh = Table.grid()
     thresh.add_column(justify="center", min_width=28)
     thresh.add_row(f"entry: PL ≥ {PL_REV_ENTRY_PL:.2f}  bp ≥ {PL_REV_MOVE_BPS:.0f}  "
-                   f"ADX gate ≤ {PL_REV_ADX_GATE:.0f}")
-    thresh.add_row(f"exit:  TP {PL_REV_TP_BPS:.0f}bp  stop {PL_REV_STOP_BPS:.0f}bp  "
+                   f"exit:  TP {PL_REV_TP_BPS:.0f}bp  stop {PL_REV_STOP_BPS:.0f}bp  "
                    f"resume PL ≥ {PL_REV_RESUME_PL:.2f}")
+    if adx_known:
+        adx_clr = "green" if gate_open else "bold yellow"
+        adx_lbl = "OPEN" if gate_open else "BLOCKED"
+        thresh.add_row(f"ADX(9-10ET)=[{adx_clr}]{adx_val:.1f}[/]  "
+                       f"gate ≤ {PL_REV_ADX_GATE:.0f} → [{adx_clr}]{adx_lbl}[/]")
+    else:
+        thresh.add_row(f"ADX gate ≤ {PL_REV_ADX_GATE:.0f}  (computed after 10:00 ET)")
     root.add_row(thresh)
 
     return Panel(root, title=f"PL REV  {SYMBOL}", border_style=border,
