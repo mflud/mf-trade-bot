@@ -174,6 +174,22 @@ PL_MOM_5S_FETCH        = 130    # 5s bars to fetch: covers sigma lookback (120) 
 PL_MOM_SIGMA_N         = 3.0    # move threshold = max(move_bps_floor, sigma_n × σ_30s_bps)
 PL_MOM_SIGMA_LOOKBACK  = 120    # 5s bars for rolling σ (10 min); backtest-optimal
 
+# ── PL_Reversion parameters ──────────────────────────────────────────────────
+# Fade the PL_MOM qualifying bar: enter OPPOSITE to momentum direction.
+# Backtest (excl Apr-2025): WR 91-97%, EV +6-9bp on MES over 2+ years.
+# ADX gate: if ADX(14) on 9:00-10:00 ET 1-min bars > PL_REV_ADX_GATE,
+#   the day is trending and reversion is suppressed.
+PL_REV_ENTRY_PL    = 0.80   # same qualifying PL threshold as PL_MOM
+PL_REV_MOVE_BPS    = 20.0   # minimum net move (bps) to qualify
+PL_REV_TP_BPS      = 12.0   # take profit: price reverts this many bps from entry
+PL_REV_STOP_BPS    = 15.0   # stop loss: price continues in original signal direction
+PL_REV_RESUME_PL   = 0.70   # exit early if PL surges back (trend resuming)
+PL_REV_MIN_HOLD_S  = 10     # seconds before RESUME_PL check is active (stop always live)
+PL_REV_MAX_HOLD_S  = 120    # max hold in seconds (same as PL_MOM)
+PL_REV_ADX_PERIOD  = 14     # ADX period (Wilder)
+PL_REV_ADX_GATE    = 25.0   # suppress reversion if ADX > this (trending open)
+PL_REV_ADX_BARS    = 80     # 1-min bars to fetch for ADX warmup (covers 9:00-10:00 ET)
+
 # ── Evening Resumption parameters ────────────────────────────────────────────
 # At 18:00 ET daily (CME resumes after 16:00–18:00 ET settlement gap):
 # if |gap from prev RTH close → first bar open| ≥ EVE_GAP_THRESH, enter in
@@ -196,6 +212,7 @@ SLR_LOG_PATH  = Path("logs/slr_trades.csv")
 EVE_LOG_PATH  = Path("logs/eve_trades.csv")
 SUN_LOG_PATH  = Path("logs/sun_gap_trades.csv")
 PL_MOM_LOG_PATH     = Path("logs/pl_mom_trades.csv")
+PL_REV_LOG_PATH     = Path("logs/pl_rev_trades.csv")
 WALL_BREAK_LOG_PATH = Path("logs/wall_break_trades.csv")
 
 # ── DOM DB constants ──────────────────────────────────────────────────────────
@@ -222,6 +239,11 @@ SLR_LOG_FIELDS = [
 PL_MOM_LOG_FIELDS = [
     "fired_at", "resolved_at", "symbol", "direction",
     "est_entry", "fill_price", "stop", "pl", "move_bps",
+    "outcome", "pnl_pts",
+]
+PL_REV_LOG_FIELDS = [
+    "fired_at", "resolved_at", "symbol", "direction",
+    "est_entry", "fill_price", "target", "stop", "pl", "move_bps", "adx",
     "outcome", "pnl_pts",
 ]
 EVE_LOG_FIELDS = [
@@ -561,6 +583,7 @@ class BotInstrument:
     target_sigma: float = 3.0
     tick_size:    float = 0.25   # minimum price increment
     point_value:  float = 5.00  # $ per point (informational only)
+    csr_enabled: bool = True   # CSR/3σ continuation signal; disable via --strategies flag
     # Dynamic CSR window: list of (gk_ann_vol_upper_bound, mom_bars)
     csr_vol_windows: list = field(default_factory=lambda: [(1.0, 8)])
     # Per-instrument blackout windows: (start_h, start_m, end_h, end_m, conditional)
@@ -599,6 +622,12 @@ class BotInstrument:
     pl_mom_exit_pl:        float = PL_MOM_EXIT_PL
     pl_mom_stop_bps:       float = PL_MOM_STOP_BPS
     pl_mom_sigma_lookback: int   = PL_MOM_SIGMA_LOOKBACK  # 5s bars for σ computation
+    # PL_Reversion: fade PL_MOM signal with ADX gate
+    pl_rev_enabled:  bool  = False
+    pl_rev_entry_pl: float = PL_REV_ENTRY_PL
+    pl_rev_move_bps: float = PL_REV_MOVE_BPS
+    pl_rev_tp_bps:   float = PL_REV_TP_BPS
+    pl_rev_stop_bps: float = PL_REV_STOP_BPS
 
 
 INSTRUMENTS = [
@@ -617,8 +646,8 @@ INSTRUMENTS = [
                   slr_enabled=True,
                   eve_enabled=False,
                   sun_gap_enabled=False,
-                  pl_mom_enabled=True, pl_mom_entry_pl=0.80, pl_mom_move_bps=8.0,
-                  pl_mom_stop_bps=7.0, pl_mom_exit_pl=0.40),
+                  pl_mom_enabled=False,  # disabled: no base-rate edge (WR~35%); replaced by PL_REV
+                  pl_rev_enabled=True),
     # MNQ: ORB-only re-enabled 2026-07-25; SLR/PL_MOM disabled (underperform MES).
     # 1-min ORB (9:30 bar), gap-fade-long only, full-range stop, 1× target.
     # Backtest: EV +30 pts/trade, 76% WR, 21 trades (Apr–Jul 2026, 15-min entry window).
@@ -836,6 +865,33 @@ class ActivePLMomTrade:
 
 
 @dataclass
+class PLRevSignal:
+    """Price Linearity Reversion signal — fades the PL_MOM qualifying bar."""
+    direction:  int    # +1 long, -1 short (OPPOSITE to momentum direction)
+    entry:      float
+    target:     float  # take profit price
+    stop:       float  # stop loss price
+    pl:         float
+    move_bps:   float
+    adx:        float  # ADX at signal time (for logging)
+    bar_ts:     datetime
+
+    def tp_pts(self):   return abs(self.target - self.entry)
+    def stop_pts(self): return abs(self.stop   - self.entry)
+
+
+@dataclass
+class ActivePLRevTrade:
+    instrument:  BotInstrument
+    contract_id: str
+    sig:         PLRevSignal
+    fired_at:    datetime
+    entry_ts:    datetime
+    order_id:    int | None = None
+    fill_price:  float | None = None
+
+
+@dataclass
 class EveningResumeSignal:
     """18:00 ET gap resumption signal (MES only). Time exit, no brackets."""
     entry:      float
@@ -950,6 +1006,11 @@ class InstrumentState:
     active_pl_mom_trade:  "ActivePLMomTrade | None" = None
     pl_mom_last_bar_ts:   "datetime | None" = None
     pl_mom_sigma_30s_bps: float = 0.0  # rolling σ of 30s (6-bar) moves in bps
+    # PL_Reversion state (shares 5s bars with PL_MOM)
+    active_pl_rev_trade:  "ActivePLRevTrade | None" = None
+    pl_rev_last_bar_ts:   "datetime | None" = None
+    pl_rev_adx:           float     = 0.0   # ADX(14) on 9:00-10:00 ET 1-min bars
+    pl_rev_adx_date:      "date | None" = None  # ET date when ADX was last computed
     eve_prev_close:       float | None = None     # last RTH close before 18:00 ET gap
     eve_fired_date:       date  | None = None     # ET date of last evening resumption trade
     active_evening_trade: ActiveEveningTrade | None = None
@@ -3005,6 +3066,382 @@ def handle_active_pl_mom_trade(client: TopstepClient, state: InstrumentState,
             pass
 
 
+# ── PL_Reversion ─────────────────────────────────────────────────────────────
+
+def _ensure_pl_rev_log():
+    PL_REV_LOG_PATH.parent.mkdir(exist_ok=True)
+    if not PL_REV_LOG_PATH.exists():
+        with open(PL_REV_LOG_PATH, "w", newline="") as f:
+            csv.DictWriter(f, fieldnames=PL_REV_LOG_FIELDS).writeheader()
+
+
+def _log_pl_rev_trade(trade: ActivePLRevTrade, outcome: str,
+                      exit_price: float, now: datetime):
+    fill    = trade.fill_price or trade.sig.entry
+    pnl_pts = (exit_price - fill) * trade.sig.direction
+    dirn    = "LONG" if trade.sig.direction == 1 else "SHORT"
+    row = {
+        "fired_at":    trade.fired_at.isoformat(),
+        "resolved_at": now.isoformat(),
+        "symbol":      trade.instrument.symbol,
+        "direction":   dirn,
+        "est_entry":   round(trade.sig.entry, 4),
+        "fill_price":  round(fill, 4),
+        "target":      round(trade.sig.target, 4),
+        "stop":        round(trade.sig.stop, 4),
+        "pl":          round(trade.sig.pl, 4),
+        "move_bps":    round(trade.sig.move_bps, 4),
+        "adx":         round(trade.sig.adx, 2),
+        "outcome":     outcome,
+        "pnl_pts":     round(pnl_pts, 4),
+    }
+    with open(PL_REV_LOG_PATH, "a", newline="") as f:
+        csv.DictWriter(f, fieldnames=PL_REV_LOG_FIELDS).writerow(row)
+    log.info(
+        f"PL_REV LOGGED  {trade.instrument.symbol} {dirn}  {outcome}  "
+        f"fill={fill:.2f}  exit={exit_price:.2f}  pnl={pnl_pts:+.2f}pts  "
+        f"pl={trade.sig.pl:.3f}  move={trade.sig.move_bps:.1f}bp  adx={trade.sig.adx:.1f}"
+    )
+
+
+def _compute_pl_rev_adx(client: TopstepClient, state: InstrumentState,
+                        now_et: datetime) -> float:
+    """
+    Compute ADX(14) on today's 9:00–10:00 ET 1-min bars.
+    Returns 0.0 on insufficient data (no gate applied → trade allowed).
+    Uses bar_collector DB when available; falls back to REST API.
+    """
+    symbol = state.instrument.symbol
+    try:
+        if bars_db_available():
+            raw_bars = get_bars_from_db(symbol, 1, PL_REV_ADX_BARS)
+        else:
+            end_utc   = datetime.now(timezone.utc)
+            start_utc = end_utc - timedelta(minutes=PL_REV_ADX_BARS + 5)
+            raw_bars  = list(reversed(client.get_bars(
+                contract_id=state.contract_id,
+                start=start_utc, end=end_utc,
+                unit=TopstepClient.MINUTE, unit_number=1,
+                limit=PL_REV_ADX_BARS,
+            )))
+    except Exception as e:
+        log.warning(f"PL_REV {symbol}: ADX bar fetch failed: {e}")
+        return 0.0
+
+    if not raw_bars:
+        return 0.0
+
+    # Normalise: DB returns dicts with "t"/"o"/"h"/"l"/"c"; REST returns same shape
+    def _get(b, *keys):
+        for k in keys:
+            if k in b:
+                return b[k]
+        return None
+
+    today_et = now_et.date()
+    window_start = dtime(9, 0)
+    window_end   = dtime(10, 0)
+
+    filtered = []
+    for b in raw_bars:
+        ts_raw = _get(b, "t", "ts")
+        if ts_raw is None:
+            continue
+        if isinstance(ts_raw, str):
+            ts_utc = datetime.fromisoformat(ts_raw)
+        else:
+            ts_utc = ts_raw
+        if ts_utc.tzinfo is None:
+            ts_utc = ts_utc.replace(tzinfo=timezone.utc)
+        ts_et = ts_utc.astimezone(ET)
+        if ts_et.date() == today_et and window_start <= ts_et.time() < window_end:
+            filtered.append({
+                "h": _get(b, "h", "high"),
+                "l": _get(b, "l", "low"),
+                "c": _get(b, "c", "close"),
+            })
+
+    n = len(filtered)
+    period = PL_REV_ADX_PERIOD
+    if n < period + 1:
+        log.debug(f"PL_REV {symbol}: only {n} bars for ADX window, skipping gate")
+        return 0.0
+
+    highs  = np.array([b["h"] for b in filtered], dtype=float)
+    lows   = np.array([b["l"] for b in filtered], dtype=float)
+    closes = np.array([b["c"] for b in filtered], dtype=float)
+
+    # True Range
+    tr = np.maximum(highs[1:] - lows[1:],
+         np.maximum(np.abs(highs[1:] - closes[:-1]),
+                    np.abs(lows[1:]  - closes[:-1])))
+    # Directional movement
+    up_move   = highs[1:] - highs[:-1]
+    down_move = lows[:-1] - lows[1:]
+    pos_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    neg_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+
+    m = len(tr)  # n-1 points
+    if m < period:
+        return 0.0
+
+    # Wilder smoothing of TR, +DM, -DM
+    atr  = np.empty(m); atr[period-1]  = tr[:period].sum()
+    pdm  = np.empty(m); pdm[period-1]  = pos_dm[:period].sum()
+    ndm  = np.empty(m); ndm[period-1]  = neg_dm[:period].sum()
+    for i in range(period, m):
+        atr[i] = atr[i-1] - atr[i-1] / period + tr[i]
+        pdm[i] = pdm[i-1] - pdm[i-1] / period + pos_dm[i]
+        ndm[i] = ndm[i-1] - ndm[i-1] / period + neg_dm[i]
+
+    pdi = np.where(atr[period-1:] > 0, 100 * pdm[period-1:] / atr[period-1:], 0.0)
+    ndi = np.where(atr[period-1:] > 0, 100 * ndm[period-1:] / atr[period-1:], 0.0)
+    denom = pdi + ndi
+    dx = np.where(denom > 0, 100 * np.abs(pdi - ndi) / denom, 0.0)
+
+    if len(dx) < period:
+        return 0.0
+
+    # Wilder smoothing of DX → ADX (mean init)
+    adx = np.empty(len(dx))
+    adx[period-1] = dx[:period].mean()
+    for i in range(period, len(dx)):
+        adx[i] = (adx[i-1] * (period - 1) + dx[i]) / period
+
+    result = float(adx[-1])
+    log.info(f"PL_REV {symbol}: ADX({period}) on 9:00-10:00 ET = {result:.1f}")
+    return result
+
+
+def evaluate_pl_reversion(state: InstrumentState) -> PLRevSignal | None:
+    """
+    Evaluate PL_Reversion on the same 5s bar window as PL_MOM.
+    Qualifies identically (PL ≥ threshold, move ≥ threshold) but enters
+    in the OPPOSITE direction (fading the momentum move).
+    Suppressed if today's ADX > PL_REV_ADX_GATE (trending open).
+    """
+    # ADX gate: if today's opening was trending, skip reversion
+    if state.pl_rev_adx > 0 and state.pl_rev_adx > PL_REV_ADX_GATE:
+        return None
+
+    inst = state.instrument
+    bars = state.pl_mom_5s_bars  # shared with PL_MOM
+    window = PL_MOM_WINDOW  # same 30s window
+    if len(bars) < window + 1:
+        return None
+
+    window_bars = bars[-window:]
+    for i in range(1, len(window_bars)):
+        dt = (window_bars[i].ts - window_bars[i - 1].ts).total_seconds()
+        if dt > 8:
+            return None
+
+    last_bar = window_bars[-1]
+    closes   = np.array([b.close for b in window_bars], dtype=float)
+    rets     = np.log(closes[1:] / closes[:-1])
+    sum_abs  = float(np.abs(rets).sum())
+    if sum_abs == 0:
+        return None
+
+    pl = float(abs(rets.sum()) / sum_abs)
+    if pl < inst.pl_rev_entry_pl:
+        return None
+
+    net_ret  = float(rets.sum())
+    entry    = last_bar.close
+    if entry <= 0:
+        return None
+    move_bps = abs(net_ret) * 10000
+    if move_bps < inst.pl_rev_move_bps:
+        return None
+
+    # FLIP: enter opposite to momentum direction
+    signal_dir = 1 if net_ret > 0 else -1
+    direction  = -signal_dir
+
+    tp_pt   = entry * inst.pl_rev_tp_bps   / 10000.0
+    stop_pt = entry * inst.pl_rev_stop_bps / 10000.0
+    target  = entry + direction * tp_pt
+    stop    = entry - direction * stop_pt
+
+    return PLRevSignal(
+        direction=direction, entry=entry,
+        target=target, stop=stop,
+        pl=pl, move_bps=move_bps, adx=state.pl_rev_adx,
+        bar_ts=last_bar.ts,
+    )
+
+
+def place_pl_rev_signal(client: TopstepClient, state: InstrumentState,
+                        sig: PLRevSignal, account_id: int,
+                        paper: bool, now: datetime) -> ActivePLRevTrade:
+    inst      = state.instrument
+    tick      = inst.tick_size
+    is_long   = sig.direction == 1
+    dir_label = "LONG" if is_long else "SHORT"
+
+    # Convert bps distances to tick counts
+    tp_mag   = max(1, round(sig.tp_pts() / tick))
+    stop_mag = max(1, round(sig.stop_pts() / tick))
+    # API convention: negative = loss-side ticks for long; positive for short
+    take_profit_ticks = tp_mag   if is_long else -tp_mag
+    stop_loss_ticks   = -stop_mag if is_long else stop_mag
+
+    trade = ActivePLRevTrade(
+        instrument=inst, contract_id=state.contract_id,
+        sig=sig, fired_at=sig.bar_ts, entry_ts=now,
+    )
+
+    log_dom_at_signal("PL_REV", inst.symbol, sig.direction, sig.entry, state.dom)
+
+    if paper:
+        log.info(
+            f"[PAPER] PL_REV {inst.symbol} {dir_label}  entry≈{sig.entry:.2f}  "
+            f"tp={sig.target:.2f} ({sig.tp_pts():.2f}pts  {inst.pl_rev_tp_bps:.0f}bp)  "
+            f"stop={sig.stop:.2f} ({sig.stop_pts():.2f}pts  {inst.pl_rev_stop_bps:.0f}bp)  "
+            f"pl={sig.pl:.3f}  move={sig.move_bps:.1f}bp  adx={sig.adx:.1f}  "
+            f"max={PL_REV_MAX_HOLD_S}s"
+        )
+    else:
+        order_side = TopstepClient.BID if is_long else TopstepClient.ASK
+        resp = client.place_order(
+            account_id=account_id,
+            contract_id=state.contract_id,
+            side=order_side,
+            size=1,
+            order_type=TopstepClient.ORDER_MARKET,
+            stop_loss_ticks=stop_loss_ticks,
+            take_profit_ticks=take_profit_ticks,
+            custom_tag=f"plr_{inst.symbol}_{sig.bar_ts.strftime('%Y%m%d%H%M%S')}_{random.randint(100,999)}",
+        )
+        trade.order_id = resp.get("orderId")
+        log.info(
+            f"PL_REV ORDER  {inst.symbol} {dir_label}  order_id={trade.order_id}  "
+            f"entry≈{sig.entry:.2f}  tp={take_profit_ticks}t  stop={stop_loss_ticks}t  "
+            f"pl={sig.pl:.3f}  move={sig.move_bps:.1f}bp  adx={sig.adx:.1f}"
+        )
+
+    state.active_pl_rev_trade = trade
+    return trade
+
+
+def handle_active_pl_rev_trade(client: TopstepClient, state: InstrumentState,
+                                account_id: int, now: datetime, paper: bool):
+    trade = state.active_pl_rev_trade
+
+    if paper:
+        # Paper mode: time exit only (bracket simulation not needed)
+        if now >= trade.entry_ts + timedelta(seconds=PL_REV_MAX_HOLD_S):
+            exit_price = (state.pl_mom_5s_bars[-1].close if state.pl_mom_5s_bars
+                          else trade.sig.entry)
+            _log_pl_rev_trade(trade, "TIME EXIT (paper)", exit_price, now)
+            state.active_pl_rev_trade = None
+        return
+
+    # Live mode: native OCO bracket handles TP/stop; we check RESUME_PL + time exit
+    try:
+        positions = client.get_open_positions(account_id)
+    except Exception as e:
+        log.warning(f"PL_REV {trade.instrument.symbol}: could not fetch positions: {e}")
+        return
+
+    pos = next(
+        (p for p in positions if p.get("contractId") == trade.contract_id),
+        None,
+    )
+
+    if pos and trade.fill_price is None:
+        trade.fill_price = pos.get("averagePrice")
+        log.info(f"PL_REV {trade.instrument.symbol} fill confirmed: {trade.fill_price:.2f}")
+        play_trade_sound()
+
+    if pos is None:
+        # Position closed — TP or stop hit by native bracket
+        exit_price = _get_exit_price(client, account_id, trade.fired_at,
+                                     trade.contract_id, now,
+                                     entry_price=trade.fill_price or trade.sig.entry)
+        fill = trade.fill_price or trade.sig.entry
+        if exit_price is None:
+            exit_price = trade.sig.stop
+        # Determine outcome by comparing exit vs target/stop
+        pnl_pts = (exit_price - fill) * trade.sig.direction
+        if pnl_pts >= 0:
+            outcome = "TP HIT"
+        else:
+            outcome = "STOPPED"
+        _log_pl_rev_trade(trade, outcome, exit_price, now)
+        state.active_pl_rev_trade = None
+        try:
+            n = client.cancel_all_orders(account_id)
+            if n:
+                log.info(f"PL_REV {trade.instrument.symbol} {outcome}: cancelled {n} residual order(s)")
+        except Exception as e:
+            log.warning(f"PL_REV {trade.instrument.symbol}: cancel_all_orders failed: {e}")
+        return
+
+    # RESUME_PL exit: if PL surges above RESUME_PL, trend is resuming — bail early
+    min_hold_ok = (now - trade.entry_ts).total_seconds() >= PL_REV_MIN_HOLD_S
+    if min_hold_ok and state.pl_mom_5s_bars:
+        window = state.pl_mom_5s_bars[-PL_MOM_WINDOW:]
+        if len(window) >= PL_MOM_WINDOW:
+            closes  = np.array([b.close for b in window], dtype=float)
+            rets    = np.log(closes[1:] / closes[:-1])
+            sum_abs = float(np.abs(rets).sum())
+            cur_pl  = abs(float(rets.sum()) / sum_abs) if sum_abs > 0 else 0.0
+            if cur_pl >= PL_REV_RESUME_PL:
+                log.info(
+                    f"PL_REV {trade.instrument.symbol} RESUME EXIT  "
+                    f"cur_pl={cur_pl:.3f} ≥ {PL_REV_RESUME_PL} (trend resuming)"
+                )
+                try:
+                    client.cancel_all_orders(account_id)
+                except Exception as e:
+                    log.warning(f"PL_REV {trade.instrument.symbol}: pre-resume cancel failed: {e}")
+                try:
+                    client.close_position(account_id, trade.contract_id)
+                except Exception as e:
+                    log.error(f"PL_REV {trade.instrument.symbol}: RESUME EXIT close_position failed: {e}")
+                    return
+                actual_exit = _get_exit_price(client, account_id, trade.entry_ts,
+                                              trade.contract_id, now,
+                                              entry_price=trade.fill_price or trade.sig.entry)
+                exit_price = actual_exit if actual_exit is not None else (
+                    state.pl_mom_5s_bars[-1].close if state.pl_mom_5s_bars
+                    else (trade.fill_price or trade.sig.entry))
+                _log_pl_rev_trade(trade, "RESUME EXIT", exit_price, now)
+                state.active_pl_rev_trade = None
+                try:
+                    client.cancel_all_orders(account_id)
+                except Exception:
+                    pass
+                return
+
+    # Time exit
+    if now >= trade.entry_ts + timedelta(seconds=PL_REV_MAX_HOLD_S):
+        log.info(f"PL_REV {trade.instrument.symbol} max hold reached — closing")
+        try:
+            client.cancel_all_orders(account_id)
+        except Exception as e:
+            log.warning(f"PL_REV {trade.instrument.symbol}: pre-close cancel_all failed: {e}")
+        try:
+            client.close_position(account_id, trade.contract_id)
+        except Exception as e:
+            log.error(f"PL_REV {trade.instrument.symbol}: failed to close position: {e}")
+            return
+        actual_exit = _get_exit_price(client, account_id, trade.entry_ts,
+                                      trade.contract_id, now,
+                                      entry_price=trade.fill_price or trade.sig.entry)
+        exit_price = actual_exit if actual_exit is not None else (
+            state.pl_mom_5s_bars[-1].close if state.pl_mom_5s_bars
+            else (trade.fill_price or trade.sig.entry))
+        _log_pl_rev_trade(trade, "TIME EXIT", exit_price, now)
+        state.active_pl_rev_trade = None
+        try:
+            client.cancel_all_orders(account_id)
+        except Exception:
+            pass
+
+
 # ── Evening Resumption ───────────────────────────────────────────────────────
 
 def _ensure_eve_log():
@@ -3429,7 +3866,25 @@ def handle_active_sunday_gap_trade(client: TopstepClient, state: InstrumentState
 
 # ── Main loop ────────────────────────────────────────────────────────────────
 
-def run(account_id: int | None, paper: bool):
+KNOWN_STRATEGIES = {"csr", "orb", "vwaslr", "slr", "eve", "sun", "pl_mom", "pl_rev", "wall"}
+
+
+def _apply_strategy_filter(inst: BotInstrument, strategies: set[str]) -> BotInstrument:
+    """Return a copy of inst with only the requested strategies enabled."""
+    from dataclasses import replace
+    overrides: dict = {}
+    if "csr"    not in strategies: overrides["csr_enabled"]     = False
+    if "orb"    not in strategies: overrides["orb_enabled"]     = False
+    if "vwaslr" not in strategies: overrides["vwaslr_n"]        = 0
+    if "slr"    not in strategies: overrides["slr_enabled"]     = False
+    if "eve"    not in strategies: overrides["eve_enabled"]     = False
+    if "sun"    not in strategies: overrides["sun_gap_enabled"] = False
+    if "pl_mom" not in strategies: overrides["pl_mom_enabled"]  = False
+    if "pl_rev" not in strategies: overrides["pl_rev_enabled"]  = False
+    return replace(inst, **overrides) if overrides else inst
+
+
+def run(account_id: int | None, paper: bool, strategies: set[str] | None = None):
     client = TopstepClient()
     client.use_shared_token()  # reuse bar_collector's token — avoids multiple-sessions disconnect
 
@@ -3456,12 +3911,16 @@ def run(account_id: int | None, paper: bool):
             f"Update PRACTICE_ACCOUNT_NAME in trading_bot.py to authorise a different account."
         )
 
+    strat_label = ", ".join(sorted(strategies)) if strategies else "all"
     log.info(f"Account: {acct_name}  id={account_id}  balance=${acct_balance:,.2f}"
-             + ("  [PAPER]" if paper else "  [LIVE]"))
+             + ("  [PAPER]" if paper else "  [LIVE]")
+             + f"  strategies={strat_label}")
 
     # Initialise instrument states
     states: list[InstrumentState] = []
     for inst in INSTRUMENTS:
+        if strategies is not None:
+            inst = _apply_strategy_filter(inst, strategies)
         contracts = client.search_contracts(inst.search_term)
         if not contracts:
             log.error(f"No contract found for {inst.symbol}")
@@ -3498,6 +3957,7 @@ def run(account_id: int | None, paper: bool):
     _ensure_eve_log()
     _ensure_sun_log()
     _ensure_pl_mom_log()
+    _ensure_pl_rev_log()
     _ensure_wall_break_log()
     _ensure_dom_signal_log()
     for state in states:
@@ -3599,12 +4059,21 @@ def run(account_id: int | None, paper: bool):
                 if state.active_pl_mom_trade:
                     handle_active_pl_mom_trade(client, state, account_id, now, paper)
 
+                # PL_Rev: fetch updated 5s bars (shared with PL_MOM) when trade active
+                if state.active_pl_rev_trade and state.instrument.pl_rev_enabled:
+                    if not (state.active_pl_mom_trade and state.instrument.pl_mom_enabled):
+                        fetch_pl_mom_bars(client, state)  # shared fetch
+
+                if state.active_pl_rev_trade:
+                    handle_active_pl_rev_trade(client, state, account_id, now, paper)
+
                 # Only enter new trades when no position is open on this instrument
                 no_position = (not state.active_trade
                                and not state.active_orb_trade
                                and not state.active_vwaslr_trade
                                and not state.active_slr_trade
                                and not state.active_pl_mom_trade
+                               and not state.active_pl_rev_trade
                                and not state.active_evening_trade
                                and not state.active_sunday_gap_trade
                                and not state.active_wall_break_trade)
@@ -3619,7 +4088,7 @@ def run(account_id: int | None, paper: bool):
                 slr_in_rth       = (9, 40) <= now_et_hm < (16, 0)
                 slr_past_cutoff  = past_cutoff and slr_in_rth
 
-                if no_position and not past_cutoff:
+                if no_position and not past_cutoff and state.instrument.csr_enabled:
                     sig = evaluate(state)
                     if sig and last_bar_ts != state.last_evaluated_ts:
                         state.last_evaluated_ts = last_bar_ts
@@ -3704,6 +4173,32 @@ def run(account_id: int | None, paper: bool):
                                 place_pl_mom_signal(client, state, pl_mom_sig,
                                                     account_id, paper, now)
 
+                # PL_Reversion entry: RTH only, after 10:00 ET (ADX computed by then)
+                # Shares 5s bars with PL_MOM; ADX gate computed once per day at 10:00 ET.
+                if state.instrument.pl_rev_enabled:
+                    now_et_hm_chk = (now_et.hour, now_et.minute)
+                    # Compute ADX once per day after 10:00 ET
+                    if now_et_hm_chk >= (10, 0):
+                        today_et = now_et.date()
+                        if state.pl_rev_adx_date != today_et:
+                            state.pl_rev_adx      = _compute_pl_rev_adx(client, state, now_et)
+                            state.pl_rev_adx_date = today_et
+
+                    # Re-check: PL_MOM may have just fired this iteration (same bar, opposite direction)
+                    no_position_rev = no_position and not state.active_pl_mom_trade
+                    if no_position_rev and not past_cutoff and (10, 0) <= now_et_hm_chk < (16, 0):
+                        # 5s bars already fetched by PL_MOM block; fetch if PL_MOM is off
+                        if not state.instrument.pl_mom_enabled:
+                            fetch_pl_mom_bars(client, state)
+                        pl_rev_bar_ts = (state.pl_mom_5s_bars[-1].ts
+                                         if state.pl_mom_5s_bars else None)
+                        if pl_rev_bar_ts != state.pl_rev_last_bar_ts:
+                            state.pl_rev_last_bar_ts = pl_rev_bar_ts
+                            pl_rev_sig = evaluate_pl_reversion(state)
+                            if pl_rev_sig:
+                                place_pl_rev_signal(client, state, pl_rev_sig,
+                                                    account_id, paper, now)
+
                 # Wall Breakout signal: RTH only, 9:40–16:00 ET, no position
                 if no_position and not past_cutoff and (9, 40) <= now_et_hm < (16, 0):
                     wb_sig = evaluate_wall_break(state, now)
@@ -3751,6 +4246,19 @@ if __name__ == "__main__":
                         help="Detect signals and log them but place no real orders")
     parser.add_argument("--account", type=int, default=None,
                         help="TopstepX account ID (auto-detects first active account if omitted)")
+    parser.add_argument("--strategies", type=str, default=None,
+                        help=(f"Comma-separated list of strategies to enable. "
+                              f"Known: {', '.join(sorted(KNOWN_STRATEGIES))}. "
+                              f"Default: all strategies enabled per instrument config. "
+                              f"Example: --strategies pl_rev,orb"))
     args = parser.parse_args()
 
-    run(account_id=args.account, paper=args.paper)
+    strategies: set[str] | None = None
+    if args.strategies:
+        strategies = {s.strip().lower() for s in args.strategies.split(",")}
+        unknown = strategies - KNOWN_STRATEGIES
+        if unknown:
+            parser.error(f"Unknown strategies: {', '.join(sorted(unknown))}. "
+                         f"Known: {', '.join(sorted(KNOWN_STRATEGIES))}")
+
+    run(account_id=args.account, paper=args.paper, strategies=strategies)
