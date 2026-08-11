@@ -23,6 +23,7 @@ TRADE_LOGS = {
     "VWASLR": Path("logs/vwaslr_trades.csv"),
     "SLR":    Path("logs/slr_trades.csv"),
     "PL MOM": Path("logs/pl_mom_trades.csv"),
+    "PL REV": Path("logs/pl_rev_trades.csv"),
 }
 
 STRAT_STYLE = {

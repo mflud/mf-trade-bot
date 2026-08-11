@@ -4240,6 +4240,8 @@ if __name__ == "__main__":
             logging.FileHandler("logs/bot.log"),
         ],
     )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
     parser = argparse.ArgumentParser(description="MES/MNQ 3σ continuation trading bot")
     parser.add_argument("--paper", action="store_true",

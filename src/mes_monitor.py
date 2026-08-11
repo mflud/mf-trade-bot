@@ -58,10 +58,10 @@ SLR_HOLD_RTH     = 15
 SLR_HOLD_GLOBEX  = 10
 SLR_BARS_FETCH   = 200
 
-# ── PL_MOM constants (keep in sync with trading_bot.py / pl_monitor.py) ───────
+# ── PL_MOM / PL_REV constants (keep in sync with trading_bot.py) ──────────────
 PL_MOM_WINDOW     = 6
 PL_MOM_ENTRY_PL   = 0.80
-PL_MOM_MOVE_BPS   = 8.0     # floor
+PL_MOM_MOVE_BPS   = 8.0     # floor (PL_MOM; not used for REV display)
 PL_MOM_EXIT_PL    = 0.40
 PL_MOM_STOP_BPS   = 7.0
 PL_MOM_MIN_HOLD_S = 10
@@ -71,6 +71,14 @@ PL_MOM_SIGMA_N    = 3.0
 PL_MOM_SIGMA_LB   = 120
 HISTORY_BARS      = 24
 CLOSE_TRD_SHOW_S  = 8
+
+# PL_REV (reversion) — qualifying thresholds for the fade signal
+PL_REV_ENTRY_PL  = 0.80
+PL_REV_MOVE_BPS  = 20.0
+PL_REV_TP_BPS    = 12.0
+PL_REV_STOP_BPS  = 15.0
+PL_REV_RESUME_PL = 0.70
+PL_REV_ADX_GATE  = 25.0
 
 # ── DOM constants ─────────────────────────────────────────────────────────────
 WALL_MULT      = 2.5
@@ -432,17 +440,24 @@ def _centered_bar(ratio: float, is_long: bool, half: int = 6) -> str:
 # ── Panel builders ────────────────────────────────────────────────────────────
 
 def build_pl_mom_panel(state: MonitorState, now: datetime) -> Panel:
+    """PL Reversion panel — shows the fade signal (opposite to momentum direction)."""
     sig     = state.pl_mom_sig
     closing = state.close_until is not None and now < state.close_until
 
+    # Reversion: qualify on same PL/move bars but enter OPPOSITE direction
+    # sig.direction is the momentum direction; fade = -direction
+    rev_qualifies = (sig is not None
+                     and sig.pl >= PL_REV_ENTRY_PL
+                     and sig.move_bps >= PL_REV_MOVE_BPS)
+
     if closing:
-        status, style, border = "CLOSE TRD", "bold yellow on black", "yellow"
-    elif sig is None:
-        status, style, border = "NO TRADE",  "bold",                 "default"
-    elif sig.direction == 1:
-        status, style, border = "BUY LONG",  "bold green",           "green"
-    else:
-        status, style, border = "SELL SHORT", "bold red",            "red"
+        status, style, border = "CLOSE TRD",   "bold yellow on black", "yellow"
+    elif not rev_qualifies:
+        status, style, border = "WATCHING",    "bold",                 "default"
+    elif sig.direction == 1:   # momentum up → fade SHORT
+        status, style, border = "FADE SHORT",  "bold red",             "red"
+    else:                      # momentum down → fade LONG
+        status, style, border = "FADE LONG",   "bold green",           "green"
 
     root = Table.grid(padding=(0, 0))
     root.add_column(justify="center")
@@ -453,17 +468,25 @@ def build_pl_mom_panel(state: MonitorState, now: datetime) -> Panel:
     root.add_row(hdr)
     root.add_row("")
 
-    if sig and not closing:
+    if rev_qualifies and not closing:
         det = Table.grid(padding=(0, 1))
         det.add_column(width=8, justify="right")
         det.add_column()
-        rem_s   = max(0, int((sig.expires_at() - now).total_seconds()))
-        rem_str = f"{rem_s // 60}m {rem_s % 60:02d}s"
-        clr     = "green" if sig.direction == 1 else "red"
-        dirn    = "▲ LONG" if sig.direction == 1 else "▼ SHORT"
-        det.add_row("", f"[bold {clr}]{dirn}[/]  PL={sig.pl:.3f}  {sig.move_bps:.1f}bp")
+        fade_dir  = -sig.direction
+        clr       = "green" if fade_dir == 1 else "red"
+        mom_sym   = "▲" if sig.direction == 1 else "▼"
+        fade_sym  = "▼ SHORT" if fade_dir == -1 else "▲ LONG"
+        tp_pt     = sig.entry * PL_REV_TP_BPS   / 10000.0
+        stop_pt   = sig.entry * PL_REV_STOP_BPS / 10000.0
+        target    = sig.entry + fade_dir * tp_pt
+        stop      = sig.entry - fade_dir * stop_pt
+        rem_s     = max(0, int((sig.expires_at() - now).total_seconds()))
+        rem_str   = f"{rem_s // 60}m {rem_s % 60:02d}s"
+        det.add_row("", f"mom {mom_sym}  →  fade [bold {clr}]{fade_sym}[/]  "
+                        f"PL={sig.pl:.3f}  {sig.move_bps:.1f}bp")
         det.add_row("Entry:",   f"[bold]{sig.entry:,.2f}[/]")
-        det.add_row("Stop:",    f"[bold red]{sig.stop:,.2f}[/]  ({sig.stop_pts():.2f} pts)")
+        det.add_row("Target:",  f"[bold green]{target:,.2f}[/]  ({tp_pt:.2f} pts  {PL_REV_TP_BPS:.0f}bp)")
+        det.add_row("Stop:",    f"[bold red]{stop:,.2f}[/]  ({stop_pt:.2f} pts  {PL_REV_STOP_BPS:.0f}bp)")
         det.add_row("Expires:", rem_str)
         root.add_row(det)
         root.add_row("")
@@ -471,40 +494,38 @@ def build_pl_mom_panel(state: MonitorState, now: datetime) -> Panel:
     hist = state.pl_mom_history[-HISTORY_BARS:]
     if hist:
         ht = Table(box=box.SIMPLE, show_header=True, padding=(0, 1), header_style="bold")
-        ht.add_column("time",  justify="right")
-        ht.add_column("",      justify="center")
-        ht.add_column("",      justify="left", no_wrap=True)
-        ht.add_column("PL",    justify="right")
-        ht.add_column("bp",    justify="right")
+        ht.add_column("time",   justify="right")
+        ht.add_column("mom",    justify="center")
+        ht.add_column("",       justify="left", no_wrap=True)
+        ht.add_column("PL",     justify="right")
+        ht.add_column("bp",     justify="right")
+        ht.add_column("fade?",  justify="center")
         for ts, pl, dir_sym, move in reversed(hist):
-            t_str  = ts.astimezone(LOCAL).strftime("%H:%M:%S")
-            pl_sty = ("bold green" if pl >= PL_MOM_ENTRY_PL else
-                      "yellow"     if pl >= PL_MOM_ENTRY_PL * 0.85 else "")
-            bp_sty = "bold green" if move >= PL_MOM_MOVE_BPS else ""
+            t_str    = ts.astimezone(LOCAL).strftime("%H:%M:%S")
+            qualifies = pl >= PL_REV_ENTRY_PL and move >= PL_REV_MOVE_BPS
+            pl_sty   = "bold green" if pl >= PL_REV_ENTRY_PL else (
+                        "yellow"    if pl >= PL_REV_ENTRY_PL * 0.85 else "")
+            bp_sty   = "bold green" if move >= PL_REV_MOVE_BPS else ""
+            fade_col = ("[bold green]✓[/]" if qualifies else "")
             ht.add_row(
                 t_str, dir_sym, _pl_bar(pl, dir_sym),
                 f"[{pl_sty}]{pl:.3f}[/]" if pl_sty else f"{pl:.3f}",
                 f"[{bp_sty}]{move:.1f}[/]" if bp_sty else f"{move:.1f}",
+                fade_col,
             )
         root.add_row(ht)
     elif not state.bars_5s:
         root.add_row("warming up…")
 
-    sigma   = state.sigma_30s_bps
-    eff_thr = max(PL_MOM_MOVE_BPS, PL_MOM_SIGMA_N * sigma) if sigma > 0 else PL_MOM_MOVE_BPS
-    if sigma > 0 and eff_thr > PL_MOM_MOVE_BPS:
-        thr_str = f"bp ≥ {eff_thr:.1f} (floor {PL_MOM_MOVE_BPS:.0f}, σ={sigma:.1f})"
-    elif sigma > 0:
-        thr_str = f"bp ≥ {PL_MOM_MOVE_BPS:.0f} (σ={sigma:.1f})"
-    else:
-        thr_str = f"bp ≥ {PL_MOM_MOVE_BPS:.0f}"
     thresh = Table.grid()
     thresh.add_column(justify="center", min_width=28)
-    thresh.add_row(f"entry: PL ≥ {PL_MOM_ENTRY_PL:.2f}  {thr_str}")
-    thresh.add_row(f"exit:  PL ≤ {PL_MOM_EXIT_PL:.2f}  stop {PL_MOM_STOP_BPS:.0f}bp")
+    thresh.add_row(f"entry: PL ≥ {PL_REV_ENTRY_PL:.2f}  bp ≥ {PL_REV_MOVE_BPS:.0f}  "
+                   f"ADX gate ≤ {PL_REV_ADX_GATE:.0f}")
+    thresh.add_row(f"exit:  TP {PL_REV_TP_BPS:.0f}bp  stop {PL_REV_STOP_BPS:.0f}bp  "
+                   f"resume PL ≥ {PL_REV_RESUME_PL:.2f}")
     root.add_row(thresh)
 
-    return Panel(root, title=f"PL MOM  {SYMBOL}", border_style=border,
+    return Panel(root, title=f"PL REV  {SYMBOL}", border_style=border,
                  padding=(0, 1), expand=True)
 
 
@@ -794,7 +815,8 @@ def _detect_position_strategy() -> str:
                 continue
             if "VWASLR ORDER" in line: return "VWASLR"
             if "SLR ORDER"    in line: return "SLR"
-            if "PL MOM ORDER" in line: return "PL MOM"
+            if "PL_REV ORDER" in line: return "PL REV"
+            if "PL_MOM ORDER" in line: return "PL MOM"
             if "ORB ORDER"    in line: return "ORB"
             if "ORDER PLACED" in line: return "CSR"
     except Exception:

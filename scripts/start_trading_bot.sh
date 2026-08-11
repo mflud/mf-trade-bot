@@ -28,6 +28,6 @@ for i in $(seq 1 60); do
 done
 
 cd "$REPO"
-nohup "$PYTHON" src/trading_bot.py >> "$LOGFILE" 2>&1 &
+nohup "$PYTHON" src/trading_bot.py "$@" >> "$LOGFILE" 2>&1 &
 echo $! > "$PIDFILE"
-echo "$(date): started trading_bot (pid $!)" >> "$REPO/logs/cron.log"
+echo "$(date): started trading_bot (pid $!) args: $*" >> "$REPO/logs/cron.log"
