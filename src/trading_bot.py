@@ -21,7 +21,7 @@ Logs: bot_trades.csv (CSR), orb_trades.csv, vwaslr_trades.csv,
     Entry : 5s bars: PL ≥ 0.80, move ≥ 20bp, ADX(9:00-10:00 ET) ≤ 25
             Fades the momentum move (enters OPPOSITE to momentum direction)
     Stop  : 15bp
-    Target: 12bp
+    Target: 24bp
     Exit  : Native OCO bracket; early exit if PL resumes ≥ 0.70; 120s max
 
   Wall Break (DOM resting-order breakout) — MES, RTH
@@ -173,7 +173,7 @@ PL_MOM_SIGMA_LOOKBACK  = 120    # 5s bars for rolling σ (10 min); backtest-opti
 # The natural "already in position" cooldown acts as the de-clustering filter.
 PL_REV_ENTRY_PL    = 0.80   # same qualifying PL threshold as PL_MOM
 PL_REV_MOVE_BPS    = 20.0   # minimum net move (bps) to qualify
-PL_REV_TP_BPS      = 12.0   # take profit: price reverts this many bps from entry
+PL_REV_TP_BPS      = 24.0   # take profit: price reverts this many bps from entry
 PL_REV_STOP_BPS    = 15.0   # stop loss: price continues in original signal direction
 PL_REV_RESUME_PL   = 0.70   # exit early if PL surges back (trend resuming)
 PL_REV_MIN_HOLD_S  = 10     # seconds before RESUME_PL check is active (stop always live)

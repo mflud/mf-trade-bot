@@ -63,7 +63,7 @@ VWASLR_BARS_FETCH = 580   # VWASLR_SIGMA_BARS + VWASLR_N + headroom
 PL_WINDOW       = 6      # 5s bars = 30s
 PL_ENTRY_PL     = 0.80
 PL_MOVE_BPS     = 20.0
-PL_TP_BPS       = 12.0
+PL_TP_BPS       = 24.0
 PL_STOP_BPS     = 15.0
 PL_RESUME_PL    = 0.70
 PL_MAX_HOLD_S   = 120
