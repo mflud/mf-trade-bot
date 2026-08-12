@@ -780,8 +780,20 @@ def run(demo: bool = False):
     # Backfill
     backfill(client, states, _bars_conn, demo)
 
-    # Token factory
+    # Token factory — re-authenticates if token is older than 90 minutes
+    # (TopstepX bearer tokens expire after ~2 hours; refresh proactively)
+    _token_refreshed_at = [time.time()]
+    TOKEN_REFRESH_INTERVAL = 90 * 60  # seconds
+
     def token_factory():
+        age = time.time() - _token_refreshed_at[0]
+        if age > TOKEN_REFRESH_INTERVAL:
+            try:
+                client.login()
+                _token_refreshed_at[0] = time.time()
+                log.info("market-hub: token refreshed (was %.0f min old)" % (age / 60))
+            except Exception as e:
+                log.warning(f"market-hub: token refresh failed: {e}")
         return client.token
 
     # Build a lookup: contract_id → (sym, SymbolState)
