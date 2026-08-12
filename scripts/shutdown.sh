@@ -4,6 +4,5 @@
 
 REPO=/Users/marek/mf-trade-bot
 
-bash "$REPO/scripts/stop_trading_bot.sh"
-bash "$REPO/scripts/stop_signal_monitor.sh"
-bash "$REPO/scripts/stop_slr_monitor.sh"
+bash "$REPO/scripts/stop_focused_bot.sh"
+bash "$REPO/scripts/stop_focused_monitor.sh"

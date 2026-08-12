@@ -15,4 +15,5 @@ if [[ $dow -ge 6 ]]; then
     exit 0
 fi
 
-bash "$REPO/scripts/start_ml_trading_bot.sh"
+bash "$REPO/scripts/start_focused_bot.sh"
+bash "$REPO/scripts/start_focused_monitor.sh"
