@@ -84,8 +84,8 @@ from wall_tracker import WallTracker, WallEvent, log_wall_events, ensure_wall_lo
 
 # Practice account — the only account the live bot is permitted to trade on.
 # Set TOPSTEP_ACCOUNT_ID in .env to override.
-PRACTICE_ACCOUNT_ID = int(os.environ.get("TOPSTEP_ACCOUNT_ID", "10634862"))
-PRACTICE_ACCOUNT_NAME = "PRAC-V2-88916-19336808"
+PRACTICE_ACCOUNT_ID = int(os.environ.get("TOPSTEP_ACCOUNT_ID", "26512465"))
+PRACTICE_ACCOUNT_NAME = "PRAC-V2-88916-14127231"
 
 # ── Parameters (keep in sync with signal_monitor.py) ────────────────────────
 
