@@ -681,11 +681,13 @@ def flush_partial_bars_loop(states: dict[str, SymbolState],
 
 # ── Silent-feed watchdog ──────────────────────────────────────────────────────
 
-TICK_TIMEOUT_SECS = 300   # force reconnect if no ticks for 5 min during market hours
+TICK_TIMEOUT_SECS = 90    # force reconnect if no ticks for 90s during market hours
 
-def silent_feed_watchdog(market_hub: "SignalRConn", last_tick: list):
+def silent_feed_watchdog(market_hub: "SignalRConn", last_tick: list,
+                         trade_counters: list | None = None):
     """Force-closes the market-hub WebSocket if no ticks arrive during market hours.
-    last_tick is a one-element list [datetime | None] updated by on_trade."""
+    last_tick is a one-element list [datetime | None] updated by on_trade.
+    trade_counters is [trade_msgs, valid_ticks] for diagnostics."""
     while True:
         time.sleep(60)
         now_utc = datetime.now(timezone.utc)
@@ -697,6 +699,12 @@ def silent_feed_watchdog(market_hub: "SignalRConn", last_tick: list):
         if t is None:
             continue
         age = (now_utc - t).total_seconds()
+        if trade_counters is not None:
+            msgs, ticks = trade_counters
+            log.info(
+                f"market-hub: watchdog — last GatewayTrade {int(age)}s ago  "
+                f"msgs={msgs}  valid_ticks={ticks}"
+            )
         if age > TICK_TIMEOUT_SECS:
             log.warning(
                 f"market-hub: no ticks for {int(age)}s — forcing reconnect"
@@ -801,6 +809,11 @@ def run(demo: bool = False):
         st.contract_id: (sym, st) for sym, st in states.items()
     }
 
+    # Watchdog: last time a GatewayTrade tick was received
+    last_tick: list = [datetime.now(timezone.utc)]
+    # Diagnostic counters: [trade_msgs, valid_ticks]
+    _trade_counters: list = [0, 0]
+
     # Market hub — handles GatewayTrade, GatewayDepth, GatewayQuote
     def on_market_message(msg: dict):
         target = msg.get("target", "")
@@ -814,11 +827,16 @@ def run(demo: bool = False):
         sym, state = entry
 
         if target == "GatewayTrade" and len(args) >= 2:
+            last_tick[0] = datetime.now(timezone.utc)
+            _trade_counters[0] += 1
             trades = args[1]
             if isinstance(trades, dict):
                 trades = [trades]
             for trade in trades:
                 if isinstance(trade, dict):
+                    price = float(trade.get("price", 0))
+                    if price:
+                        _trade_counters[1] += 1
                     on_trade(sym, state, _bars_conn, trade, demo)
 
         elif target == "GatewayDepth" and len(args) >= 2:
@@ -852,6 +870,30 @@ def run(demo: bool = False):
 
     market_hub.start()
     log.info(f"Bar collector running — instruments={list(states.keys())}  demo={demo}")
+
+    # Watchdog: reconnect if no GatewayTrade events for TICK_TIMEOUT_SECS during market hours
+    threading.Thread(
+        target=silent_feed_watchdog,
+        args=(market_hub, last_tick, _trade_counters),
+        daemon=True,
+        name="tick-watchdog",
+    ).start()
+
+    # Periodic trade re-subscribe: re-send SubscribeContractTrades every 60s
+    # to recover from silent server-side subscription drops (depth/quote keep
+    # flowing but trade events stop without a disconnect).
+    def trade_resubscribe_loop():
+        while True:
+            time.sleep(60)
+            for sym, state in states.items():
+                market_hub.send("SubscribeContractTrades", [state.contract_id])
+            log.info("market-hub: re-subscribed contract trades")
+
+    threading.Thread(
+        target=trade_resubscribe_loop,
+        daemon=True,
+        name="trade-resubscribe",
+    ).start()
 
     # DOM writer thread — writes live DOM state to dom.db every 200ms
     if not demo:

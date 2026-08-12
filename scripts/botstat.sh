@@ -50,13 +50,19 @@ echo ""
 echo "--- Bar DB ---"
 DB="$REPO/data/bars.db"
 if [ -f "$DB" ]; then
-    AGE=$(( $(date +%s) - $(stat -f %m "$DB") ))
-    echo "  bars.db last updated: ${AGE}s ago"
+    # Compute staleness from the most recent bar timestamp (WAL-safe, not file mtime)
+    BAR_AGE=$(/usr/bin/sqlite3 "$DB" "
+        SELECT CAST((strftime('%s','now') - MAX(strftime('%s', ts))) AS INTEGER)
+        FROM bars WHERE symbol IN ('MES', 'MNQ') AND minutes = 1;
+    " 2>/dev/null)
+    if [ -n "$BAR_AGE" ]; then
+        echo "  bars.db last bar: ${BAR_AGE}s ago"
+    fi
     /usr/bin/sqlite3 "$DB" "
         SELECT '  ' || symbol || ' ' || minutes || 'm: ' ||
                COUNT(*) || ' bars, last=' ||
                strftime('%Y-%m-%dT%H:%M', MAX(ts), '-7 hours') || ' MST'
-        FROM bars GROUP BY symbol, minutes ORDER BY symbol, minutes;
+        FROM bars WHERE symbol IN ('MES', 'MNQ') GROUP BY symbol, minutes ORDER BY symbol, minutes;
     " 2>/dev/null || echo "  (db read error)"
 else
     echo "  bars.db not found — bar_collector not yet run"
