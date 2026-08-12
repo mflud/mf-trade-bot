@@ -1,8 +1,10 @@
 #!/bin/bash
 # botdown.sh — cleanly stop ALL bot processes and prevent auto-restart.
 #
-# Stops:  trading_bot, mes_monitor, bar_collector, bar_recorder health-check
+# Stops:  trading_bot (focused_bot), focused_monitor, bar_collector, bar-check
 # Disables: watchdog (so nothing auto-restarts until botup.sh is run)
+#
+# IMPORTANT: Use this before manually trading a Combine to avoid cross-account hedging.
 #
 # Usage:  bash scripts/botdown.sh
 
@@ -41,18 +43,13 @@ else
         || echo "  [--] trading_bot not running"
 fi
 
-# ── 4. Stop mes_monitor screen session ───────────────────────────────────────
-if /usr/bin/screen -list | grep -q "mes_monitor"; then
-    /usr/bin/screen -S mes_monitor -X quit 2>/dev/null
-    echo "  [OK] mes_monitor screen session quit"
-else
-    echo "  [--] mes_monitor not running"
-fi
+# ── 4. Stop focused_monitor ───────────────────────────────────────────────────
+pkill -f "src/focused_monitor.py" 2>/dev/null && echo "  [OK] focused_monitor stopped" \
+    || echo "  [--] focused_monitor not running"
 
 # ── 5. Unload bar_collector (launchd-managed) ────────────────────────────────
 if launchctl list | grep -q "com.mf-trade-bot.bar-collector"; then
     launchctl unload ~/Library/LaunchAgents/com.mf-trade-bot.bar-collector.plist 2>/dev/null
-    # Kill any lingering Python process
     pkill -f "src/bar_collector.py" 2>/dev/null || true
     echo "  [OK] bar_collector unloaded"
 else
@@ -65,6 +62,15 @@ if launchctl list | grep -q "com.mf-trade-bot.bar-check"; then
     echo "  [OK] bar-check unloaded"
 else
     echo "  [--] bar-check already unloaded"
+fi
+
+# ── 7. Final safety check — confirm trading_bot is truly dead ────────────────
+sleep 1
+if pgrep -f "src/trading_bot.py" > /dev/null 2>&1; then
+    echo "  [WARN] trading_bot still running — force killing"
+    pkill -9 -f "src/trading_bot.py" 2>/dev/null
+else
+    echo "  [OK] confirmed: trading_bot not running"
 fi
 
 echo ""

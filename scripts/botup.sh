@@ -1,7 +1,7 @@
 #!/bin/bash
 # botup.sh — restart all bot processes after a botdown.sh shutdown.
 #
-# Starts:  bar_collector, mes_monitor, trading_bot
+# Starts:  bar_collector, focused_monitor, focused_bot (trading_bot)
 # Re-enables: watchdog, bar-check
 #
 # Usage:  bash scripts/botup.sh
@@ -34,10 +34,11 @@ else
 fi
 
 # ── 4. Wait for bar_collector to log in and write token ──────────────────────
-echo "  Waiting for bar_collector token (up to 30s)…"
-for i in $(seq 1 30); do
-    if [ -f "$REPO/data/auth_token.txt" ]; then
-        AGE=$(( $(date +%s) - $(stat -f %m "$REPO/data/auth_token.txt") ))
+echo "  Waiting for bar_collector token (up to 60s)…"
+TOKEN="$REPO/data/auth_token.txt"
+for i in $(seq 1 60); do
+    if [ -f "$TOKEN" ]; then
+        AGE=$(( $(date +%s) - $(stat -f %m "$TOKEN") ))
         if [ "$AGE" -lt 60 ]; then
             echo "  [OK] token ready (${AGE}s old)"
             break
@@ -46,13 +47,13 @@ for i in $(seq 1 30); do
     sleep 1
 done
 
-# ── 5. Start mes_monitor ──────────────────────────────────────────────────────
-bash "$REPO/scripts/start_mes_monitor.sh"
-echo "  [OK] mes_monitor started"
+# ── 5. Start focused_monitor ──────────────────────────────────────────────────
+bash "$REPO/scripts/start_focused_monitor.sh"
+echo "  [OK] focused_monitor started"
 
-# ── 6. Start trading_bot ─────────────────────────────────────────────────────
-bash "$REPO/scripts/start_trading_bot.sh"
-echo "  [OK] trading_bot started"
+# ── 6. Start focused_bot (trading_bot with focused strategies) ────────────────
+bash "$REPO/scripts/start_focused_bot.sh"
+echo "  [OK] focused_bot started"
 
 # ── 7. Re-enable watchdog ─────────────────────────────────────────────────────
 if ! launchctl list | grep -q "com.mf-trade-bot.watchdog"; then
