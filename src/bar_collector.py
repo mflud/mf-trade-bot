@@ -52,8 +52,6 @@ USER_HUB_URL   = "wss://rtc.topstepx.com/hubs/user"
 INSTRUMENTS = {
     "MES": "MES",
     "MNQ": "MNQ",
-    "ES":  "ES",
-    "NQ":  "NQ",
 }
 
 # Bar sizes to build (in minutes).

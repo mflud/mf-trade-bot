@@ -71,8 +71,6 @@ PL_MIN_HOLD_S   = 10
 PL_5S_FETCH     = 130
 PL_SIGMA_N      = 3.0
 PL_SIGMA_LB     = 120
-PL_ADX_GATE     = 25.0
-PL_ADX_STATE    = Path("logs/pl_rev_state.json")
 PL_HISTORY      = 10
 
 # ── ORB constants — MNQ 1-min ORB (mirrors trading_bot.py MNQ config) ──────────
@@ -269,14 +267,6 @@ class MonitorState:
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
-
-def _read_pl_rev_state() -> dict:
-    try:
-        if PL_ADX_STATE.exists():
-            return json.loads(PL_ADX_STATE.read_text())
-    except Exception:
-        pass
-    return {}
 
 
 def _in_settlement(ts: datetime) -> bool:
@@ -662,20 +652,13 @@ def build_vwaslr_panel(state: MonitorState, now: datetime) -> Panel:
 
 
 def build_pl_rev_panel(state: MonitorState, now: datetime) -> Panel:
-    sig       = state.pl_sig
-    adx_state = _read_pl_rev_state()
-    adx_val   = adx_state.get("adx", 0.0)
-    gate_open = adx_state.get("gate_open", True)
-    adx_known = bool(adx_state)
+    sig = state.pl_sig
 
     rev_qualifies = (sig is not None
                      and sig.pl >= PL_ENTRY_PL
-                     and sig.move_bps >= PL_MOVE_BPS
-                     and gate_open)
+                     and sig.move_bps >= PL_MOVE_BPS)
 
-    if adx_known and not gate_open:
-        status = "ADX BLOCKED"; style = "bold yellow"; border = "yellow"
-    elif not rev_qualifies:
+    if not rev_qualifies:
         status = "WATCHING";    style = "bold";        border = "default"
     elif sig.direction == 1:
         status = "FADE LONG";   style = "bold green";  border = "green"
@@ -738,12 +721,6 @@ def build_pl_rev_panel(state: MonitorState, now: datetime) -> Panel:
     foot = Table.grid(); foot.add_column(justify="center")
     foot.add_row(f"[dim]entry: PL≥{PL_ENTRY_PL:.2f} bp≥{PL_MOVE_BPS:.0f}  "
                  f"TP {PL_TP_BPS:.0f}bp  stop {PL_STOP_BPS:.0f}bp  resume≥{PL_RESUME_PL:.2f}[/]")
-    if adx_known:
-        clr = "green" if gate_open else "bold yellow"
-        lbl = "OPEN" if gate_open else "BLOCKED"
-        foot.add_row(f"ADX(9-10ET)=[{clr}]{adx_val:.1f}[/]  gate≤{PL_ADX_GATE:.0f} → [{clr}]{lbl}[/]")
-    else:
-        foot.add_row(f"[dim]ADX gate≤{PL_ADX_GATE:.0f}  (computed after 10:00 ET)[/]")
     root.add_row(foot)
 
     return Panel(root, title=f"PL REV  {SYMBOL}", border_style=border,
@@ -766,7 +743,7 @@ def build_orb_panel(state: MonitorState, now: datetime) -> Panel:
         else:
             status = "LOADING…"; style = "dim"; border = "default"
         root.add_row(f"[{style}]  {status}  [/]")
-        return Panel(root, title=f"ORB  {SYMBOL}  (15-min)", border_style=border,
+        return Panel(root, title=f"ORB  MNQ  (1-min)", border_style=border,
                      padding=(0, 1), expand=True)
 
     # Determine status

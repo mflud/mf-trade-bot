@@ -167,9 +167,10 @@ PL_MOM_SIGMA_LOOKBACK  = 120    # 5s bars for rolling σ (10 min); backtest-opti
 
 # ── PL_Reversion parameters ──────────────────────────────────────────────────
 # Fade the PL_MOM qualifying bar: enter OPPOSITE to momentum direction.
-# Backtest (excl Apr-2025): WR 91-97%, EV +6-9bp on MES over 2+ years.
-# ADX gate: if ADX(14) on 9:00-10:00 ET 1-min bars > PL_REV_ADX_GATE,
-#   the day is trending and reversion is suppressed.
+# Backtest (2024-09–2026-07): WR 91.6%, EV +10.17bp — no ADX gate.
+# ADX gate sweep showed: with 120s natural cooldown between trades, no gate
+# outperforms every ADX threshold (EV +10.17bp vs +9.80bp at gate=25).
+# The natural "already in position" cooldown acts as the de-clustering filter.
 PL_REV_ENTRY_PL    = 0.80   # same qualifying PL threshold as PL_MOM
 PL_REV_MOVE_BPS    = 20.0   # minimum net move (bps) to qualify
 PL_REV_TP_BPS      = 12.0   # take profit: price reverts this many bps from entry
@@ -177,9 +178,6 @@ PL_REV_STOP_BPS    = 15.0   # stop loss: price continues in original signal dire
 PL_REV_RESUME_PL   = 0.70   # exit early if PL surges back (trend resuming)
 PL_REV_MIN_HOLD_S  = 10     # seconds before RESUME_PL check is active (stop always live)
 PL_REV_MAX_HOLD_S  = 120    # max hold in seconds (same as PL_MOM)
-PL_REV_ADX_PERIOD  = 14     # ADX period (Wilder)
-PL_REV_ADX_GATE    = 25.0   # suppress reversion if ADX > this (trending open)
-PL_REV_ADX_BARS    = 430    # 1-min bars to fetch: covers 9:00-10:00 ET from anywhere in RTH (max ~420 min)
 
 # ── Evening Resumption parameters ────────────────────────────────────────────
 # At 18:00 ET daily (CME resumes after 16:00–18:00 ET settlement gap):
@@ -1006,8 +1004,6 @@ class InstrumentState:
     # PL_Reversion state (shares 5s bars with PL_MOM)
     active_pl_rev_trade:  "ActivePLRevTrade | None" = None
     pl_rev_last_bar_ts:   "datetime | None" = None
-    pl_rev_adx:           float     = 0.0   # ADX(14) on 9:00-10:00 ET 1-min bars
-    pl_rev_adx_date:      "date | None" = None  # ET date when ADX was last computed
     eve_prev_close:       float | None = None     # last RTH close before 18:00 ET gap
     eve_fired_date:       date  | None = None     # ET date of last evening resumption trade
     active_evening_trade: ActiveEveningTrade | None = None
@@ -3113,150 +3109,13 @@ def _log_pl_rev_trade(trade: ActivePLRevTrade, outcome: str,
     )
 
 
-PL_REV_STATE_PATH = Path("logs/pl_rev_state.json")
-
-
-def _write_pl_rev_state(state: InstrumentState):
-    """Write PL_REV ADX state to a JSON file for mes_monitor to display."""
-    try:
-        data = {
-            "symbol":   state.instrument.symbol,
-            "adx":      round(state.pl_rev_adx, 2),
-            "adx_gate": PL_REV_ADX_GATE,
-            "gate_open": state.pl_rev_adx <= PL_REV_ADX_GATE or state.pl_rev_adx == 0.0,
-            "date":     state.pl_rev_adx_date.isoformat() if state.pl_rev_adx_date else None,
-        }
-        PL_REV_STATE_PATH.parent.mkdir(exist_ok=True)
-        PL_REV_STATE_PATH.write_text(json.dumps(data))
-    except Exception as e:
-        log.debug(f"PL_REV state write failed: {e}")
-
-
-def _compute_pl_rev_adx(client: TopstepClient, state: InstrumentState,
-                        now_et: datetime) -> float:
-    """
-    Compute ADX(14) on today's 9:00–10:00 ET 1-min bars.
-    Returns 0.0 on insufficient data (no gate applied → trade allowed).
-    Uses bar_collector DB when available; falls back to REST API.
-    """
-    symbol = state.instrument.symbol
-    try:
-        if bars_db_available():
-            raw_bars = get_bars_from_db(symbol, 1, PL_REV_ADX_BARS)
-        else:
-            # Anchor start to 9:00 ET today so the window is always covered
-            from datetime import time as _time
-            nine_et   = datetime.combine(now_et.date(), _time(9, 0)).replace(tzinfo=ET)
-            end_utc   = datetime.now(timezone.utc)
-            raw_bars  = list(reversed(client.get_bars(
-                contract_id=state.contract_id,
-                start=nine_et.astimezone(timezone.utc), end=end_utc,
-                unit=TopstepClient.MINUTE, unit_number=1,
-                limit=PL_REV_ADX_BARS,
-            )))
-    except Exception as e:
-        log.warning(f"PL_REV {symbol}: ADX bar fetch failed: {e}")
-        return 0.0
-
-    if not raw_bars:
-        log.warning(f"PL_REV {symbol}: ADX fetch returned no bars")
-        return 0.0
-
-    # Normalise: DB returns dicts with "t"/"o"/"h"/"l"/"c"; REST returns same shape
-    def _get(b, *keys):
-        for k in keys:
-            if k in b:
-                return b[k]
-        return None
-
-    from datetime import time as _time
-    window_start = _time(9, 0)
-    window_end   = _time(10, 0)
-
-    # No date filter needed: 80 1-min bars from now only span ~80 min, so yesterday's
-    # 9:00-10:00 ET bars are never in the fetch window when called after 10:00 ET.
-    filtered = []
-    for b in raw_bars:
-        ts_raw = _get(b, "t", "ts")
-        if ts_raw is None:
-            continue
-        if isinstance(ts_raw, str):
-            ts_utc = datetime.fromisoformat(ts_raw)
-        else:
-            ts_utc = ts_raw
-        if ts_utc.tzinfo is None:
-            ts_utc = ts_utc.replace(tzinfo=timezone.utc)
-        ts_et = ts_utc.astimezone(ET)
-        if window_start <= ts_et.time() < window_end:
-            filtered.append({
-                "h": _get(b, "h", "high"),
-                "l": _get(b, "l", "low"),
-                "c": _get(b, "c", "close"),
-            })
-
-    n = len(filtered)
-    period = PL_REV_ADX_PERIOD
-    if n < period + 1:
-        log.warning(f"PL_REV {symbol}: only {n} bars in 9-10 ET window (need {period+1}), skipping ADX gate")
-        return 0.0
-
-    highs  = np.array([b["h"] for b in filtered], dtype=float)
-    lows   = np.array([b["l"] for b in filtered], dtype=float)
-    closes = np.array([b["c"] for b in filtered], dtype=float)
-
-    # True Range
-    tr = np.maximum(highs[1:] - lows[1:],
-         np.maximum(np.abs(highs[1:] - closes[:-1]),
-                    np.abs(lows[1:]  - closes[:-1])))
-    # Directional movement
-    up_move   = highs[1:] - highs[:-1]
-    down_move = lows[:-1] - lows[1:]
-    pos_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-    neg_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-
-    m = len(tr)  # n-1 points
-    if m < period:
-        return 0.0
-
-    # Wilder smoothing of TR, +DM, -DM
-    atr  = np.empty(m); atr[period-1]  = tr[:period].sum()
-    pdm  = np.empty(m); pdm[period-1]  = pos_dm[:period].sum()
-    ndm  = np.empty(m); ndm[period-1]  = neg_dm[:period].sum()
-    for i in range(period, m):
-        atr[i] = atr[i-1] - atr[i-1] / period + tr[i]
-        pdm[i] = pdm[i-1] - pdm[i-1] / period + pos_dm[i]
-        ndm[i] = ndm[i-1] - ndm[i-1] / period + neg_dm[i]
-
-    pdi = np.where(atr[period-1:] > 0, 100 * pdm[period-1:] / atr[period-1:], 0.0)
-    ndi = np.where(atr[period-1:] > 0, 100 * ndm[period-1:] / atr[period-1:], 0.0)
-    denom = pdi + ndi
-    dx = np.where(denom > 0, 100 * np.abs(pdi - ndi) / denom, 0.0)
-
-    if len(dx) < period:
-        return 0.0
-
-    # Wilder smoothing of DX → ADX (mean init)
-    adx = np.empty(len(dx))
-    adx[period-1] = dx[:period].mean()
-    for i in range(period, len(dx)):
-        adx[i] = (adx[i-1] * (period - 1) + dx[i]) / period
-
-    result = float(adx[-1])
-    log.info(f"PL_REV {symbol}: ADX({period}) on 9:00-10:00 ET = {result:.1f}")
-    return result
-
-
 def evaluate_pl_reversion(state: InstrumentState) -> PLRevSignal | None:
     """
     Evaluate PL_Reversion on the same 5s bar window as PL_MOM.
     Qualifies identically (PL ≥ threshold, move ≥ threshold) but enters
     in the OPPOSITE direction (fading the momentum move).
-    Suppressed if today's ADX > PL_REV_ADX_GATE (trending open).
+    No ADX gate — natural trade cooldown (in-position check) outperforms any gate.
     """
-    # ADX gate: if today's opening was trending, skip reversion
-    if state.pl_rev_adx > 0 and state.pl_rev_adx > PL_REV_ADX_GATE:
-        return None
-
     inst = state.instrument
     bars = state.pl_mom_5s_bars  # shared with PL_MOM
     window = PL_MOM_WINDOW  # same 30s window
@@ -3300,7 +3159,7 @@ def evaluate_pl_reversion(state: InstrumentState) -> PLRevSignal | None:
     return PLRevSignal(
         direction=direction, entry=entry,
         target=target, stop=stop,
-        pl=pl, move_bps=move_bps, adx=state.pl_rev_adx,
+        pl=pl, move_bps=move_bps, adx=0.0,
         bar_ts=last_bar.ts,
     )
 
@@ -4207,18 +4066,9 @@ def run(account_id: int | None, paper: bool, strategies: set[str] | None = None)
                                 place_pl_mom_signal(client, state, pl_mom_sig,
                                                     account_id, paper, now)
 
-                # PL_Reversion entry: RTH only, after 10:00 ET (ADX computed by then)
-                # Shares 5s bars with PL_MOM; ADX gate computed once per day at 10:00 ET.
+                # PL_Reversion entry: RTH only, after 9:40 ET blackout.
+                # No ADX gate — backtest showed natural trade cooldown outperforms any gate.
                 if state.instrument.pl_rev_enabled:
-                    now_et_hm_chk = (now_et.hour, now_et.minute)
-                    # Compute ADX once per day after 10:00 ET
-                    if now_et_hm_chk >= (10, 0):
-                        today_et = now_et.date()
-                        if state.pl_rev_adx_date != today_et:
-                            state.pl_rev_adx      = _compute_pl_rev_adx(client, state, now_et)
-                            state.pl_rev_adx_date = today_et
-                            # Write state for mes_monitor to read
-                            _write_pl_rev_state(state)
 
                     # Re-check: PL_MOM may have just fired this iteration (same bar, opposite direction)
                     no_position_rev = no_position and not state.active_pl_mom_trade

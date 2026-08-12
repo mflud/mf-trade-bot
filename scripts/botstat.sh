@@ -30,42 +30,22 @@ if [ -f "$REPO/logs/bot.disabled" ]; then
     echo ""
 fi
 echo "--- Processes ---"
+check        "focused_bot      " "src/trading_bot.py"
+screen_check "focused_monitor  " "focused_monitor"
 check        "bar_collector    " "bar_collector.py"
-screen_check "mes_monitor      " "mes_monitor"
-check        "trading_bot      " "src/trading_bot.py"
 check        "bar_recorder     " "src/bar_recorder.py"
-check        "ml_trading_bot MES" "ml_trading_bot.py --symbol MES"
-check        "ml_trading_bot MNQ" "ml_trading_bot.py --symbol MNQ"
-screen_check "ml_monitor        " "ml_monitor"
 echo ""
 
-# ML bot state summary
-for SYM in MES MNQ; do
-    ML_STATE="$REPO/logs/ml_state_${SYM}.json"
-    if [ -f "$ML_STATE" ]; then
-        echo "--- ML Bot State: $SYM ---"
-        python3 -c "
-import json, sys
-s = json.load(open('$ML_STATE'))
-feat = s.get('feat') or {}
-sig  = s.get('signal') or {}
-pos  = s.get('position')
-st   = s.get('session_stats') or {}
-upd  = s.get('updated_at','')[:19]
-print(f\"  Updated: {upd}\")
-print(f\"  Close: {feat.get('close',0):.2f}  vol_regime: {feat.get('vol_regime',0):.2f}  prob: {sig.get('prob',0):.3f}\")
-if pos:
-    pnl = (feat.get('close',pos['entry_pts']) - pos['entry_pts']) * (1 if pos['direction']=='LONG' else -1)
-    print(f\"  Position: {pos['direction']} @ {pos['entry_pts']:.2f}  P&L est: {pnl:+.2f}pts  bars: {pos['bars_held']}\")
-else:
-    print('  Position: none')
-wins = st.get('wins',0); trades = st.get('trades',0)
-wr = f\"{wins/trades*100:.0f}%\" if trades else '—'
-print(f\"  Session: {st.get('signals',0)} signals  {trades} trades  WR:{wr}  P&L:{st.get('pnl_pts',0):+.2f}pts\")
-" 2>/dev/null || echo "  (ml_state_${SYM}.json unreadable)"
-        echo ""
+echo "--- Stale Process Check ---"
+stale=0
+for pattern in "src/mes_monitor.py" "src/ml_monitor.py" "src/signal_monitor.py" "src/slr_monitor.py" "src/dom_client.py"; do
+    if pgrep -f "$pattern" > /dev/null 2>&1; then
+        echo "  [WARN] Stale process running: $pattern"
+        stale=1
     fi
 done
+[ "$stale" -eq 0 ] && echo "  [OK]   No stale processes"
+echo ""
 
 echo "--- Bar DB ---"
 DB="$REPO/data/bars.db"
