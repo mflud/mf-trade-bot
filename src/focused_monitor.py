@@ -73,14 +73,18 @@ PL_SIGMA_N      = 3.0
 PL_SIGMA_LB     = 120
 PL_ADX_GATE     = 25.0
 PL_ADX_STATE    = Path("logs/pl_rev_state.json")
-PL_HISTORY      = 24
+PL_HISTORY      = 10
 
-# ── ORB constants (mirrors trading_bot.py) ─────────────────────────────────────
-ORB_MIN       = 15       # opening range = first 15 min after 9:30 ET
-ORB_ENTRY_WIN = 60       # minutes after ORB close to look for breakout
-ORB_WIDTH_MIN = 0.0015
-ORB_WIDTH_MAX = 0.0050
-ORB_TGT_MULT  = 1.0      # 1× width
+# ── ORB constants — MNQ 1-min ORB (mirrors trading_bot.py MNQ config) ──────────
+ORB_SYMBOL     = "MNQ"
+ORB_MIN        = 1        # opening range = first 1-min bar (9:30 ET)
+ORB_ENTRY_WIN  = 5        # minutes after ORB close to look for breakout
+ORB_WIDTH_MAX  = 0.003    # ≤ 30bps
+ORB_WIDTH_MIN  = 0.0      # no minimum
+ORB_TGT_MULT   = 1.0      # 1× width
+ORB_HOLD_MIN   = 10       # force-exit after 10 min (~9:40 ET)
+ORB_MAX_LOSS   = 500.0    # $500 stop cap
+ORB_PV         = 2.0      # MNQ point value
 ORB_BARS_FETCH = 200
 
 # ── DOM constants ─────────────────────────────────────────────────────────────
@@ -111,15 +115,7 @@ _last_alert    = 0.0
 
 
 def play_alert():
-    global _last_alert
-    t = time.time()
-    if t - _last_alert < ALERT_COOLDOWN:
-        return
-    _last_alert = t
-    threading.Thread(
-        target=lambda: subprocess.run(["afplay", ALERT], check=False),
-        daemon=True,
-    ).start()
+    pass  # alerts disabled
 
 
 # ─── Data classes ─────────────────────────────────────────────────────────────
@@ -241,16 +237,19 @@ class DOMBook:
 
 @dataclass
 class MonitorState:
-    contract_id: str
-    bars_1m:     list = field(default_factory=list)   # 1-min bars for VWASLR + ORB + sizing
+    contract_id:     str
+    mnq_contract_id: str = ""
+    bars_1m:     list = field(default_factory=list)   # MES 1-min bars for VWASLR + sizing
+    bars_orb:    list = field(default_factory=list)   # MNQ 1-min bars for ORB
     bars_5s:     list = field(default_factory=list)   # 5s bars for PL_REV
     dom:         DOMBook = field(default_factory=DOMBook)
     wall_tracker: "WallTracker|None" = None
     # VWASLR
-    vwaslr_ema:      float = 0.0
-    vwaslr_ema_prev: float = 0.0
-    vwaslr_signal:   "VwaslrSignal|None" = None
-    vwaslr_history:  list = field(default_factory=list)   # (ts, ema, fired)
+    vwaslr_ema:       float = 0.0
+    vwaslr_ema_prev:  float = 0.0
+    vwaslr_sigma_pts: float = 0.0
+    vwaslr_signal:    "VwaslrSignal|None" = None
+    vwaslr_history:   list = field(default_factory=list)   # (ts, ema, fired)
     # PL_REV
     pl_sig:         "PLRevSignal|None" = None
     pl_entry_ts:    "datetime|None"   = None
@@ -336,6 +335,30 @@ def fetch_1min_bars(client: TopstepClient, state: MonitorState):
                               for b in reversed(raw)]
         except Exception:
             pass
+
+
+# ─── MNQ bar fetcher (for ORB) ────────────────────────────────────────────────
+
+def fetch_mnq_bars(state: MonitorState):
+    """Load MNQ 1-min bars from bars.db for today's ORB tracking."""
+    try:
+        import sqlite3
+        now_et = datetime.now(ET)
+        today  = now_et.date()
+        # Fetch last 200 1-min MNQ bars from db
+        conn = sqlite3.connect("data/bars.db", timeout=1.0)
+        rows = conn.execute(
+            "SELECT ts, open, high, low, close, volume FROM bars "
+            "WHERE symbol='MNQ' AND minutes=1 ORDER BY ts DESC LIMIT 200"
+        ).fetchall()
+        conn.close()
+        if rows:
+            bars = [Bar(ts=datetime.fromisoformat(r[0]),
+                        open=r[1], high=r[2], low=r[3], close=r[4], volume=r[5])
+                    for r in reversed(rows)]
+            state.bars_orb = bars
+    except Exception:
+        pass
 
 
 # ─── DOM reader ───────────────────────────────────────────────────────────────
@@ -441,7 +464,8 @@ def _evaluate_vwaslr(state: MonitorState) -> "VwaslrSignal|None":
 # ─── ORB tracking ─────────────────────────────────────────────────────────────
 
 def _update_orb(state: MonitorState):
-    bars  = state.bars_1m
+    # ORB uses MNQ 1-min bars — fetch separately if available
+    bars = state.bars_orb if state.bars_orb else state.bars_1m
     if not bars:
         return
     now_et    = datetime.now(ET)
@@ -454,7 +478,7 @@ def _update_orb(state: MonitorState):
         orb.session_date = today
 
     orb_start_hm = 9 * 60 + 30
-    orb_end_hm   = orb_start_hm + ORB_MIN   # 9:45 ET
+    orb_end_hm   = orb_start_hm + ORB_MIN   # 9:31 ET (1-min ORB)
 
     # Collect today's RTH 1-min bars
     today_rth = [b for b in bars
@@ -463,16 +487,20 @@ def _update_orb(state: MonitorState):
     if not today_rth:
         return
 
-    # Build/refresh ORB range from first 15 bars
+    # Build ORB range from the 9:30 bar only (1-min ORB)
     orb_bars = [b for b in today_rth
                 if b.ts.astimezone(ET).hour*60 + b.ts.astimezone(ET).minute < orb_end_hm]
 
-    if len(orb_bars) >= ORB_MIN - 1:
+    if orb_bars:
         orb.orb_high  = max(b.high  for b in orb_bars)
         orb.orb_low   = min(b.low   for b in orb_bars)
         orb.orb_mid   = (orb.orb_high + orb.orb_low) / 2
         orb.orb_width = orb.orb_high - orb.orb_low
-        orb.valid     = ORB_WIDTH_MIN <= orb.orb_width / orb.orb_mid <= ORB_WIDTH_MAX
+        if orb.orb_mid > 0:
+            w_pct = orb.orb_width / orb.orb_mid
+            orb.valid = w_pct <= ORB_WIDTH_MAX
+        else:
+            orb.valid = False
 
     # Look for breakout (only if ORB formed and no breakout yet)
     if orb.valid and orb.direction == 0:
@@ -480,17 +508,24 @@ def _update_orb(state: MonitorState):
         after_orb = [b for b in today_rth
                      if orb_end_hm <= b.ts.astimezone(ET).hour*60 + b.ts.astimezone(ET).minute < entry_end_hm]
         for b in after_orb:
+            w = orb.orb_width
             if b.close > orb.orb_high:
+                raw_stop = orb.orb_low
+                max_pts  = ORB_MAX_LOSS / ORB_PV
+                stop     = max(raw_stop, b.close - max_pts)
                 orb.direction   = 1
                 orb.entry_price = b.close
-                orb.target      = b.close + (orb.orb_high - orb.orb_low) * ORB_TGT_MULT
-                orb.stop        = orb.orb_mid
+                orb.target      = b.close + w * ORB_TGT_MULT
+                orb.stop        = stop
                 break
             if b.close < orb.orb_low:
+                raw_stop = orb.orb_high
+                max_pts  = ORB_MAX_LOSS / ORB_PV
+                stop     = min(raw_stop, b.close + max_pts)
                 orb.direction   = -1
                 orb.entry_price = b.close
-                orb.target      = b.close - (orb.orb_high - orb.orb_low) * ORB_TGT_MULT
-                orb.stop        = orb.orb_mid
+                orb.target      = b.close - w * ORB_TGT_MULT
+                orb.stop        = stop
                 break
 
 
@@ -575,8 +610,10 @@ def build_vwaslr_panel(state: MonitorState, now: datetime) -> Panel:
     grd.add_row("Threshold:", f"±{thr:.2f}σ  (cross fires signal)")
     if bars and len(bars) >= 2:
         last_et = bars[-1].ts.astimezone(LOCAL)
+        sp = state.vwaslr_sigma_pts
+        sigma_s = f"  σ={sp:.2f}pt" if sp else ""
         grd.add_row("Last bar:", f"[dim]{last_et.strftime('%H:%M')}  "
-                                 f"close={bars[-1].close:.2f}[/]")
+                                 f"close={bars[-1].close:.2f}{sigma_s}[/]")
     root.add_row(grd)
     root.add_row("")
 
@@ -756,7 +793,7 @@ def build_orb_panel(state: MonitorState, now: datetime) -> Panel:
 
     if orb.orb_high:
         w_pct = orb.orb_width / orb.orb_mid * 100 if orb.orb_mid else 0
-        valid_s = "✓" if orb.valid else f"✗ (need {ORB_WIDTH_MIN*100:.2f}–{ORB_WIDTH_MAX*100:.2f}%)"
+        valid_s = "✓" if orb.valid else f"✗ (need ≤{ORB_WIDTH_MAX*100:.2f}%)"
         v_clr   = "green" if orb.valid else "yellow"
         rng.add_row("ORB High:",  f"[bold]{orb.orb_high:.2f}[/]")
         rng.add_row("ORB Low:",   f"[bold]{orb.orb_low:.2f}[/]")
@@ -772,25 +809,29 @@ def build_orb_panel(state: MonitorState, now: datetime) -> Panel:
         bdet.add_column(width=10, justify="right")
         bdet.add_column()
         clr = "green" if orb.direction == 1 else "red"
+        exit_et_min = 9*60+31 + ORB_ENTRY_WIN - 1 + ORB_HOLD_MIN
+        exit_h, exit_m = divmod(exit_et_min, 60)
         bdet.add_row("Entry:",  f"[bold {clr}]{orb.entry_price:.2f}[/]")
         bdet.add_row("Target:", f"[bold green]{orb.target:.2f}[/]  "
                                 f"(+{abs(orb.target-orb.entry_price):.2f}pt)")
         bdet.add_row("Stop:",   f"[bold red]{orb.stop:.2f}[/]  "
                                 f"({abs(orb.stop-orb.entry_price):.2f}pt)")
+        bdet.add_row("Exit by:", f"[dim]~{exit_h:02d}:{exit_m:02d} ET[/]")
         root.add_row(bdet)
     elif orb.valid and hm_et < entry_end_hm:
         root.add_row("")
-        root.add_row(f"[dim]  Entry window: 9:45–10:45 ET  "
-                     f"(break above {orb.orb_high:.2f} → LONG  /  "
-                     f"below {orb.orb_low:.2f} → SHORT)[/]")
+        root.add_row(f"[dim]  Entry window: 9:31–9:36 ET  "
+                     f"(close > {orb.orb_high:.2f} → LONG  /  "
+                     f"close < {orb.orb_low:.2f} → SHORT)[/]")
 
     root.add_row("")
     foot = Table.grid(); foot.add_column(justify="center")
-    foot.add_row(f"[dim]ORB={ORB_MIN}min  entry window={ORB_ENTRY_WIN}min  "
-                 f"stop=midpoint  target={ORB_TGT_MULT:.0f}× width[/]")
+    foot.add_row(f"[dim]MNQ 1-min ORB  entry≤{ORB_ENTRY_WIN}min  hold {ORB_HOLD_MIN}min  "
+                 f"stop=opposite ORB (cap ${ORB_MAX_LOSS:.0f})  target={ORB_TGT_MULT:.0f}× width  "
+                 f"width≤{ORB_WIDTH_MAX*10000:.0f}bps[/]")
     root.add_row(foot)
 
-    return Panel(root, title=f"ORB  {SYMBOL}  (15-min)", border_style=border,
+    return Panel(root, title=f"ORB  MNQ  (1-min)", border_style=border,
                  padding=(0, 1), expand=True)
 
 
@@ -899,30 +940,10 @@ def build_wall_panel(state: MonitorState, now: datetime) -> Panel:
         det.add_row("Hold:",   f"[dim]{rem//60}m {rem%60:02d}s remaining[/]")
         root.add_row(det)
 
-    # Active walls table
-    if active:
-        root.add_row("")
-        wt = Table(box=None, show_header=True, padding=(0, 1), header_style="bold")
-        wt.add_column("price",  justify="right")
-        wt.add_column("side",   justify="center")
-        wt.add_column("peak",   justify="right")
-        wt.add_column("tests",  justify="center")
-        for w in active[:8]:
-            clr  = "green" if w.side == "bid" else "red"
-            tc_c = ("bold yellow" if w.test_count >= 2 else
-                    "yellow"      if w.test_count == 1 else "dim")
-            wt.add_row(
-                f"[{clr}]{w.price:.2f}[/]",
-                f"[{clr}]{w.side}[/]",
-                f"{w.peak_size:.0f}",
-                f"[{tc_c}]T{w.test_count}[/]",
-            )
-        root.add_row(wt)
-
-    # Recent event log (tests + breakouts)
+    # Recent event log (tests + breakouts) — capped at 4 rows; walls shown on DOM ladder
     notable = [(ts, ev, side, wp, tc, ep)
                for ts, ev, side, wp, tc, ep in reversed(state.wall_recent_events[-20:])
-               if ev in ("breakout", "test")][:8]
+               if ev in ("breakout", "test")][:4]
     if notable:
         root.add_row("")
         lt = Table(box=None, show_header=True, padding=(0, 1), header_style="bold")
@@ -1023,22 +1044,24 @@ def render(state: MonitorState) -> Table:
     root.add_column(ratio=1)
     root.add_row(build_header())
 
-    row1 = Table(box=None, show_header=False, padding=(0, 1), expand=True)
-    row1.add_column(ratio=1)
-    row1.add_column(ratio=1)
-    row1.add_row(build_vwaslr_panel(state, now), build_pl_rev_panel(state, now))
-    root.add_row(row1)
+    # ── 3-column strategy area ─────────────────────────────────────────────────
+    # Col 1: VWASLR + ORB   |   Col 2: PL_REV + Wall Break   |   Col 3: DOM
+    col1 = Table.grid(); col1.add_column()
+    col1.add_row(build_vwaslr_panel(state, now))
+    col1.add_row(build_orb_panel(state, now))
 
-    row2 = Table(box=None, show_header=False, padding=(0, 1), expand=True)
-    row2.add_column()
-    row2.add_column(ratio=1)
-    left_col = Table.grid()
-    left_col.add_column()
-    left_col.add_row(build_dom_panel(state))
-    left_col.add_row(build_wall_panel(state, now))
-    row2.add_row(left_col, build_orb_panel(state, now))
-    root.add_row(row2)
+    col2 = Table.grid(); col2.add_column()
+    col2.add_row(build_pl_rev_panel(state, now))
+    col2.add_row(build_wall_panel(state, now))
 
+    main = Table(box=None, show_header=False, padding=(0, 1), expand=True)
+    main.add_column(ratio=1)
+    main.add_column(ratio=1)
+    main.add_column()        # DOM fixed width
+    main.add_row(col1, col2, build_dom_panel(state))
+    root.add_row(main)
+
+    # ── Bottom: Trade Summary + Sizing ─────────────────────────────────────────
     left = Table.grid(); left.add_column()
     left.add_row(build_trade_summary_panel())
     left.add_row(build_positions_panel(state))
@@ -1103,6 +1126,8 @@ def run():
             try:
                 fetch_1min_bars(client, state)
                 sigma_pts = _update_vwaslr_ema(state)
+                if sigma_pts:
+                    state.vwaslr_sigma_pts = sigma_pts
                 sig = _evaluate_vwaslr(state)
                 if sig and state.vwaslr_signal is None:
                     state.vwaslr_signal = sig
@@ -1117,7 +1142,8 @@ def run():
                     state.vwaslr_history.append((state.bars_1m[-1].ts, state.vwaslr_ema, fired))
                     if len(state.vwaslr_history) > 40:
                         state.vwaslr_history = state.vwaslr_history[-40:]
-                # Update ORB
+                # Update ORB (MNQ bars)
+                fetch_mnq_bars(state)
                 _update_orb(state)
             except Exception: traceback.print_exc()
     threading.Thread(target=_fetch_1min_loop, daemon=True, name="bar-fetch").start()
@@ -1232,7 +1258,10 @@ def run():
 
     # Initial VWASLR EMA + ORB after bars loaded
     time.sleep(2)
-    _update_vwaslr_ema(state)
+    sigma_pts = _update_vwaslr_ema(state)
+    if sigma_pts:
+        state.vwaslr_sigma_pts = sigma_pts
+    fetch_mnq_bars(state)
     _update_orb(state)
 
     # Position poll (30s cadence)

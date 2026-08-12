@@ -609,6 +609,8 @@ class BotInstrument:
     orb_target_mult:      float = 1.0
     orb_gap_fade_long:    bool  = False
     orb_full_range_stop:  bool  = False  # if True, stop at opposite ORB edge; default = half-range
+    orb_hold_min:         int   = MAX_HOLD_MIN  # force-exit after this many minutes (per-instrument)
+    orb_max_loss_dollars: float = 0.0   # cap stop distance: 0 = no cap
     # VWASLR: 0 = disabled. n = look-back bars; threshold = signal level in σ/bar units.
     # vwaslr_start: earliest (hour, minute) ET for VWASLR signals (default 9:30 RTH open).
     vwaslr_n:         int   = 0
@@ -654,18 +656,20 @@ INSTRUMENTS = [
                   sun_gap_enabled=False,
                   pl_mom_enabled=False,  # disabled: no base-rate edge (WR~35%); replaced by PL_REV
                   pl_rev_enabled=True),
-    # MNQ: ORB-only re-enabled 2026-07-25; SLR/PL_MOM disabled (underperform MES).
-    # 1-min ORB (9:30 bar), gap-fade-long only, full-range stop, 1× target.
-    # Backtest: EV +30 pts/trade, 76% WR, 21 trades (Apr–Jul 2026, 15-min entry window).
+    # MNQ: 1-min ORB. Sweep (Apr–Aug 2026, 82 sessions):
+    #   entry=close-break, stop=opposite-ORB capped at $500, target=1×width,
+    #   width≤30bps, entry window=5min, hold=10min (exit ~9:40 ET).
+    #   Both directions (no gap filter). WR=63% PF=1.41 $2,512 (3 contracts).
     BotInstrument("MNQ", "MNQ", tick_size=0.25, point_value=2.00,
                   blackout_windows=[
                       (16,  0,  9,  0, False),  # trade 09:00–16:00 ET only
                   ],
                   orb_enabled=True,
-                  orb_width_pct_min=0.001, orb_width_pct_max=0.010,
-                  orb_period_min=1, orb_entry_window_min=15,
-                  orb_target_mult=0.75, orb_gap_fade_long=True,
-                  orb_full_range_stop=True,
+                  orb_width_pct_min=0.0,    orb_width_pct_max=0.003,  # ≤30bps
+                  orb_period_min=1,          orb_entry_window_min=5,   # 5-min entry window
+                  orb_target_mult=1.0,       orb_gap_fade_long=False,  # both directions
+                  orb_full_range_stop=True,  orb_hold_min=10,          # exit ~9:40 ET
+                  orb_max_loss_dollars=500,                            # $500 stop cap
                   vwaslr_n=0,
                   slr_enabled=False,
                   pl_mom_enabled=False),
@@ -794,7 +798,8 @@ class ActiveOrbTrade:
     expires_at:  datetime = field(init=False)
 
     def __post_init__(self):
-        self.expires_at = self.fired_at + timedelta(minutes=MAX_HOLD_MIN)
+        hold = self.instrument.orb_hold_min
+        self.expires_at = self.fired_at + timedelta(minutes=hold)
 
     def target_price(self) -> float:
         p = self.fill_price or self.sig.entry
@@ -1696,6 +1701,16 @@ def evaluate_orb(state: InstrumentState) -> OrbSignal | None:
     # ── Stop and target sizing ────────────────────────────────────────────────
     target_pts = orb_width * inst.orb_target_mult
 
+    def _apply_stop_cap(raw_stop: float, entry: float, direction: int) -> float:
+        """Cap stop distance at orb_max_loss_dollars if configured."""
+        if inst.orb_max_loss_dollars <= 0:
+            return raw_stop
+        max_pts = inst.orb_max_loss_dollars / inst.point_value
+        dist = abs(entry - raw_stop)
+        if dist > max_pts:
+            return entry - direction * max_pts
+        return raw_stop
+
     # ── LONG breakout ─────────────────────────────────────────────────────────
     if bar.close > orb.orb_high:
         if inst.orb_gap_fade_long and not orb.is_gap_down:
@@ -1705,6 +1720,7 @@ def evaluate_orb(state: InstrumentState) -> OrbSignal | None:
             stop = orb.orb_low              # opposite side of ORB range
         else:
             stop = entry - orb_width / 2.0  # half-range (ORB midpoint)
+        stop = _apply_stop_cap(stop, entry, 1)
         sig = OrbSignal(
             entry=entry, target=entry + target_pts, stop=stop,
             orb_high=orb.orb_high, orb_low=orb.orb_low,
@@ -1723,6 +1739,7 @@ def evaluate_orb(state: InstrumentState) -> OrbSignal | None:
             stop = orb.orb_high             # opposite side of ORB range
         else:
             stop = entry + orb_width / 2.0  # half-range
+        stop = _apply_stop_cap(stop, entry, -1)
         sig = OrbSignal(
             entry=entry, target=entry - target_pts, stop=stop,
             orb_high=orb.orb_high, orb_low=orb.orb_low,
