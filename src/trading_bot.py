@@ -36,12 +36,7 @@ Logs: bot_trades.csv (CSR), orb_trades.csv, vwaslr_trades.csv,
     Target: 1× ORB width
     Exit  : Force-close after 10 min (~9:40–9:41 ET)
     Backtest (82 sessions Apr–Aug 2026): WR 63%, PF 1.41 (3 contracts)
-
-  ORB (opening range breakout) — MES, 9:45–10:45 ET (also active)
-    Entry : First 5-min close outside 15-min opening range (9:30–9:45),
-            LONG only on gap-down days, ORB width 0.15%–0.50%
-    Stop  : ORB midpoint (half-range)
-    Target: 1× ORB width
+    Note  : MES 15-min ORB disabled 2026-08-12 (only 10 trades in May–Jul)
 
 ━━━ INACTIVE strategies ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -635,9 +630,9 @@ INSTRUMENTS = [
                   blackout_windows=[
                       (16,  0,  9,  0, False),  # trade 09:00–16:00 ET only
                   ],
-                  # ORB: 15-min range, gap-fade-long only (LONG on gap-down days),
-                  #   half-range stop, 1× target, 0.15%–0.5% width, 60-min entry window
-                  orb_enabled=True,
+                  # ORB: disabled 2026-08-12 — only 10 trades in May–Jul 2026 backtest,
+                  #   not enough frequency to justify running alongside MNQ 1-min ORB.
+                  orb_enabled=False,
                   orb_width_pct_min=0.0015, orb_width_pct_max=0.005,
                   orb_period_min=15, orb_entry_window_min=60,
                   orb_target_mult=1.0, orb_gap_fade_long=True,

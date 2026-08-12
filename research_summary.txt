@@ -27,10 +27,8 @@ not currently running.
   │ Wall Break   │ focused_   │ MES           │ RTH; DOM wall (peak ≥3× median, ≥50 lots,    │ 4pt             │ 12pt               │ 15-min hold               │
   │ (DOM)        │ bot        │               │ tested ≥2×) breaks out                       │                 │                    │                           │
   ├──────────────┼────────────┼───────────────┼──────────────────────────────────────────────┼─────────────────┼────────────────────┼───────────────────────────┤
-  │ ORB          │ focused_   │ MNQ: 9:31–    │ MNQ: 1-min range (9:30 bar) close-break,     │ Opposite ORB    │ 1× ORB width       │ ~9:40 ET force-close      │
+  │ ORB          │ focused_   │ MNQ: 9:31–    │ 1-min range (9:30 bar) close-break,          │ Opposite ORB    │ 1× ORB width       │ ~9:40 ET force-close      │
   │ (1-min ORB)  │ bot        │ 9:36 ET       │ both directions, width ≤30bps                │ capped at $500  │                    │ (10-min hold)             │
-  │              │            │               │ MES: 15-min range, LONG only on gap-down,    │ MES: half-range │ MES: 1× ORB width  │ MES: Bracket (OCO)        │
-  │              │            │               │ width 0.15%–0.50%, entry window 60min        │ (ORB midpoint)  │                    │                           │
   ├──────────────┼────────────┼───────────────┼──────────────────────────────────────────────┼─────────────────┼────────────────────┼───────────────────────────┤
   │ CSR          │ (inactive) │ MES, MNQ      │ 9:00–16:00 ET; 5-min bar ≥3σ, vol ≥1.5×,   │ 2σ bracket      │ 3σ bracket         │ 25-min force-close        │
   │ (3σ momentum)│            │               │ 40-min CSR aligned                           │ + 0.5σ trailing │                    │                           │
