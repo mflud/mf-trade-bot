@@ -1,69 +1,60 @@
 """
 Automated trading bot — MES and MNQ micro futures.
 
+Run as focused_bot via: --strategies vwaslr,pl_rev,wall,orb
 Places market orders with native API bracket stops/targets. Only one open
 position per instrument at a time across all strategies.
 
 Logs: bot_trades.csv (CSR), orb_trades.csv, vwaslr_trades.csv,
       slr_trades.csv, pl_rev_trades.csv, wall_break_trades.csv
 
-━━━ MES strategies ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━ ACTIVE strategies (focused_bot) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  CSR (3σ momentum) — active 9:00–16:00 ET
-    Entry : 5-min bar return ≥ 3σ, volume ≥ 1.5× mean, 40-min CSR aligned
-    Stop  : 2σ bracket (safety net) + 0.5σ software trailing stop
-    Target: 3σ bracket; force-close after 25 min if neither hit
-
-  ORB (opening range breakout) — active 9:45–10:45 ET
-    Entry : First 5-min close outside 15-min opening range (9:30–9:45),
-            LONG only on gap-down days (9:30 open < prior RTH close),
-            ORB width 0.15%–0.50% of price
-    Stop  : ORB midpoint (half-range)
-    Target: 1× ORB width
-
-  VWASLR (volume-weighted avg scaled log return) — active 9:00–16:00 ET
+  VWASLR (volume-weighted avg scaled log return) — MES, 9:00–16:00 ET
     Entry : EMA-10 of 50-min VWASLR (σ=500-min) crosses ±0.4σ, 1-min bars
+            Skip 9:30–9:40 ET opening blackout
     Stop  : 2σ bracket
     Target: 3σ bracket
     Exit  : EMA retracts to ±0.2σ (half-zero signal exit)
 
-  SLR Scalp (volume surge) — active 9:40–16:00 ET
-    Entry : 1-min bar: vol ≥ 7× rolling median, move ≥ 12bp
-    Stop  : 10bp
-    Target: 15bp; max hold 10 min
-
-  PL_REV (price linearity reversion) — active 10:00–16:00 ET
+  PL_REV (price linearity reversion) — MES, 10:00–16:00 ET
     Entry : 5s bars: PL ≥ 0.80, move ≥ 20bp, ADX(9:00-10:00 ET) ≤ 25
-            Fades the momentum move (enters OPPOSITE to PL_MOM direction)
-    Stop  : 15bp (continuation confirmed = wrong trade)
-    Target: 12bp (reversion hit)
+            Fades the momentum move (enters OPPOSITE to momentum direction)
+    Stop  : 15bp
+    Target: 12bp
     Exit  : Native OCO bracket; early exit if PL resumes ≥ 0.70; 120s max
-    Backtest (excl Apr-2025): WR 91-97%, EV +6-9bp on MES
 
-  Wall Break (DOM resting-order breakout) — active 9:40–16:00 ET
-    Entry : DOM wall (peak 100–300 lots, tested ≥ 2×) breaks out
-    Stop  : 4–5pt adaptive (clamped to trailing 100-min σ)
+  Wall Break (DOM resting-order breakout) — MES, RTH
+    Entry : DOM wall (peak ≥ 3× median, ≥ 50 lots, tested ≥ 2×) breaks out
+    Stop  : 4pt
     Target: 12pt; max hold 15 min
 
-  Note: PL_MOM (continuation) is disabled — no base-rate edge outside
-  April 2025 extreme vol. PL_REV replaced it.
+  ORB (opening range breakout) — MNQ, 9:31–9:36 ET
+    Entry : 9:30 bar (1-min) close-break, both LONG and SHORT,
+            ORB width ≤ 30bps of price, entry window 5 min
+    Stop  : Opposite ORB edge, capped at $500 loss
+    Target: 1× ORB width
+    Exit  : Force-close after 10 min (~9:40–9:41 ET)
+    Backtest (82 sessions Apr–Aug 2026): WR 63%, PF 1.41 (3 contracts)
 
-━━━ MNQ strategies ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ORB (opening range breakout) — MES, 9:45–10:45 ET (also active)
+    Entry : First 5-min close outside 15-min opening range (9:30–9:45),
+            LONG only on gap-down days, ORB width 0.15%–0.50%
+    Stop  : ORB midpoint (half-range)
+    Target: 1× ORB width
 
-  ORB (1-min opening range breakout) — active 9:31–9:46 ET
-    Entry : First 1-min close above 9:30 bar high,
-            LONG only on gap-down days (9:30 open < prior RTH close),
-            ORB width 0.10%–1.00% of price
-    Stop  : Opposite ORB edge (orb_low); full-range stop
-    Target: 0.75× ORB width
+━━━ INACTIVE strategies ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  CSR (3σ momentum) — disabled; dead in post-tariff low-vol regime
+  SLR Scalp (volume surge) — research ongoing; not in focused_bot
+  ML RF (Random Forest) — ml_trading_bot.py; not running currently
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 Usage:
-  python src/trading_bot.py                         # all enabled strategies
-  python src/trading_bot.py --paper                 # paper mode (no orders)
-  python src/trading_bot.py --strategies pl_rev,orb # selected strategies only
-  python src/trading_bot.py --account 12345         # specify account ID
+  python src/trading_bot.py --strategies vwaslr,pl_rev,wall,orb  # focused_bot
+  python src/trading_bot.py --paper                              # paper mode
+  python src/trading_bot.py --account 12345                      # specify account
 """
 
 import argparse
