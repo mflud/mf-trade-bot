@@ -29,14 +29,13 @@ Logs: bot_trades.csv (CSR), orb_trades.csv, vwaslr_trades.csv,
     Stop  : 4pt
     Target: 12pt; max hold 15 min
 
-  ORB (opening range breakout) — MNQ, 9:31–9:36 ET
-    Entry : 9:30 bar (1-min) close-break, both LONG and SHORT,
-            ORB width ≤ 30bps of price, entry window 5 min
-    Stop  : Opposite ORB edge, capped at $500 loss
-    Target: 1× ORB width
-    Exit  : Force-close after 10 min (~9:40–9:41 ET)
-    Backtest (82 sessions Apr–Aug 2026): WR 63%, PF 1.41 (3 contracts)
-    Note  : MES 15-min ORB disabled 2026-08-12 (only 10 trades in May–Jul)
+  ORB (opening range breakout) — MNQ + MES, 9:31–9:36 ET
+    MNQ: 9:30 bar close-break, both directions, width ≤ 30bps,
+         stop=opposite ORB edge (capped $500), target=1×width, hold 10min
+         Backtest (82 sessions Apr–Aug 2026): WR 63%, PF 1.41 (3 contracts)
+    MES: 9:30 bar close-break, both directions, no width filter,
+         stop=ORB midpoint (half-range, ~2:1 R:R), target=1×width, hold 10min
+         Backtest (84 sessions Apr–Aug 2026): WR 65.9%, PF 3.03 (1 contract)
 
 ━━━ INACTIVE strategies ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -623,17 +622,22 @@ class BotInstrument:
 
 
 INSTRUMENTS = [
+    # MES: 1-min ORB. Sweep (Apr–Aug 2026, 84 sessions):
+    #   entry=close-break, stop=ORB midpoint (half-range), target=1×width,
+    #   entry window=5min, hold=10min, both directions.
+    #   WR=65.9% PF=3.03 $1,325 (1 contract). Width filter makes no difference.
+    #   Midpoint stop outperforms far_side for MES (better R:R at ~2:1).
     BotInstrument("MES", "MES", tick_size=0.25, point_value=5.00,
                   csr_vol_windows=[(0.08, 4), (1.0, 8)],
                   blackout_windows=[
                       (16,  0,  9,  0, False),  # trade 09:00–16:00 ET only
                   ],
-                  # ORB: disabled 2026-08-12 — only 10 trades in May–Jul 2026 backtest,
-                  #   not enough frequency to justify running alongside MNQ 1-min ORB.
-                  orb_enabled=False,
-                  orb_width_pct_min=0.0015, orb_width_pct_max=0.005,
-                  orb_period_min=15, orb_entry_window_min=60,
-                  orb_target_mult=1.0, orb_gap_fade_long=True,
+                  orb_enabled=True,
+                  orb_width_pct_min=0.0,     orb_width_pct_max=0.0,    # no width filter
+                  orb_period_min=1,           orb_entry_window_min=5,   # 5-min entry window
+                  orb_target_mult=1.0,        orb_gap_fade_long=False,  # both directions
+                  orb_full_range_stop=False,  orb_hold_min=10,          # midpoint stop, exit ~9:41 ET
+                  orb_max_loss_dollars=0,                               # no dollar cap
                   vwaslr_n=50, vwaslr_threshold=0.4, vwaslr_start=(9, 0),
                   slr_enabled=True,
                   eve_enabled=False,
