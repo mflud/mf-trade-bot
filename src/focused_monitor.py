@@ -580,7 +580,7 @@ def build_vwaslr_panel(state: MonitorState, now: datetime) -> Panel:
 
     root = Table.grid(padding=(0, 0))
     root.add_column(justify="center")
-    root.add_row(f"[{style}]  {status}  [/]")
+    root.add_row(f"[{style}]  {status}  [/]" if style else f"  {status}  ")
     root.add_row("")
 
     # EMA gauge
@@ -667,7 +667,7 @@ def build_pl_rev_panel(state: MonitorState, now: datetime) -> Panel:
 
     root = Table.grid(padding=(0, 0))
     root.add_column(justify="center")
-    root.add_row(f"[{style}]  {status}  [/]")
+    root.add_row(f"[{style}]  {status}  [/]" if style else f"  {status}  ")
     root.add_row("")
 
     if rev_qualifies:
@@ -742,7 +742,7 @@ def build_orb_panel(state: MonitorState, now: datetime) -> Panel:
             status = "PRE-MARKET"; style = ""; border = "default"
         else:
             status = "LOADING…"; style = ""; border = "default"
-        root.add_row(f"[{style}]  {status}  [/]")
+        root.add_row(f"[{style}]  {status}  [/]" if style else f"  {status}  ")
         return Panel(root, title=f"ORB  MNQ  (1-min)", border_style=border,
                      padding=(0, 1), expand=True)
 
@@ -760,7 +760,7 @@ def build_orb_panel(state: MonitorState, now: datetime) -> Panel:
     else:
         status = "▼ BREAKOUT SHORT"; style = "bold red"; border = "red"
 
-    root.add_row(f"[{style}]  {status}  [/]")
+    root.add_row(f"[{style}]  {status}  [/]" if style else f"  {status}  ")
     root.add_row("")
 
     # ORB range info
@@ -899,7 +899,7 @@ def build_wall_panel(state: MonitorState, now: datetime) -> Panel:
 
     root = Table.grid(padding=(0, 0))
     root.add_column(justify="center")
-    root.add_row(f"[{style}]  {status}  [/]")
+    root.add_row(f"[{style}]  {status}  [/]" if style else f"  {status}  ")
 
     # Active signal detail
     if sig and now < sig.expires_at:
@@ -933,7 +933,7 @@ def build_wall_panel(state: MonitorState, now: datetime) -> Panel:
             t_s  = ts.astimezone(LOCAL).strftime("%H:%M:%S")
             ec   = "bold yellow" if ev == "breakout" else ""
             sc   = "green" if side == "bid" else "red"
-            lt.add_row(t_s, f"[{ec}]{ev}[/]", f"[{sc}]{side}[/]",
+            lt.add_row(t_s, f"[{ec}]{ev}[/]" if ec else ev, f"[{sc}]{side}[/]",
                        f"{wp:.2f}", f"T{tc}")
         root.add_row(lt)
 
