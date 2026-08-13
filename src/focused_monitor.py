@@ -565,7 +565,7 @@ def build_vwaslr_panel(state: MonitorState, now: datetime) -> Panel:
     if warming:
         status = "WARMING UP"
         border = "default"
-        style  = "dim"
+        style  = ""
     elif sig and now < sig.expires_at:
         direction = sig.direction
         status = "▲ LONG" if direction == 1 else "▼ SHORT"
@@ -589,9 +589,9 @@ def build_vwaslr_panel(state: MonitorState, now: datetime) -> Panel:
     filled     = int(abs(ema_norm) * gauge_half)
     empty      = gauge_half - filled
     if ema >= 0:
-        gauge = f"[dim]{'░'*gauge_half}[/][green]{'|'}{'█'*filled}{'░'*empty}[/]"
+        gauge = f"{'░'*gauge_half}[green]{'|'}{'█'*filled}{'░'*empty}[/]"
     else:
-        gauge = f"[red]{'░'*empty}{'█'*filled}{'|'}[/][dim]{'░'*gauge_half}[/]"
+        gauge = f"[red]{'░'*empty}{'█'*filled}{'|'}[/]{'░'*gauge_half}"
 
     grd = Table.grid(padding=(0, 1))
     grd.add_column(width=10, justify="right")
@@ -602,8 +602,8 @@ def build_vwaslr_panel(state: MonitorState, now: datetime) -> Panel:
         last_et = bars[-1].ts.astimezone(LOCAL)
         sp = state.vwaslr_sigma_pts
         sigma_s = f"  σ={sp:.2f}pt" if sp else ""
-        grd.add_row("Last bar:", f"[dim]{last_et.strftime('%H:%M')}  "
-                                 f"close={bars[-1].close:.2f}{sigma_s}[/]")
+        grd.add_row("Last bar:", f"{last_et.strftime('%H:%M')}  "
+                                 f"close={bars[-1].close:.2f}{sigma_s}")
     root.add_row(grd)
     root.add_row("")
 
@@ -618,7 +618,7 @@ def build_vwaslr_panel(state: MonitorState, now: datetime) -> Panel:
         sdet.add_row("Entry:",   f"[bold {clr}]{sig.entry:.2f}[/]")
         sdet.add_row("Target:",  f"[bold green]{tgt:.2f}[/]  ({VWASLR_TARGET_S:.0f}σ)")
         sdet.add_row("Stop:",    f"[bold red]{stp:.2f}[/]  ({VWASLR_STOP_S:.0f}σ)")
-        sdet.add_row("Expires:", f"[dim]{rem}s[/]")
+        sdet.add_row("Expires:", f"{rem}s")
         root.add_row(sdet)
         root.add_row("")
 
@@ -632,7 +632,7 @@ def build_vwaslr_panel(state: MonitorState, now: datetime) -> Panel:
         for ts, ema_h, fired in reversed(state.vwaslr_history[-10:]):
             t_str = ts.astimezone(LOCAL).strftime("%H:%M")
             clr   = ("green" if ema_h > thr else "red" if ema_h < -thr else "")
-            ema_s = (f"[{clr}]{ema_h:+.4f}[/]" if clr else f"[dim]{ema_h:+.4f}[/]")
+            ema_s = (f"[{clr}]{ema_h:+.4f}[/]" if clr else f"{ema_h:+.4f}")
             filled2 = max(0, min(8, int(abs(ema_h) / (thr * 2) * 8)))
             bar_s = ("▲" if ema_h > 0 else "▼") * max(1, filled2)
             sig_s = ("[bold green]▲ LONG[/]" if fired == 1 else
@@ -641,10 +641,10 @@ def build_vwaslr_panel(state: MonitorState, now: datetime) -> Panel:
         root.add_row(ht)
 
     if warming:
-        root.add_row(f"[dim]Need {VWASLR_N + VWASLR_SIGMA_BARS + 1 - len(bars)} more bars[/]")
+        root.add_row(f"Need {VWASLR_N + VWASLR_SIGMA_BARS + 1 - len(bars)} more bars")
 
     foot = Table.grid(); foot.add_column(justify="center")
-    foot.add_row(f"[dim]VWASLR({VWASLR_N}min, σ={VWASLR_SIGMA_BARS}min)  EMA({VWASLR_EMA_SPAN})  thr ±{thr:.2f}σ  2σ/3σ bracket[/]")
+    foot.add_row(f"VWASLR({VWASLR_N}min, σ={VWASLR_SIGMA_BARS}min)  EMA({VWASLR_EMA_SPAN})  thr ±{thr:.2f}σ  2σ/3σ bracket")
     root.add_row(foot)
 
     return Panel(root, title=f"VWASLR  {SYMBOL}", border_style=border,
@@ -689,7 +689,7 @@ def build_pl_rev_panel(state: MonitorState, now: datetime) -> Panel:
         det.add_row("Entry:",   f"[bold]{sig.entry:,.2f}[/]")
         det.add_row("Target:",  f"[bold green]{tgt:,.2f}[/]  ({tp_pt:.2f}pt  {PL_TP_BPS:.0f}bp)")
         det.add_row("Stop:",    f"[bold red]{stp:,.2f}[/]  ({stop_pt:.2f}pt  {PL_STOP_BPS:.0f}bp)")
-        det.add_row("Expires:", f"[dim]{rem_s//60}m {rem_s%60:02d}s[/]")
+        det.add_row("Expires:", f"{rem_s//60}m {rem_s%60:02d}s")
         root.add_row(det)
         root.add_row("")
 
@@ -716,11 +716,11 @@ def build_pl_rev_panel(state: MonitorState, now: datetime) -> Panel:
                 fade_col)
         root.add_row(ht)
     elif not state.bars_5s:
-        root.add_row("[dim]warming up…[/]")
+        root.add_row("warming up…")
 
     foot = Table.grid(); foot.add_column(justify="center")
-    foot.add_row(f"[dim]entry: PL≥{PL_ENTRY_PL:.2f} bp≥{PL_MOVE_BPS:.0f}  "
-                 f"TP {PL_TP_BPS:.0f}bp  stop {PL_STOP_BPS:.0f}bp  resume≥{PL_RESUME_PL:.2f}[/]")
+    foot.add_row(f"entry: PL≥{PL_ENTRY_PL:.2f} bp≥{PL_MOVE_BPS:.0f}  "
+                 f"TP {PL_TP_BPS:.0f}bp  stop {PL_STOP_BPS:.0f}bp  resume≥{PL_RESUME_PL:.2f}")
     root.add_row(foot)
 
     return Panel(root, title=f"PL REV  {SYMBOL}", border_style=border,
@@ -739,9 +739,9 @@ def build_orb_panel(state: MonitorState, now: datetime) -> Panel:
 
     if orb.session_date is None or not orb.orb_high:
         if hm_et < 9*60+30:
-            status = "PRE-MARKET"; style = "dim"; border = "default"
+            status = "PRE-MARKET"; style = ""; border = "default"
         else:
-            status = "LOADING…"; style = "dim"; border = "default"
+            status = "LOADING…"; style = ""; border = "default"
         root.add_row(f"[{style}]  {status}  [/]")
         return Panel(root, title=f"ORB  MNQ  (1-min)", border_style=border,
                      padding=(0, 1), expand=True)
@@ -750,9 +750,9 @@ def build_orb_panel(state: MonitorState, now: datetime) -> Panel:
     if hm_et < orb_end_hm:
         status = "FORMING"; style = "bold"; border = "default"
     elif not orb.valid:
-        status = "INVALID WIDTH"; style = "dim yellow"; border = "yellow"
+        status = "INVALID WIDTH"; style = "yellow"; border = "yellow"
     elif orb.direction == 0 and hm_et >= entry_end_hm:
-        status = "EXPIRED"; style = "dim"; border = "default"
+        status = "EXPIRED"; style = ""; border = "default"
     elif orb.direction == 0:
         status = "WATCHING"; style = "bold"; border = "blue"
     elif orb.direction == 1:
@@ -775,7 +775,7 @@ def build_orb_panel(state: MonitorState, now: datetime) -> Panel:
         rng.add_row("ORB High:",  f"[bold]{orb.orb_high:.2f}[/]")
         rng.add_row("ORB Low:",   f"[bold]{orb.orb_low:.2f}[/]")
         rng.add_row("Width:",     f"{orb.orb_width:.2f}pt  {w_pct:.3f}%  [{v_clr}]{valid_s}[/]")
-        rng.add_row("Midpoint:",  f"[dim]{orb.orb_mid:.2f}[/]")
+        rng.add_row("Midpoint:",  f"{orb.orb_mid:.2f}")
 
     root.add_row(rng)
 
@@ -793,19 +793,19 @@ def build_orb_panel(state: MonitorState, now: datetime) -> Panel:
                                 f"(+{abs(orb.target-orb.entry_price):.2f}pt)")
         bdet.add_row("Stop:",   f"[bold red]{orb.stop:.2f}[/]  "
                                 f"({abs(orb.stop-orb.entry_price):.2f}pt)")
-        bdet.add_row("Exit by:", f"[dim]~{exit_h:02d}:{exit_m:02d} ET[/]")
+        bdet.add_row("Exit by:", f"~{exit_h:02d}:{exit_m:02d} ET")
         root.add_row(bdet)
     elif orb.valid and hm_et < entry_end_hm:
         root.add_row("")
-        root.add_row(f"[dim]  Entry window: 9:31–9:36 ET  "
+        root.add_row(f"  Entry window: 9:31–9:36 ET  "
                      f"(close > {orb.orb_high:.2f} → LONG  /  "
-                     f"close < {orb.orb_low:.2f} → SHORT)[/]")
+                     f"close < {orb.orb_low:.2f} → SHORT)")
 
     root.add_row("")
     foot = Table.grid(); foot.add_column(justify="center")
-    foot.add_row(f"[dim]MNQ 1-min ORB  entry≤{ORB_ENTRY_WIN}min  hold {ORB_HOLD_MIN}min  "
+    foot.add_row(f"MNQ 1-min ORB  entry≤{ORB_ENTRY_WIN}min  hold {ORB_HOLD_MIN}min  "
                  f"stop=opposite ORB (cap ${ORB_MAX_LOSS:.0f})  target={ORB_TGT_MULT:.0f}× width  "
-                 f"width≤{ORB_WIDTH_MAX*10000:.0f}bps[/]")
+                 f"width≤{ORB_WIDTH_MAX*10000:.0f}bps")
     root.add_row(foot)
 
     return Panel(root, title=f"ORB  MNQ  (1-min)", border_style=border,
@@ -844,7 +844,7 @@ def build_dom_panel(state: MonitorState) -> Panel:
     for label, size, is_bucket in list(reversed(ask_rows[DOM_NEAR:])) + list(reversed(ask_rows[:DOM_NEAR])):
         if label is None: t.add_row("","","","",""); continue
         wall  = is_wall(size)
-        style = "bold red" if wall else ("red" if size > 0 else "dim")
+        style = "bold red" if wall else ("red" if size > 0 else "")
         bar   = sz_bar(size, False, is_bucket)
         wm    = "◀" if wall else " "
         tc    = wall_tests.get(label) if isinstance(label, float) else None
@@ -860,14 +860,14 @@ def build_dom_panel(state: MonitorState) -> Panel:
         ta = sum(s for _, s, _ in ask_rows if s > 0)
         d  = tb + ta
         im = (tb - ta) / d if d else 0
-        ic = "green" if im > 0.1 else ("red" if im < -0.1 else "dim")
-        imbal_txt = f"  [{ic}]imb {im:+.2f}[/]"
-    t.add_row("", f"[dim]spread {spread}[/]{imbal_txt}", "", "", "")
+        ic = "green" if im > 0.1 else ("red" if im < -0.1 else "")
+        imbal_txt = f"  [{ic}]imb {im:+.2f}[/]" if ic else f"  imb {im:+.2f}"
+    t.add_row("", f"spread {spread}{imbal_txt}", "", "", "")
 
     for label, size, is_bucket in bid_rows[:DOM_NEAR] + bid_rows[DOM_NEAR:]:
         if label is None: t.add_row("","","","",""); continue
         wall  = is_wall(size)
-        style = "bold green" if wall else ("green" if size > 0 else "dim")
+        style = "bold green" if wall else ("green" if size > 0 else "")
         bar   = sz_bar(size, True, is_bucket)
         wm    = "◀" if wall else " "
         tc    = wall_tests.get(label) if isinstance(label, float) else None
@@ -879,7 +879,7 @@ def build_dom_panel(state: MonitorState) -> Panel:
     age     = (datetime.now(timezone.utc) - updated).total_seconds()
     age_col = "green" if age < 10 else ("yellow" if age < 30 else "red")
     last_s  = f"{last:.2f}" if last else "—"
-    return Panel(t, title=f"DOM  {SYMBOL}  [{age_col}]{last_s}[/]  [dim]{age:.0f}s[/]",
+    return Panel(t, title=f"DOM  {SYMBOL}  [{age_col}]{last_s}[/]  {age:.0f}s",
                  border_style="blue", padding=(0, 1), expand=True)
 
 
@@ -895,7 +895,7 @@ def build_wall_panel(state: MonitorState, now: datetime) -> Panel:
     elif active:
         status = "WATCHING"; border = "blue"; style = "bold"
     else:
-        status = "NO WALLS"; border = "default"; style = "dim"
+        status = "NO WALLS"; border = "default"; style = ""
 
     root = Table.grid(padding=(0, 0))
     root.add_column(justify="center")
@@ -914,7 +914,7 @@ def build_wall_panel(state: MonitorState, now: datetime) -> Panel:
         det.add_row("Entry:",  f"[bold {clr}]{sig.entry:.2f}[/]")
         det.add_row("Target:", f"[bold green]{sig.target:.2f}[/]  (+{WALL_TARGET_PTS:.0f}pt)")
         det.add_row("Stop:",   f"[bold red]{sig.stop:.2f}[/]  ({WALL_STOP_PTS:.0f}pt)")
-        det.add_row("Hold:",   f"[dim]{rem//60}m {rem%60:02d}s remaining[/]")
+        det.add_row("Hold:",   f"{rem//60}m {rem%60:02d}s remaining")
         root.add_row(det)
 
     # Recent event log (tests + breakouts) — capped at 4 rows; walls shown on DOM ladder
@@ -931,7 +931,7 @@ def build_wall_panel(state: MonitorState, now: datetime) -> Panel:
         lt.add_column("tests",  justify="center")
         for ts, ev, side, wp, tc, ep in notable:
             t_s  = ts.astimezone(LOCAL).strftime("%H:%M:%S")
-            ec   = "bold yellow" if ev == "breakout" else "dim"
+            ec   = "bold yellow" if ev == "breakout" else ""
             sc   = "green" if side == "bid" else "red"
             lt.add_row(t_s, f"[{ec}]{ev}[/]", f"[{sc}]{side}[/]",
                        f"{wp:.2f}", f"T{tc}")
@@ -939,7 +939,7 @@ def build_wall_panel(state: MonitorState, now: datetime) -> Panel:
 
     root.add_row("")
     foot = Table.grid(); foot.add_column(justify="center")
-    foot.add_row(f"[dim]stop {WALL_STOP_PTS:.0f}pt  target {WALL_TARGET_PTS:.0f}pt  hold {WALL_HOLD_MIN}min  tests≥2 to trade[/]")
+    foot.add_row(f"stop {WALL_STOP_PTS:.0f}pt  target {WALL_TARGET_PTS:.0f}pt  hold {WALL_HOLD_MIN}min  tests≥2 to trade")
     root.add_row(foot)
 
     return Panel(root, title=f"WALL BREAK  {SYMBOL}", border_style=border,
@@ -975,7 +975,7 @@ def build_sizing_panel(state: MonitorState) -> Panel:
         else:
             t.add_row(f"${risk}", "—")
     return Panel(t, title="[bold]SIZING (2σ stop)[/]",
-                 subtitle=f"[dim]σ: {min(SIZING_SIGMA_BARS, len(state.bars_1m))} 1-min bars[/]",
+                 subtitle=f"σ: {min(SIZING_SIGMA_BARS, len(state.bars_1m))} 1-min bars",
                  border_style="blue", padding=(0, 1), expand=False)
 
 
@@ -1004,12 +1004,12 @@ def build_header() -> Table:
     else:
         h = datetime.now(timezone.utc).hour
         sess = ("[bold red]SETTLEMENT[/]" if SETTLE_UTC_START <= h < SETTLE_UTC_END
-                else "[dim]GLOBEX[/]")
+                else "GLOBEX")
     t = Table.grid(expand=True)
     t.add_column(ratio=1); t.add_column(ratio=1, justify="center"); t.add_column(ratio=1, justify="right")
     t.add_row(
-        f"[bold]Focused Bot Monitor[/]  {sess}  [dim]VWASLR · PL_REV · Wall Break · ORB[/]",
-        f"[dim]{now_loc.strftime('%H:%M:%S')}  /  {now_et.strftime('%H:%M ET')}[/]",
+        f"[bold]Focused Bot Monitor[/]  {sess}  VWASLR · PL_REV · Wall Break · ORB",
+        f"{now_loc.strftime('%H:%M:%S')}  /  {now_et.strftime('%H:%M ET')}",
         "",
     )
     return t

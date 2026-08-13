@@ -4053,8 +4053,8 @@ def run(account_id: int | None, paper: bool, strategies: set[str] | None = None)
 
                 # PL_Mom entry: RTH only, new 5s bar gate
                 # Blackout 9:30–9:40 ET: first 10 min are high-volatility churn with negative edge
+                now_et_hm_chk = (now_et.hour, now_et.minute)
                 if no_position and not past_cutoff and state.instrument.pl_mom_enabled:
-                    now_et_hm_chk = (now_et.hour, now_et.minute)
                     if (9, 40) <= now_et_hm_chk < (16, 0):
                         fetch_pl_mom_bars(client, state)
                         pl_mom_bar_ts = (state.pl_mom_5s_bars[-1].ts
