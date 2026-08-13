@@ -2,15 +2,12 @@
 focused_monitor.py — Monitor for the focused bot (VWASLR, PL_REV, Wall Break, ORB).
 
 Layout:
-  ┌─────────────────────────────────────────────────────────────────┐
-  │ Header                                                          │
-  ├─────────────────────────┬───────────────────────────────────────┤
-  │ VWASLR panel            │ PL REV panel                          │
-  ├─────────────────────────┬───────────────────────────────────────┤
-  │ DOM + Wall Break panel  │ ORB panel                             │
-  ├─────────────────────────┴───────────────────────────────────────┤
-  │ Trade Summary + Positions          │ Sizing                     │
-  └────────────────────────────────────┴───────────────────────────┘
+  ┌────────────────────────┬───────────────────────┬────────────┐
+  │ VWASLR                 │ PL_REV                │ DOM        │
+  │ MNQ ORB                │ Wall Break            │            │
+  │ MES ORB                ├───────────────────────┴────────────┤
+  │ Positions │ Sizing     │ Trade Summary (col2+DOM width)      │
+  └────────────────────────┴────────────────────────────────────┘
 
 Usage:
     python src/focused_monitor.py
@@ -1175,33 +1172,41 @@ def render(state: MonitorState) -> Table:
     root.add_column(ratio=1)
     root.add_row(build_header())
 
-    # ── Top: 3-column strategy area ────────────────────────────────────────────
-    # Col 1: VWASLR + MNQ ORB   |   Col 2: PL_REV + Wall Break   |   Col 3: DOM
+    # ── Layout ─────────────────────────────────────────────────────────────────
+    # Col 1 (ratio=1): VWASLR · MNQ ORB · MES ORB · Positions|Sizing
+    # Col 2 (ratio=1): [PL_REV + Wall Break | DOM]  ← top
+    #                  [Trade Summary (full col2+DOM width)] ← bottom
+    pos_siz = Table(box=None, show_header=False, padding=(0, 0), expand=False)
+    pos_siz.add_column(); pos_siz.add_column()
+    pos_siz.add_row(build_positions_panel(state), build_sizing_panel(state))
+
     col1 = Table.grid(); col1.add_column()
     col1.add_row(build_vwaslr_panel(state, now))
     col1.add_row(build_orb_panel(state, now))
+    col1.add_row(build_mes_orb_panel(state, now))
+    col1.add_row(pos_siz)
 
-    col2 = Table.grid(); col2.add_column()
-    col2.add_row(build_pl_rev_panel(state, now))
-    col2.add_row(build_wall_panel(state, now))
+    # Top portion of right section: PL_REV/Wall Break alongside DOM
+    pl_wall = Table.grid(); pl_wall.add_column()
+    pl_wall.add_row(build_pl_rev_panel(state, now))
+    pl_wall.add_row(build_wall_panel(state, now))
+
+    strats = Table(box=None, show_header=False, padding=(0, 1), expand=True)
+    strats.add_column(ratio=1)   # PL_REV + Wall Break
+    strats.add_column()           # DOM (fixed)
+    strats.add_row(pl_wall, build_dom_panel(state))
+
+    # Right section: strats on top, Trade Summary full-width below
+    right = Table(box=None, show_header=False, padding=(0, 0), expand=True)
+    right.add_column(ratio=1)
+    right.add_row(strats)
+    right.add_row(build_trade_summary_panel())
 
     main = Table(box=None, show_header=False, padding=(0, 1), expand=True)
-    main.add_column(ratio=1)
-    main.add_column(ratio=1)
-    main.add_column()        # DOM fixed width
-    main.add_row(col1, col2, build_dom_panel(state))
+    main.add_column()           # col1: natural width, no ratio
+    main.add_column(ratio=1)    # right section: fills remaining space
+    main.add_row(col1, right)
     root.add_row(main)
-
-    # ── Bottom: MES ORB  |  Trade Summary + Positions + Sizing ────────────────
-    right = Table.grid(); right.add_column()
-    right.add_row(build_trade_summary_panel())
-    right.add_row(build_positions_panel(state))
-    right.add_row(build_sizing_panel(state))
-
-    row3 = Table(box=None, show_header=False, padding=(0, 1), expand=False)
-    row3.add_column(); row3.add_column()
-    row3.add_row(build_mes_orb_panel(state, now), right)
-    root.add_row(row3)
 
     return root
 

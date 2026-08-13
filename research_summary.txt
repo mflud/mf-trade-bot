@@ -1,11 +1,11 @@
 MES/MYM Systematic Signal Research — Journey Summary
 ======================================================
-Written: 2026-03-15  |  Updated: 2026-08-11
+Written: 2026-03-15  |  Updated: 2026-08-13
 
 
-LIVE SYSTEM OVERVIEW  (updated 2026-08-12)
+LIVE SYSTEM OVERVIEW  (updated 2026-08-13)
 ------------------------------------------
-focused_bot (trading_bot.py --strategies vwaslr,pl_rev,wall,orb) trades four
+focused_bot (trading_bot.py --strategies vwaslr,pl_rev,wall,orb) trades five
 rule-based strategies across MES and MNQ. ml_trading_bot.py is available but
 not currently running.
 
@@ -14,21 +14,30 @@ not currently running.
 
   Trading window: 9:00 AM – 4:00 PM ET, Monday–Friday only
 
+  Practice account reset: 2026-08-12. All P&L from that date forward reflects
+  this exact configuration.
+
   ┌──────────────┬────────────┬───────────────┬──────────────────────────────────────────────┬─────────────────┬────────────────────┬───────────────────────────┐
-  │ Strategy     │ Bot        │ Instruments   │ Entry                                        │ Stop            │ Target             │ Exit                      │
-  ├──────────────┼────────────┼───────────────┼──────────────────────────────────────────────┼─────────────────┼────────────────────┬───────────────────────────┤
+  │ Strategy     │ Bot        │ Instruments   │ Entry                                        │ Stop            │ Target             │ Exit / Backtest           │
+  ├──────────────┼────────────┼───────────────┼──────────────────────────────────────────────┼─────────────────┼────────────────────┼───────────────────────────┤
   │ VWASLR       │ focused_   │ MES           │ 9:00–16:00 ET (skip 9:30–9:40); EMA-10       │ 2σ bracket      │ 3σ bracket         │ EMA retracts to ±0.2σ     │
   │ (EMA cross)  │ bot        │               │ (VWASLR 50-min) crosses ±0.4σ, 1-min bars   │                 │                    │ (half-zero signal exit)   │
   ├──────────────┼────────────┼───────────────┼──────────────────────────────────────────────┼─────────────────┼────────────────────┼───────────────────────────┤
-  │ PL_REV       │ focused_   │ MES           │ 10:00–16:00 ET; 5s bars: PL ≥0.80,          │ 15bp            │ 12bp               │ Bracket (OCO); early exit │
-  │ (reversion)  │ bot        │               │ move ≥20bp, ADX(9-10ET) ≤25                 │                 │                    │ if PL resumes ≥0.70       │
-  │              │            │               │ Fades the momentum move (opposite direction) │                 │                    │ or 120s max hold          │
+  │ PL_REV       │ focused_   │ MES           │ 10:00–16:00 ET; 5s bars: PL ≥0.80,          │ 15bp            │ 24bp               │ Bracket (OCO); early exit │
+  │ (reversion)  │ bot        │               │ move ≥20bp; no ADX gate (120s cooldown       │                 │                    │ if PL resumes ≥0.70;      │
+  │              │            │               │ between trades replaces gate).               │                 │                    │ 120s max hold.            │
+  │              │            │               │ Fades the momentum move (opposite direction) │                 │                    │ BT: WR 91.6% EV +10.17bp  │
   ├──────────────┼────────────┼───────────────┼──────────────────────────────────────────────┼─────────────────┼────────────────────┼───────────────────────────┤
   │ Wall Break   │ focused_   │ MES           │ RTH; DOM wall (peak ≥3× median, ≥50 lots,    │ 4pt             │ 12pt               │ 15-min hold               │
   │ (DOM)        │ bot        │               │ tested ≥2×) breaks out                       │                 │                    │                           │
   ├──────────────┼────────────┼───────────────┼──────────────────────────────────────────────┼─────────────────┼────────────────────┼───────────────────────────┤
-  │ ORB          │ focused_   │ MNQ: 9:31–    │ 1-min range (9:30 bar) close-break,          │ Opposite ORB    │ 1× ORB width       │ ~9:40 ET force-close      │
+  │ ORB (MNQ)    │ focused_   │ MNQ: 9:31–    │ 1-min range (9:30 bar) close-break,          │ Opposite ORB    │ 1× ORB width       │ ~9:40 ET force-close      │
   │ (1-min ORB)  │ bot        │ 9:36 ET       │ both directions, width ≤30bps                │ capped at $500  │                    │ (10-min hold)             │
+  │              │            │               │                                              │ (far-side)      │                    │ BT: WR 63% PF 1.41        │
+  ├──────────────┼────────────┼───────────────┼──────────────────────────────────────────────┼─────────────────┼────────────────────┼───────────────────────────┤
+  │ ORB (MES)    │ focused_   │ MES: 9:31–    │ 1-min range (9:30 bar) close-break,          │ ORB midpoint    │ 1× ORB width       │ ~9:41 ET force-close      │
+  │ (1-min ORB)  │ bot        │ 9:36 ET       │ both directions, no width filter             │ (~½ width,      │                    │ (10-min hold)             │
+  │              │            │               │                                              │ ~2:1 R:R)       │                    │ BT: WR 65.9% PF 3.03      │
   ├──────────────┼────────────┼───────────────┼──────────────────────────────────────────────┼─────────────────┼────────────────────┼───────────────────────────┤
   │ CSR          │ (inactive) │ MES, MNQ      │ 9:00–16:00 ET; 5-min bar ≥3σ, vol ≥1.5×,   │ 2σ bracket      │ 3σ bracket         │ 25-min force-close        │
   │ (3σ momentum)│            │               │ 40-min CSR aligned                           │ + 0.5σ trailing │                    │                           │
@@ -39,6 +48,14 @@ not currently running.
   │ ML RF        │ (inactive) │ MES, MNQ      │ 9:40–15:45 ET; Random Forest prob ≥0.65,    │ MES: ~9bp       │ MES: ~16bp         │ Bracket (OCO)             │
   │ (2-min bars) │            │               │ vol_regime ≥0.50, r2m + ret_open aligned    │ MNQ: ~11bp      │ MNQ: ~17bp         │                           │
   └──────────────┴────────────┴───────────────┴──────────────────────────────────────────────┴─────────────────┴────────────────────┴───────────────────────────┘
+
+  Key parameter changes (2026-08-12/13):
+    PL_REV: ADX gate removed — backtest showed 120s natural cooldown between
+      trades outperforms every ADX threshold. TP increased 12bp → 24bp
+      (WR stays ~91% at any TP level; 24bp chosen for balanced EV/frequency).
+    MES ORB: added 2026-08-13 — 1-min ORB with midpoint stop gives PF 3.03
+      vs PF 1.41 for MNQ (different stop style; MES midpoint = ~2:1 R:R).
+    Backtest periods: Apr–Aug 2026 (84 MES sessions, 82 MNQ sessions).
 
   Note: PL_MOM (price linearity momentum continuation) is disabled on MES —
   backtesting showed no base-rate edge (WR ~35%) outside April 2025 extreme vol.
@@ -52,14 +69,15 @@ not currently running.
 
   Background processes:
   ─────────────────────────────────────────────────────────────────────────────
-  focused_bot          Places live orders — 4 strategies (launchd, 6:20 AM MST)
-  focused_monitor      Display: VWASLR / PL_REV / DOM+Wall Break / ORB (screen)
+  focused_bot          Places live orders — 5 strategies (launchd, 6:20 AM MST)
+  focused_monitor      Display: VWASLR + MNQ ORB | PL_REV + Wall Break | DOM
+                         + MES ORB panel | Trade Summary | Positions | Sizing
   bar_collector        Writes 1-min + 5-min + 5s bars to bars.db (launchd)
   bar_recorder         Writes 5s bars to CSV files (launchd)
-  dom_recorder         Records DOM snapshots to dom.db (launchd)
 
   All launchd processes share one TopstepX auth session per day (prevents
-  "multiple sessions" login conflicts).
+  "multiple sessions" login conflicts). dom_recorder removed 2026-08-12
+  (bar_collector handles DOM writes directly).
 
   Bar collection window: 09:00–17:00 ET (TopstepX data available until
   17:00 ET = 14:00 MST).
@@ -74,12 +92,17 @@ not currently running.
     No overnight / weekend activity
 
   Monitor display features (focused_monitor):
-    • 3-column layout: VWASLR + ORB | PL_REV + Wall Break | DOM
+    • Top: 3-column layout: VWASLR + MNQ ORB | PL_REV + Wall Break | DOM
+    • Bottom-left: MES ORB panel
+    • Bottom-right: Trade Summary + Positions + Sizing stacked
     • Wall Break panel: active signal with target/stop/countdown, test-count log
-    • ORB panel: MNQ 1-min range, entry window, breakout direction + levels
+    • ORB panels: 1-min range, entry window, breakout direction + levels
     • POSITIONS panel shows open contracts + strategy that opened them
     • SIZING panel: lot sizes for $100–$1000 risk at 2σ stop, from live sigma
     • Trade Summary: trades since 08:30 ET today
+
+  Combine safety: use botdown.sh before manually trading a Combine to stop
+  focused_bot and prevent cross-account hedging violations. botup.sh to restart.
 
 
 STARTING POINT

@@ -188,5 +188,5 @@ def build_trade_summary_panel(max_rows: int = 20) -> Panel:
         RichGroup(tbl, blank, note),
         title="Trade Summary  (since 08:30 ET)",
         border_style="blue",
-        expand=False,
+        expand=True,
     )
