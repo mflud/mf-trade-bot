@@ -699,12 +699,6 @@ def silent_feed_watchdog(market_hub: "SignalRConn", last_tick: list,
         if t is None:
             continue
         age = (now_utc - t).total_seconds()
-        if trade_counters is not None:
-            msgs, ticks = trade_counters
-            log.info(
-                f"market-hub: watchdog — last GatewayTrade {int(age)}s ago  "
-                f"msgs={msgs}  valid_ticks={ticks}"
-            )
         if age > TICK_TIMEOUT_SECS:
             log.warning(
                 f"market-hub: no ticks for {int(age)}s — forcing reconnect"
@@ -887,7 +881,7 @@ def run(demo: bool = False):
             time.sleep(60)
             for sym, state in states.items():
                 market_hub.send("SubscribeContractTrades", [state.contract_id])
-            log.info("market-hub: re-subscribed contract trades")
+            log.debug("market-hub: re-subscribed contract trades")
 
     threading.Thread(
         target=trade_resubscribe_loop,
