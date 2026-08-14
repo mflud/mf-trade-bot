@@ -1001,7 +1001,8 @@ def build_dom_panel(state: MonitorState) -> Panel:
         tc    = wall_tests.get(label) if isinstance(label, float) else None
         tc_s  = f"[yellow]T{tc}[/]" if tc else ""
         sz_s  = f"[{style}]{size:.0f}{wm}[/]{tc_s}" if size > 0 else ""
-        lbl_s = f"[{style}]{label}[/]" if is_bucket else f"[{style}]{label:.2f}[/]"
+        lbl_raw = f"{label}" if is_bucket else f"{label:.2f}"
+        lbl_s = f"[{style}]{lbl_raw}[/]" if style else lbl_raw
         t.add_row("", "", lbl_s, bar, sz_s)
 
     spread = f"{ba-bb:.2f}" if bb and ba else "—"
@@ -1024,7 +1025,8 @@ def build_dom_panel(state: MonitorState) -> Panel:
         tc    = wall_tests.get(label) if isinstance(label, float) else None
         tc_s  = f"[yellow]T{tc}[/]" if tc else ""
         sz_s  = f"{tc_s}[{style}]{wm}{size:.0f}[/]" if size > 0 else ""
-        lbl_s = f"[{style}]{label}[/]" if is_bucket else f"[{style}]{label:.2f}[/]"
+        lbl_raw = f"{label}" if is_bucket else f"{label:.2f}"
+        lbl_s = f"[{style}]{lbl_raw}[/]" if style else lbl_raw
         t.add_row(sz_s, bar, lbl_s, "", "")
 
     age     = (datetime.now(timezone.utc) - updated).total_seconds()
@@ -1405,11 +1407,21 @@ def run():
     fetch_mes_orb_bars(state)
     _update_mes_orb(state)
 
+    # Resolve account ID — same logic as trading_bot (uses TOPSTEP_ACCOUNT_ID env var)
+    import os as _os
+    _acct_id_env = int(_os.environ.get("TOPSTEP_ACCOUNT_ID", "0"))
+    _accounts    = client.get_accounts()
+    _acct        = (next((a for a in _accounts if a["id"] == _acct_id_env), None)
+                    if _acct_id_env else None) or (_accounts[0] if _accounts else None)
+    MONITOR_ACCOUNT_ID = _acct["id"] if _acct else None
+
     # Position poll (30s cadence)
     def _poll_positions():
         while True:
             try:
-                account_id = client.get_accounts()[0]["id"]
+                account_id = MONITOR_ACCOUNT_ID
+                if not account_id:
+                    time.sleep(30); continue
                 positions  = client.get_open_positions(account_id)
                 pos = next((p for p in positions
                             if str(p.get("contractId", "")) == state.contract_id), None)
@@ -1429,10 +1441,13 @@ def run():
     threading.Thread(target=_poll_positions, daemon=True, name="pos-poll").start()
 
     console = Console()
-    with Live(render(state), console=console, refresh_per_second=4, screen=True) as live:
+    with Live(console=console, refresh_per_second=4, screen=True) as live:
         while True:
             time.sleep(0.25)
-            live.update(render(state))
+            try:
+                live.update(render(state))
+            except Exception as e:
+                traceback.print_exc()
 
 
 if __name__ == "__main__":

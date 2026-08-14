@@ -15,22 +15,11 @@
     <key>WorkingDirectory</key>
     <string>/Users/marek/mf-trade-bot</string>
 
-    <!-- Run every 5 minutes during session: 05:30–13:55 MST (08:30–16:55 ET) -->
+    <!-- Run every 5 minutes: 06:25–13:55 MST (09:25–16:55 ET)             -->
+    <!-- Start at 6:25 (5 min after focused-bot launchd fires at 6:20 MST) -->
     <key>StartCalendarInterval</key>
     <array>
-        <!-- Hour 5: 05:30–05:55 MST -->
-        <dict><key>Hour</key><integer>5</integer><key>Minute</key><integer>30</integer></dict>
-        <dict><key>Hour</key><integer>5</integer><key>Minute</key><integer>35</integer></dict>
-        <dict><key>Hour</key><integer>5</integer><key>Minute</key><integer>40</integer></dict>
-        <dict><key>Hour</key><integer>5</integer><key>Minute</key><integer>45</integer></dict>
-        <dict><key>Hour</key><integer>5</integer><key>Minute</key><integer>50</integer></dict>
-        <dict><key>Hour</key><integer>5</integer><key>Minute</key><integer>55</integer></dict>
-        <!-- Hours 6–13: every 5 minutes -->
-        <dict><key>Hour</key><integer>6</integer><key>Minute</key><integer>0</integer></dict>
-        <dict><key>Hour</key><integer>6</integer><key>Minute</key><integer>5</integer></dict>
-        <dict><key>Hour</key><integer>6</integer><key>Minute</key><integer>10</integer></dict>
-        <dict><key>Hour</key><integer>6</integer><key>Minute</key><integer>15</integer></dict>
-        <dict><key>Hour</key><integer>6</integer><key>Minute</key><integer>20</integer></dict>
+        <!-- Hour 6: 06:25–06:55 MST -->
         <dict><key>Hour</key><integer>6</integer><key>Minute</key><integer>25</integer></dict>
         <dict><key>Hour</key><integer>6</integer><key>Minute</key><integer>30</integer></dict>
         <dict><key>Hour</key><integer>6</integer><key>Minute</key><integer>35</integer></dict>
@@ -38,6 +27,7 @@
         <dict><key>Hour</key><integer>6</integer><key>Minute</key><integer>45</integer></dict>
         <dict><key>Hour</key><integer>6</integer><key>Minute</key><integer>50</integer></dict>
         <dict><key>Hour</key><integer>6</integer><key>Minute</key><integer>55</integer></dict>
+        <!-- Hours 7–13: every 5 minutes -->
         <dict><key>Hour</key><integer>7</integer><key>Minute</key><integer>0</integer></dict>
         <dict><key>Hour</key><integer>7</integer><key>Minute</key><integer>5</integer></dict>
         <dict><key>Hour</key><integer>7</integer><key>Minute</key><integer>10</integer></dict>

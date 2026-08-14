@@ -19,14 +19,18 @@ if [[ $day -ge 6 ]] || [[ $hour -lt 6 ]] || [[ $hour -ge 14 ]]; then
     exit 0
 fi
 
-# ── Check bars.db mtime ───────────────────────────────────────────────────────
+# ── Check age of most recent bar in bars.db (WAL mode: file mtime is unreliable) ──
 if [[ ! -f "$DB_PATH" ]]; then
     exit 0
 fi
 
 now=$(date +%s)
-mtime=$(stat -f %m "$DB_PATH")
-age=$(( now - mtime ))
+last_bar_ts=$(/usr/bin/sqlite3 "$DB_PATH" \
+    "SELECT CAST(strftime('%s', MAX(ts)) AS INTEGER) FROM bars WHERE symbol IN ('MES','MNQ') AND minutes=1;" 2>/dev/null)
+if [[ -z "$last_bar_ts" || "$last_bar_ts" == "0" ]]; then
+    exit 0
+fi
+age=$(( now - last_bar_ts ))
 
 if [[ $age -lt $STALE_SECS ]]; then
     exit 0

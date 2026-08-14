@@ -10,6 +10,16 @@ STRATEGIES="vwaslr,pl_rev,wall,orb"
 
 mkdir -p "$REPO/logs"
 
+# Use a lock file so concurrent invocations (watchdog + launchd, or manual + watchdog)
+# don't race past the pgrep check simultaneously.
+LOCKFILE="$REPO/logs/start_focused_bot.lock"
+if [ -e "$LOCKFILE" ] && kill -0 "$(cat "$LOCKFILE" 2>/dev/null)" 2>/dev/null; then
+    echo "$(date): start_focused_bot already in progress — skipping" >> "$REPO/logs/cron.log"
+    exit 0
+fi
+echo $$ > "$LOCKFILE"
+trap 'rm -f "$LOCKFILE"' EXIT
+
 if pgrep -f "src/trading_bot.py" > /dev/null 2>&1; then
     echo "$(date): trading_bot already running (pid $(pgrep -f 'src/trading_bot.py' | tr '\n' ' ')) — skipping" >> "$REPO/logs/cron.log"
     exit 0

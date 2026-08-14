@@ -159,10 +159,10 @@ def build_trade_summary_panel(max_rows: int = 20) -> Panel:
             tbl.add_row(
                 row["sym"],
                 fired_et.strftime("%H:%M"),
-                f"[{strat_style}]{strat}[/]",
+                Text(strat, style=strat_style),
                 dir_txt,
                 str(row["entry"]),
-                f"[dim]{row['detail']}[/]",
+                Text(row["detail"], style="dim"),
                 out_txt,
                 Text(f"{pnl_sign}{abs(pnl):.2f}", style=pnl_col),
             )
@@ -181,7 +181,7 @@ def build_trade_summary_panel(max_rows: int = 20) -> Panel:
     )
     blank = RichText("")
     note  = RichText.from_markup(
-        f"  {count_str}    {sym_totals}  [dim](since 08:30 ET)[/]"
+        f"  {count_str}    {sym_totals}  (since 08:30 ET)"
     )
 
     return Panel(

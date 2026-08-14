@@ -96,8 +96,8 @@ SIGNAL_SIGMA  = 3.0
 MAX_SCALED    = 5.0    # ignore extreme event spikes
 VOL_RATIO_MIN = 1.5
 MAX_HOLD_MIN  = 25     # force-close after this many minutes
-POLL_SECONDS     = 40   # default poll interval (VWASLR on 1-min bars; 60s was too coarse)
-POLL_SECONDS_ORB = 20   # faster poll during the ORB window (9:30–10:30 ET)
+POLL_SECONDS     = 5    # poll interval — idle polls are SQLite-only, API only on signal/active trade
+POLL_SECONDS_ORB = 5    # ORB window (9:30–10:30 ET) — same as default
 POLL_SECONDS_RTH = 5    # fast poll during RTH for PL_MOM entry detection (matches 5s bar cadence)
 
 PL_N_BARS = 10    # 1-min bars to look back for PL computation
@@ -2789,7 +2789,12 @@ def _wall_stop_price(state, direction: int, entry: float, default_stop: float) -
                 candidate = w.price + tick
                 if candidate < best:   # tighter = lower for short stop
                     best = candidate
+    # Only use wall stop if it saves at least half the default stop distance.
+    # Prevents snapping to walls that are just 1–2 ticks away from entry.
     if best != default_stop:
+        min_stop_dist = abs(default_stop - entry) * 0.5
+        if abs(best - entry) < min_stop_dist:
+            return default_stop
         log.info(
             f"{state.instrument.symbol}: wall-anchored stop "
             f"{best:.2f} (default {default_stop:.2f})"
