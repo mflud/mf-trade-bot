@@ -10,15 +10,15 @@ Logs: bot_trades.csv (CSR), orb_trades.csv, vwaslr_trades.csv,
 
 ━━━ ACTIVE strategies (focused_bot) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  VWASLR (volume-weighted avg scaled log return) — MES, 9:00–16:00 ET
+  VWASLR (volume-weighted avg scaled log return) — MES, 9:40–16:00 ET
     Entry : EMA-10 of 50-min VWASLR (σ=500-min) crosses ±0.4σ, 1-min bars
-            Skip 9:30–9:40 ET opening blackout
+            Blackout before 9:40 ET
     Stop  : 2σ bracket
     Target: 3σ bracket
     Exit  : EMA retracts to ±0.2σ (half-zero signal exit)
 
   PL_REV (price linearity reversion) — MES, 10:00–16:00 ET
-    Entry : 5s bars: PL ≥ 0.80, move ≥ 20bp, ADX(9:00-10:00 ET) ≤ 25
+    Entry : 5s bars: PL ≥ 0.60, move ≥ 25bp
             Fades the momentum move (enters OPPOSITE to momentum direction)
     Stop  : 15bp
     Target: 24bp
@@ -170,8 +170,8 @@ PL_MOM_SIGMA_LOOKBACK  = 120    # 5s bars for rolling σ (10 min); backtest-opti
 # ADX gate sweep showed: with 120s natural cooldown between trades, no gate
 # outperforms every ADX threshold (EV +10.17bp vs +9.80bp at gate=25).
 # The natural "already in position" cooldown acts as the de-clustering filter.
-PL_REV_ENTRY_PL    = 0.80   # same qualifying PL threshold as PL_MOM
-PL_REV_MOVE_BPS    = 20.0   # minimum net move (bps) to qualify
+PL_REV_ENTRY_PL    = 0.60   # backtest: PL adds little value; keep low
+PL_REV_MOVE_BPS    = 25.0   # raised from 20bp; higher move → higher WR (97% vs 87%)
 PL_REV_TP_BPS      = 24.0   # take profit: price reverts this many bps from entry
 PL_REV_STOP_BPS    = 15.0   # stop loss: price continues in original signal direction
 PL_REV_RESUME_PL   = 0.70   # exit early if PL surges back (trend resuming)
@@ -210,7 +210,7 @@ DOM_DB_STALE_S = 30   # seconds; DOM older than this is considered stale
 # ── Wall breakout parameters ──────────────────────────────────────────────────
 WALL_MED_MIN          = 100    # peak_size lower bound for "medium" wall
 WALL_MED_MAX          = 300    # peak_size upper bound for "medium" wall
-WALL_BREAK_MIN_TESTS  = 2      # minimum test_count at breakout to qualify
+WALL_BREAK_MIN_TESTS  = 3      # minimum test_count at breakout to qualify (backtest: tests≥3 flips to +EV)
 WALL_BREAK_STOP_MIN   = 4.0   # stop floor in points (quiet markets)
 WALL_BREAK_STOP_MAX   = 5.0   # stop ceiling in points (volatile markets)
 # Actual stop = clamp(state.sigma_pts, WALL_BREAK_STOP_MIN, WALL_BREAK_STOP_MAX)
@@ -638,8 +638,8 @@ INSTRUMENTS = [
                   orb_target_mult=1.0,        orb_gap_fade_long=False,  # both directions
                   orb_full_range_stop=False,  orb_hold_min=10,          # midpoint stop, exit ~9:41 ET
                   orb_max_loss_dollars=0,                               # no dollar cap
-                  vwaslr_n=50, vwaslr_threshold=0.4, vwaslr_start=(9, 0),
-                  slr_enabled=True,
+                  vwaslr_n=50, vwaslr_threshold=0.4, vwaslr_start=(9, 40),
+                  slr_enabled=False,
                   eve_enabled=False,
                   sun_gap_enabled=False,
                   pl_mom_enabled=False,  # disabled: no base-rate edge (WR~35%); replaced by PL_REV
@@ -660,7 +660,9 @@ INSTRUMENTS = [
                   orb_max_loss_dollars=500,                            # $500 stop cap
                   vwaslr_n=0,
                   slr_enabled=False,
-                  pl_mom_enabled=False),
+                  wall_enabled=False,
+                  pl_mom_enabled=False,
+                  pl_rev_enabled=True),
 ]
 
 
@@ -1678,7 +1680,7 @@ def evaluate_orb(state: InstrumentState) -> OrbSignal | None:
     orb_width_pct = orb_width / orb_mid if orb_mid > 0 else 0.0
     if orb_width_pct < inst.orb_width_pct_min:
         return None
-    if orb_width_pct > inst.orb_width_pct_max:
+    if inst.orb_width_pct_max > 0 and orb_width_pct > inst.orb_width_pct_max:
         return None
 
     if state.sigma_pts <= 0:
@@ -4094,8 +4096,9 @@ def run(account_id: int | None, paper: bool, strategies: set[str] | None = None)
                                 place_pl_rev_signal(client, state, pl_rev_sig,
                                                     account_id, paper, now)
 
-                # Wall Breakout signal: RTH only, 9:40–16:00 ET, no position
-                if no_position and not past_cutoff and state.instrument.wall_enabled and (9, 40) <= now_et_hm < (16, 0):
+                # Wall Breakout signal: 10:30–13:00 ET only, no position
+                # Backtest: 9:30-10:30 and 13:00-16:00 are strongly negative; sweet spot is 10:30-13:00
+                if no_position and not past_cutoff and state.instrument.wall_enabled and (10, 30) <= now_et_hm < (13, 0):
                     wb_sig = evaluate_wall_break(state, now)
                     if wb_sig:
                         place_wall_break_signal(client, state, wb_sig, account_id, paper)

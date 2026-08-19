@@ -2,12 +2,12 @@
 focused_monitor.py — Monitor for the focused bot (VWASLR, PL_REV, Wall Break, ORB).
 
 Layout:
-  ┌────────────────────────┬───────────────────────┬────────────┐
-  │ VWASLR                 │ PL_REV                │ DOM        │
-  │ MNQ ORB                │ Wall Break            │            │
-  │ MES ORB                ├───────────────────────┴────────────┤
-  │ Positions │ Sizing     │ Trade Summary (col2+DOM width)      │
-  └────────────────────────┴────────────────────────────────────┘
+  ┌────────────────────────┬───────────────────────────────────────────────┐
+  │ VWASLR                 │ PL_REV MES                                    │
+  │ MNQ ORB                │ PL_REV MNQ                                    │
+  │ MES ORB                │ Wall Break                                    │
+  │ Positions │ Sizing     │ Trade Summary                                 │
+  └────────────────────────┴───────────────────────────────────────────────┘
 
 Usage:
     python src/focused_monitor.py
@@ -58,8 +58,8 @@ VWASLR_BARS_FETCH = 580   # VWASLR_SIGMA_BARS + VWASLR_N + headroom
 
 # ── PL_REV constants (mirrors trading_bot.py) ─────────────────────────────────
 PL_WINDOW       = 6      # 5s bars = 30s
-PL_ENTRY_PL     = 0.80
-PL_MOVE_BPS     = 20.0
+PL_ENTRY_PL     = 0.60
+PL_MOVE_BPS     = 25.0
 PL_TP_BPS       = 24.0
 PL_STOP_BPS     = 15.0
 PL_RESUME_PL    = 0.70
@@ -247,7 +247,8 @@ class MonitorState:
     bars_1m:     list = field(default_factory=list)   # MES 1-min bars for VWASLR + sizing
     bars_orb:    list = field(default_factory=list)   # MNQ 1-min bars for ORB
     bars_mes_orb: list = field(default_factory=list)  # MES 1-min bars for MES ORB
-    bars_5s:     list = field(default_factory=list)   # 5s bars for PL_REV
+    bars_5s:     list = field(default_factory=list)   # MES 5s bars for PL_REV
+    bars_5s_mnq: list = field(default_factory=list)   # MNQ 5s bars for PL_REV
     dom:         DOMBook = field(default_factory=DOMBook)
     wall_tracker: "WallTracker|None" = None
     # VWASLR
@@ -256,12 +257,18 @@ class MonitorState:
     vwaslr_sigma_pts: float = 0.0
     vwaslr_signal:    "VwaslrSignal|None" = None
     vwaslr_history:   list = field(default_factory=list)   # (ts, ema, fired)
-    # PL_REV
+    # PL_REV — MES
     pl_sig:         "PLRevSignal|None" = None
     pl_entry_ts:    "datetime|None"   = None
     pl_last_bar_ts: "datetime|None"   = None
     pl_history:     list = field(default_factory=list)    # (ts, pl, dir_sym, move_bps)
     sigma_30s_bps:  float = 0.0
+    # PL_REV — MNQ
+    pl_sig_mnq:         "PLRevSignal|None" = None
+    pl_entry_ts_mnq:    "datetime|None"   = None
+    pl_last_bar_ts_mnq: "datetime|None"   = None
+    pl_history_mnq:     list = field(default_factory=list)
+    sigma_30s_bps_mnq:  float = 0.0
     # ORB
     orb:     ORBState = field(default_factory=ORBState)   # MNQ ORB
     orb_mes: ORBState = field(default_factory=ORBState)   # MES ORB
@@ -600,8 +607,7 @@ def _update_orb(state: MonitorState):
 
 # ─── PL_REV evaluation ───────────────────────────────────────────────────────
 
-def _evaluate_pl_rev(state: MonitorState) -> "PLRevSignal|None":
-    bars = state.bars_5s
+def _evaluate_pl_rev(bars: list, prev_sig, sigma: float) -> "PLRevSignal|None":
     if len(bars) < PL_WINDOW + 1:
         return None
     window = bars[-PL_WINDOW:]
@@ -609,7 +615,7 @@ def _evaluate_pl_rev(state: MonitorState) -> "PLRevSignal|None":
         if (window[i].ts - window[i-1].ts).total_seconds() > 8:
             return None
     last = window[-1]
-    if state.pl_sig and last.ts == state.pl_sig.bar_ts:
+    if prev_sig and last.ts == prev_sig.bar_ts:
         return None
     closes  = np.array([b.close for b in window], dtype=float)
     rets    = np.log(closes[1:] / closes[:-1])
@@ -621,7 +627,6 @@ def _evaluate_pl_rev(state: MonitorState) -> "PLRevSignal|None":
         return None
     net_ret  = float(rets.sum())
     move_bps = abs(net_ret) * 10000
-    sigma    = state.sigma_30s_bps
     eff_thr  = max(PL_MOVE_BPS, PL_SIGMA_N * sigma) if sigma > 0 else PL_MOVE_BPS
     if move_bps < eff_thr:
         return None
@@ -730,8 +735,15 @@ def build_vwaslr_panel(state: MonitorState, now: datetime) -> Panel:
                  padding=(0, 1), expand=True)
 
 
-def build_pl_rev_panel(state: MonitorState, now: datetime) -> Panel:
-    sig = state.pl_sig
+def build_pl_rev_panel(state: MonitorState, now: datetime, symbol: str = "MES") -> Panel:
+    if symbol == "MNQ":
+        sig      = state.pl_sig_mnq
+        hist_src = state.pl_history_mnq
+        bars_src = state.bars_5s_mnq
+    else:
+        sig      = state.pl_sig
+        hist_src = state.pl_history
+        bars_src = state.bars_5s
 
     rev_qualifies = (sig is not None
                      and sig.pl >= PL_ENTRY_PL
@@ -772,14 +784,14 @@ def build_pl_rev_panel(state: MonitorState, now: datetime) -> Panel:
         root.add_row(det)
         root.add_row("")
 
-    hist = state.pl_history[-PL_HISTORY:]
+    hist = hist_src[-PL_HISTORY:]
     if hist:
         ht = Table(box=box.SIMPLE, show_header=True, padding=(0, 1), header_style="bold")
         ht.add_column("time",   justify="right")
         ht.add_column("mom",    justify="center")
         ht.add_column("",       justify="left",  no_wrap=True)
         ht.add_column("PL",     justify="right")
-        ht.add_column("bp",     justify="right")
+        ht.add_column("30s bp", justify="right")
         ht.add_column("fade?",  justify="center")
         for ts, pl, dir_sym, move in reversed(hist):
             qualifies = pl >= PL_ENTRY_PL and move >= PL_MOVE_BPS
@@ -794,7 +806,7 @@ def build_pl_rev_panel(state: MonitorState, now: datetime) -> Panel:
                 f"[{bp_sty}]{move:.1f}[/]" if bp_sty else f"{move:.1f}",
                 fade_col)
         root.add_row(ht)
-    elif not state.bars_5s:
+    elif not bars_src:
         root.add_row("warming up…")
 
     foot = Table.grid(); foot.add_column(justify="center")
@@ -802,7 +814,7 @@ def build_pl_rev_panel(state: MonitorState, now: datetime) -> Panel:
                  f"TP {PL_TP_BPS:.0f}bp  stop {PL_STOP_BPS:.0f}bp  resume≥{PL_RESUME_PL:.2f}")
     root.add_row(foot)
 
-    return Panel(root, title=f"PL REV  {SYMBOL}", border_style=border,
+    return Panel(root, title=f"PL REV  {symbol}", border_style=border,
                  padding=(0, 1), expand=True)
 
 
@@ -882,13 +894,11 @@ def build_orb_panel(state: MonitorState, now: datetime) -> Panel:
 
     root.add_row("")
     foot = Table.grid(); foot.add_column(justify="center")
-    foot.add_row(f"MNQ 1-min ORB  entry≤{ORB_ENTRY_WIN}min  hold {ORB_HOLD_MIN}min  "
-                 f"stop=opposite ORB (cap ${ORB_MAX_LOSS:.0f})  target={ORB_TGT_MULT:.0f}× width  "
-                 f"width≤{ORB_WIDTH_MAX*10000:.0f}bps")
+    foot.add_row(f"MNQ ORB  ≤{ORB_ENTRY_WIN}min  hold {ORB_HOLD_MIN}min  stop=opp(cap ${ORB_MAX_LOSS:.0f})  tgt={ORB_TGT_MULT:.0f}×  w≤{ORB_WIDTH_MAX*10000:.0f}bp")
     root.add_row(foot)
 
     return Panel(root, title=f"ORB  MNQ  (1-min)", border_style=border,
-                 padding=(0, 1), expand=True)
+                 padding=(0, 1), expand=False)
 
 
 def build_mes_orb_panel(state: MonitorState, now: datetime) -> Panel:
@@ -955,8 +965,7 @@ def build_mes_orb_panel(state: MonitorState, now: datetime) -> Panel:
 
     root.add_row("")
     foot = Table.grid(); foot.add_column(justify="center")
-    foot.add_row(f"MES 1-min ORB  entry≤{ORB_ENTRY_WIN}min  hold {ORB_HOLD_MIN}min  "
-                 f"stop=midpoint (~½ width)  target={ORB_TGT_MULT:.0f}× width  no width filter")
+    foot.add_row(f"MES ORB  ≤{ORB_ENTRY_WIN}min  hold {ORB_HOLD_MIN}min  stop=midpoint  tgt={ORB_TGT_MULT:.0f}×  no width filter")
     root.add_row(foot)
 
     return Panel(root, title="ORB  MES  (1-min)", border_style=border,
@@ -1096,7 +1105,7 @@ def build_wall_panel(state: MonitorState, now: datetime) -> Panel:
     root.add_row(foot)
 
     return Panel(root, title=f"WALL BREAK  {SYMBOL}", border_style=border,
-                 padding=(0, 1), expand=True)
+                 padding=(0, 1), expand=False)
 
 
 def build_sizing_panel(state: MonitorState) -> Panel:
@@ -1188,20 +1197,12 @@ def render(state: MonitorState) -> Table:
     col1.add_row(build_mes_orb_panel(state, now))
     col1.add_row(pos_siz)
 
-    # Top portion of right section: PL_REV/Wall Break alongside DOM
-    pl_wall = Table.grid(); pl_wall.add_column()
-    pl_wall.add_row(build_pl_rev_panel(state, now))
-    pl_wall.add_row(build_wall_panel(state, now))
-
-    strats = Table(box=None, show_header=False, padding=(0, 1), expand=True)
-    strats.add_column(ratio=1)   # PL_REV + Wall Break
-    strats.add_column()           # DOM (fixed)
-    strats.add_row(pl_wall, build_dom_panel(state))
-
-    # Right section: strats on top, Trade Summary full-width below
+    # Right section: PL_REV MES, PL_REV MNQ, Wall Break stacked, Trade Summary below
     right = Table(box=None, show_header=False, padding=(0, 0), expand=True)
     right.add_column(ratio=1)
-    right.add_row(strats)
+    right.add_row(build_pl_rev_panel(state, now, "MES"))
+    right.add_row(build_pl_rev_panel(state, now, "MNQ"))
+    right.add_row(build_wall_panel(state, now))
     right.add_row(build_trade_summary_panel())
 
     main = Table(box=None, show_header=False, padding=(0, 1), expand=True)
@@ -1289,7 +1290,49 @@ def run():
             except Exception: traceback.print_exc()
     threading.Thread(target=_fetch_1min_loop, daemon=True, name="bar-fetch").start()
 
-    # 5s bar poll + PL_REV eval (2s cadence, RTH only)
+    def _update_pl_rev_for(bars: list, prev_sig, entry_ts, history: list, sigma: float, now):
+        """Shared logic: update history + evaluate signal for one instrument's 5s bars.
+        Returns (new_sig, new_entry_ts) — unchanged values if no new signal."""
+        bar_ts = bars[-1].ts if bars else None
+        last_ts = prev_sig.bar_ts if prev_sig else None
+        if bar_ts and bar_ts != last_ts:
+            if len(bars) >= PL_WINDOW:
+                window  = bars[-PL_WINDOW:]
+                closes  = np.array([b.close for b in window], dtype=float)
+                rets    = np.log(closes[1:] / closes[:-1])
+                sum_abs = float(np.abs(rets).sum())
+                if sum_abs > 0:
+                    net = float(rets.sum())
+                    history.append((bar_ts, abs(net)/sum_abs,
+                                    "▲" if net > 0 else "▼", abs(net)*10000))
+                    if len(history) > 40:
+                        del history[:-40]
+            new_sig = _evaluate_pl_rev(bars, prev_sig, sigma)
+            if new_sig and (prev_sig is None or new_sig.bar_ts != prev_sig.bar_ts):
+                play_alert()
+                return new_sig, now
+        return prev_sig, entry_ts
+
+    def _expire_pl_rev(bars: list, sig, entry_ts, now):
+        """Expire a PL_REV signal if max-hold elapsed or trend resumed."""
+        if sig is None:
+            return None, None
+        expired = now >= sig.expires_at()
+        pl_exit = False
+        min_ok  = (entry_ts is not None and
+                   (now - entry_ts).total_seconds() >= PL_MIN_HOLD_S)
+        if min_ok and len(bars) >= PL_WINDOW:
+            window = bars[-PL_WINDOW:]
+            closes = np.array([b.close for b in window], dtype=float)
+            rets   = np.log(closes[1:] / closes[:-1])
+            sa     = float(np.abs(rets).sum())
+            cur_pl = abs(float(rets.sum())/sa) if sa > 0 else 0.0
+            pl_exit = cur_pl >= PL_RESUME_PL
+        if expired or pl_exit:
+            return None, None
+        return sig, entry_ts
+
+    # 5s bar poll + PL_REV eval for MES and MNQ (2s cadence, RTH only)
     def _poll_5s():
         while True:
             now_et = datetime.now(ET)
@@ -1297,58 +1340,51 @@ def run():
             if in_rth:
                 try:
                     now = datetime.now(timezone.utc)
-                    if bars_db_available():
+                    db_ok = bars_db_available()
+                    floor = datetime.fromtimestamp((int(now.timestamp())//5)*5, tz=timezone.utc)
+                    start = floor - timedelta(seconds=5*(PL_5S_FETCH+5))
+
+                    # ── MES 5s bars ───────────────────────────────────────────
+                    if db_ok:
                         raw = get_5s_bars_from_db(SYMBOL, PL_5S_FETCH)
                     else:
-                        floor = datetime.fromtimestamp((int(now.timestamp())//5)*5, tz=timezone.utc)
-                        start = floor - timedelta(seconds=5*(PL_5S_FETCH+5))
-                        raw   = client.get_bars(contract_id=state.contract_id, start=start, end=floor,
-                                                unit=TopstepClient.SECOND, unit_number=5, limit=PL_5S_FETCH)
+                        raw = client.get_bars(contract_id=state.contract_id, start=start, end=floor,
+                                              unit=TopstepClient.SECOND, unit_number=5, limit=PL_5S_FETCH)
                     if raw:
                         state.bars_5s = [Bar(ts=datetime.fromisoformat(b["t"]),
                                              open=b["o"], high=b["h"], low=b["l"],
                                              close=b["c"], volume=b["v"]) for b in raw]
                         state.sigma_30s_bps = _compute_sigma_5s(state.bars_5s, PL_SIGMA_LB)
 
-                    bar_ts = state.bars_5s[-1].ts if state.bars_5s else None
-                    if bar_ts and bar_ts != state.pl_last_bar_ts:
-                        state.pl_last_bar_ts = bar_ts
-                        if len(state.bars_5s) >= PL_WINDOW:
-                            window  = state.bars_5s[-PL_WINDOW:]
-                            closes  = np.array([b.close for b in window], dtype=float)
-                            rets    = np.log(closes[1:] / closes[:-1])
-                            sum_abs = float(np.abs(rets).sum())
-                            if sum_abs > 0:
-                                net = float(rets.sum())
-                                state.pl_history.append((bar_ts, abs(net)/sum_abs,
-                                                         "▲" if net > 0 else "▼", abs(net)*10000))
-                                if len(state.pl_history) > 40:
-                                    state.pl_history = state.pl_history[-40:]
+                    state.pl_sig, state.pl_entry_ts = _update_pl_rev_for(
+                        state.bars_5s, state.pl_sig, state.pl_entry_ts,
+                        state.pl_history, state.sigma_30s_bps, now)
+                    state.pl_sig, state.pl_entry_ts = _expire_pl_rev(
+                        state.bars_5s, state.pl_sig, state.pl_entry_ts, now)
 
-                        new_sig = _evaluate_pl_rev(state)
-                        if new_sig and (state.pl_sig is None or
-                                        new_sig.bar_ts != state.pl_sig.bar_ts):
-                            state.pl_sig      = new_sig
-                            state.pl_entry_ts = now
-                            play_alert()
+                    # ── MNQ 5s bars ───────────────────────────────────────────
+                    if True:  # always fetch; DB path needs no contract ID
+                        if db_ok:
+                            raw_mnq = get_5s_bars_from_db("MNQ", PL_5S_FETCH)
+                        elif state.mnq_contract_id:
+                            raw_mnq = client.get_bars(contract_id=state.mnq_contract_id,
+                                                      start=start, end=floor,
+                                                      unit=TopstepClient.SECOND,
+                                                      unit_number=5, limit=PL_5S_FETCH)
+                        else:
+                            raw_mnq = []
+                        if raw_mnq:
+                            state.bars_5s_mnq = [Bar(ts=datetime.fromisoformat(b["t"]),
+                                                     open=b["o"], high=b["h"], low=b["l"],
+                                                     close=b["c"], volume=b["v"]) for b in raw_mnq]
+                            state.sigma_30s_bps_mnq = _compute_sigma_5s(state.bars_5s_mnq, PL_SIGMA_LB)
 
-                    # Expire PL_REV signal
-                    if state.pl_sig is not None:
-                        sig = state.pl_sig
-                        expired = now >= sig.expires_at()
-                        pl_exit = False
-                        min_ok  = (state.pl_entry_ts is not None and
-                                   (now - state.pl_entry_ts).total_seconds() >= PL_MIN_HOLD_S)
-                        if min_ok and len(state.bars_5s) >= PL_WINDOW:
-                            window  = state.bars_5s[-PL_WINDOW:]
-                            closes  = np.array([b.close for b in window], dtype=float)
-                            rets    = np.log(closes[1:] / closes[:-1])
-                            sa      = float(np.abs(rets).sum())
-                            cur_pl  = abs(float(rets.sum())/sa) if sa > 0 else 0.0
-                            pl_exit = cur_pl >= PL_RESUME_PL   # trend resuming → exit fade
-                        if expired or pl_exit:
-                            state.pl_sig      = None
-                            state.pl_entry_ts = None
+                        state.pl_sig_mnq, state.pl_entry_ts_mnq = _update_pl_rev_for(
+                            state.bars_5s_mnq, state.pl_sig_mnq, state.pl_entry_ts_mnq,
+                            state.pl_history_mnq, state.sigma_30s_bps_mnq, now)
+                        state.pl_sig_mnq, state.pl_entry_ts_mnq = _expire_pl_rev(
+                            state.bars_5s_mnq, state.pl_sig_mnq, state.pl_entry_ts_mnq, now)
+
                 except Exception: traceback.print_exc()
             time.sleep(2)
     threading.Thread(target=_poll_5s, daemon=True, name="pl-rev").start()

@@ -30,7 +30,7 @@ if [ -f "$REPO/logs/bot.disabled" ]; then
     echo ""
 fi
 echo "--- Processes ---"
-check        "focused_bot      " "src/trading_bot.py"
+check        "focused_bot      " "trading_bot.py.*--strategies"
 screen_check "focused_monitor  " "focused_monitor"
 check        "bar_collector    " "bar_collector.py"
 check        "bar_recorder     " "src/bar_recorder.py"
