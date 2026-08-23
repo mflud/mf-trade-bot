@@ -274,7 +274,7 @@ class MonitorState:
     orb_mes: ORBState = field(default_factory=ORBState)   # MES ORB
     # Wall Break
     wall_break_signal: "WallBreakSignal|None" = None
-    wall_recent_events: list = field(default_factory=list)  # (ts, event, side, wall_price, test_count, entry)
+    wall_recent_events: list = field(default_factory=list)  # (ts, event, side, wall_price, test_count, entry, peak_size)
     # Position
     position_size:  int   = 0
     position_dir:   int   = 0
@@ -1079,10 +1079,10 @@ def build_wall_panel(state: MonitorState, now: datetime) -> Panel:
         det.add_row("Hold:",   f"{rem//60}m {rem%60:02d}s remaining")
         root.add_row(det)
 
-    # Recent event log (tests + breakouts) — capped at 4 rows; walls shown on DOM ladder
-    notable = [(ts, ev, side, wp, tc, ep)
-               for ts, ev, side, wp, tc, ep in reversed(state.wall_recent_events[-20:])
-               if ev in ("breakout", "test")][:4]
+    # Recent event log (tests + breakouts) — capped at 10 rows; walls shown on DOM ladder
+    notable = [(ts, ev, side, wp, tc, ep, pk)
+               for ts, ev, side, wp, tc, ep, pk in reversed(state.wall_recent_events[-30:])
+               if ev in ("breakout", "test")][:10]
     if notable:
         root.add_row("")
         lt = Table(box=None, show_header=True, padding=(0, 1), header_style="bold")
@@ -1090,18 +1090,20 @@ def build_wall_panel(state: MonitorState, now: datetime) -> Panel:
         lt.add_column("event",  justify="center")
         lt.add_column("side",   justify="center")
         lt.add_column("wall",   justify="right")
+        lt.add_column("peak",   justify="right")
         lt.add_column("tests",  justify="center")
-        for ts, ev, side, wp, tc, ep in notable:
+        for ts, ev, side, wp, tc, ep, pk in notable:
             t_s  = ts.astimezone(LOCAL).strftime("%H:%M:%S")
             ec   = "bold yellow" if ev == "breakout" else ""
             sc   = "green" if side == "bid" else "red"
+            pk_s = f"[bold green]{pk}[/]" if pk >= 100 else str(pk)
             lt.add_row(t_s, f"[{ec}]{ev}[/]" if ec else ev, f"[{sc}]{side}[/]",
-                       f"{wp:.2f}", f"T{tc}")
+                       f"{wp:.2f}", pk_s, f"T{tc}")
         root.add_row(lt)
 
     root.add_row("")
     foot = Table.grid(); foot.add_column(justify="center")
-    foot.add_row(f"stop {WALL_STOP_PTS:.0f}pt  target {WALL_TARGET_PTS:.0f}pt  hold {WALL_HOLD_MIN}min  tests≥2 to trade")
+    foot.add_row(f"stop {WALL_STOP_PTS:.0f}pt  target {WALL_TARGET_PTS:.0f}pt  hold {WALL_HOLD_MIN}min  peak≥100  tests≥3  10:30–13:00 ET")
     root.add_row(foot)
 
     return Panel(root, title=f"WALL BREAK  {SYMBOL}", border_style=border,
@@ -1406,7 +1408,7 @@ def run():
                             entry_price = ev.price or ev.wall_price
                             state.wall_recent_events.append(
                                 (ev.ts, ev.event, ev.side, ev.wall_price,
-                                 ev.test_count, entry_price))
+                                 ev.test_count, entry_price, ev.peak_size))
                             if len(state.wall_recent_events) > 30:
                                 state.wall_recent_events = state.wall_recent_events[-30:]
                         if ev.event == "breakout":

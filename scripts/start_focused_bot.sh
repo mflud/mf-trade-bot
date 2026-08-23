@@ -1,7 +1,7 @@
 #!/bin/bash
 # Start trading_bot with PL_REV, Wall Break, ORB strategies (VWASLR disabled 2026-08-19).
 # Logs to logs/focused_bot.log; PID tracked in logs/trading_bot.pid (shared).
-# Guards: skips before 08:25 ET; waits up to 5 min for a fresh bar_collector token.
+# Guards: skips before 08:45 ET; waits up to 60s for bar_collector to be actively writing bars.
 REPO=/Users/marek/mf-trade-bot
 PIDFILE="$REPO/logs/trading_bot.pid"
 LOGFILE="$REPO/logs/focused_bot.log"
@@ -20,12 +20,16 @@ fi
 echo $$ > "$LOCKFILE"
 trap 'rm -f "$LOCKFILE"' EXIT
 
-# Don't start before 08:25 ET — bar_collector isn't logged in yet and any start
-# attempt would use a stale token and silently fail.
-hhmm=$(TZ=America/New_York date +%H%M)
-hhmm=$((10#$hhmm))
-if [[ $hhmm -lt 825 ]]; then
-    echo "$(date): too early to start focused_bot (ET=$(TZ=America/New_York date +%H:%M), need ≥08:25) — skipping" >> "$REPO/logs/cron.log"
+# Don't start before 08:45 ET. Use Python for a DST-safe check (TZ= is unreliable in launchd).
+et_hhmm=$("$PYTHON" -c "
+from datetime import datetime
+from zoneinfo import ZoneInfo
+now = datetime.now(ZoneInfo('America/New_York'))
+print(f'{now.hour:02d}{now.minute:02d}')
+" 2>/dev/null)
+et_hhmm=$((10#${et_hhmm:-0000}))
+if [[ $et_hhmm -lt 845 ]]; then
+    echo "$(date): too early to start focused_bot (ET=$(TZ=America/New_York date +%H:%M 2>/dev/null || date -u +%H:%M)UTC, need ≥08:45 ET) — skipping" >> "$REPO/logs/cron.log"
     exit 0
 fi
 
@@ -46,19 +50,26 @@ if [ -n "$RUNNING_PID" ]; then
     exit 0
 fi
 
-# Wait for bar_collector to write a fresh token (max 5 min).
-# bar_collector doesn't log in until 08:30 ET — if the bot starts before that,
-# the token on disk is stale and the first API call will 401.
-TOKEN="$REPO/data/auth_token.txt"
-for i in $(seq 1 300); do
-    if [ -f "$TOKEN" ]; then
-        AGE=$(( $(date +%s) - $(stat -f %m "$TOKEN") ))
-        if [ "$AGE" -lt 300 ]; then
+# Require bar_collector to be actively running (dom.db updated within last 30s).
+# dom.db is written every few seconds by bar_collector — this is a reliable liveness
+# signal, unlike auth_token.txt which can be stale from a prior session.
+# Wait up to 60s; if not ready, skip — watchdog will retry in 5 minutes.
+DOM_DB="$REPO/data/dom.db"
+DOM_OK=0
+for i in $(seq 1 60); do
+    if [ -f "$DOM_DB" ]; then
+        DOM_AGE=$(( $(date +%s) - $(stat -f %m "$DOM_DB") ))
+        if [ "$DOM_AGE" -lt 30 ]; then
+            DOM_OK=1
             break
         fi
     fi
     sleep 1
 done
+if [[ $DOM_OK -eq 0 ]]; then
+    echo "$(date): bar_collector not yet live (dom.db absent or stale) — skipping (will retry)" >> "$REPO/logs/cron.log"
+    exit 0
+fi
 
 cd "$REPO"
 nohup "$PYTHON" -u src/trading_bot.py --strategies "$STRATEGIES" "$@" >> "$LOGFILE" 2>&1 &

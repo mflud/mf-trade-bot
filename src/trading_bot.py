@@ -1683,9 +1683,6 @@ def evaluate_orb(state: InstrumentState) -> OrbSignal | None:
     if inst.orb_width_pct_max > 0 and orb_width_pct > inst.orb_width_pct_max:
         return None
 
-    if state.sigma_pts <= 0:
-        return None
-
     # ── Stop and target sizing ────────────────────────────────────────────────
     target_pts = orb_width * inst.orb_target_mult
 
@@ -3878,6 +3875,7 @@ def run(account_id: int | None, paper: bool, strategies: set[str] | None = None)
         f"instruments={[s.instrument.symbol for s in states]}  "
         f"poll={POLL_SECONDS}s"
     )
+    _last_heartbeat = datetime.now(timezone.utc)
 
     while True:
         now = datetime.now(timezone.utc)
@@ -4105,6 +4103,19 @@ def run(account_id: int | None, paper: bool, strategies: set[str] | None = None)
 
             except Exception as e:
                 log.error(f"{state.instrument.symbol}: {e}", exc_info=True)
+
+        # Heartbeat: log every 5 min so it's clear the bot is alive between signals
+        _now_hb = datetime.now(timezone.utc)
+        if (_now_hb - _last_heartbeat).total_seconds() >= 300:
+            any_active = any(
+                s.active_trade or s.active_orb_trade or s.active_vwaslr_trade
+                or s.active_slr_trade or s.active_pl_mom_trade or s.active_pl_rev_trade
+                or s.active_evening_trade or s.active_sunday_gap_trade or s.active_wall_break_trade
+                for s in states
+            )
+            last_bars = {s.instrument.symbol: (s.bars[-1].ts if s.bars else None) for s in states}
+            log.info(f"Heartbeat — active_trade={any_active}  last_bars={last_bars}")
+            _last_heartbeat = _now_hb
 
         # Poll interval: 5s during RTH (PL_MOM entry cadence), 10s when PL_MOM
         # trade is active, 20s during ORB window, 40s otherwise

@@ -33,7 +33,14 @@ class TopstepClient:
         self.username = username or os.environ["TOPSTEP_USERNAME"]
         self.api_key = api_key or os.environ["TOPSTEP_API_KEY"]
         self.token: str | None = None
-        self._client = httpx.Client(base_url=BASE_URL, timeout=60)
+        self._client = httpx.Client(
+            base_url=BASE_URL,
+            timeout=60,
+            limits=httpx.Limits(
+                max_keepalive_connections=5,
+                keepalive_expiry=30,   # close idle connections after 30s (avoids CLOSE_WAIT hangs)
+            ),
+        )
 
     def login(self) -> str:
         """Authenticate and store the session token. Writes token to shared file."""
