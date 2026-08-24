@@ -1144,21 +1144,39 @@ def fetch_1min_pl(client: TopstepClient, contract_id: str,
 
 # ── Signal evaluation (identical logic to signal_monitor.py) ────────────────
 
+def update_sigma_pts(state: InstrumentState) -> None:
+    """Update state.sigma / state.sigma_pts from trailing bars.
+
+    Runs unconditionally every poll (regardless of which strategies are
+    enabled) — Wall Break's stop sizing and ORB's logged sigma_pts both
+    depend on this, not just CSR's evaluate().
+    """
+    bars = state.bars
+    if len(bars) < TRAILING_BARS + 1:
+        return
+    closes = np.array([b.close for b in bars])
+    trail  = np.log(closes[-TRAILING_BARS:] / closes[-TRAILING_BARS - 1:-1])
+    sigma  = float(np.std(trail, ddof=1))
+    if sigma == 0:
+        return
+    state.sigma     = sigma
+    state.sigma_pts = sigma * closes[-1]
+
+
 def evaluate(state: InstrumentState) -> dict | None:
     """Return signal dict if all criteria are met, else None."""
     bars = state.bars
     if len(bars) < TRAILING_BARS + 1:
         return None
 
+    update_sigma_pts(state)
+    if state.sigma <= 0:
+        return None
+    sigma = state.sigma
+
     closes  = np.array([b.close  for b in bars])
     volumes = np.array([b.volume for b in bars])
 
-    trail     = np.log(closes[-TRAILING_BARS:] / closes[-TRAILING_BARS - 1:-1])
-    sigma     = float(np.std(trail, ddof=1))
-    if sigma == 0:
-        return None
-
-    sigma_pts = sigma * closes[-1]
     prior_vols   = volumes[-TRAILING_BARS - 1:-1]
     active_vols  = prior_vols[prior_vols >= 10]
     mean_vol     = float(np.median(active_vols)) if len(active_vols) >= 10 else None
@@ -1177,8 +1195,6 @@ def evaluate(state: InstrumentState) -> dict | None:
     else:
         csr = 0.0
 
-    state.sigma     = sigma
-    state.sigma_pts = sigma_pts
     state.mean_vol  = mean_vol
     state.csr       = csr
 
@@ -1197,7 +1213,7 @@ def evaluate(state: InstrumentState) -> dict | None:
             "direction": direction,
             "entry":     last.close,
             "sigma":     sigma,
-            "sigma_pts": sigma_pts,
+            "sigma_pts": state.sigma_pts,
             "scaled":    scaled,
             "vol_ratio": vol_ratio,
             "csr":       csr,
@@ -3884,6 +3900,7 @@ def run(account_id: int | None, paper: bool, strategies: set[str] | None = None)
         for state in states:
             try:
                 fetch_bars(client, state)
+                update_sigma_pts(state)
                 if state.instrument.sun_gap_enabled:
                     _update_sun_fri_close(state)
 
