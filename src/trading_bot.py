@@ -218,6 +218,12 @@ WALL_BREAK_TARGET_PTS = 12.0  # profit target distance in points
 WALL_BREAK_HOLD_MIN   = 15    # max hold in minutes
 WALL_EXTEND_MIN       = 10    # minutes to extend VWASLR hold on qualifying breakout
 WALL_STOP_SEARCH_PTS  = 10.0  # search radius for tested walls to anchor stop
+# Halt new Wall Break entries for the rest of the ET day after this many
+# consecutive losses. Backtest (2026-07-22..2026-08-25, 68 trades, 17 days):
+# N=2 turned -72.11pt into -26.36pt; skipped trades averaged -2.41pt/trade vs
+# -0.54pt/trade for trades taken, and no day's skipped remainder was net
+# positive. Revisit with more data — this was a 17-day sample.
+WALL_BREAK_MAX_CONSEC_LOSSES = 2
 SLR_LOG_FIELDS = [
     "fired_at", "resolved_at", "symbol", "direction",
     "est_entry", "fill_price", "target", "stop",
@@ -1025,6 +1031,9 @@ class InstrumentState:
     wall_break_last_ts:         "datetime | None"             = None
     vwaslr_wall_extended_until: "datetime | None"             = None
     active_wall_break_trade:    "ActiveWallBreakTrade | None" = None
+    wall_break_day:             "date | None"                 = None
+    wall_break_consec_losses:   int                            = 0
+    wall_break_halted_today:    bool                           = False
 
 
 # ── Trade logging ────────────────────────────────────────────────────────────
@@ -2621,7 +2630,8 @@ def handle_active_wall_break_trade(client: TopstepClient, state,
         if now >= trade.expires_at():
             exit_price = (state.vwaslr_bars[-1].close if state.vwaslr_bars
                           else trade.sig.entry)
-            _log_wall_break_trade(trade, "TIME EXIT (paper)", exit_price, now)
+            pnl_pts = _log_wall_break_trade(trade, "TIME EXIT (paper)", exit_price, now)
+            _update_wall_break_streak(state, pnl_pts, now)
             state.active_wall_break_trade = None
         return
 
@@ -2651,7 +2661,8 @@ def handle_active_wall_break_trade(client: TopstepClient, state,
                        else "STOPPED")
         else:
             outcome, exit_price = _classify_wall_break_outcome(trade, state.vwaslr_bars)
-        _log_wall_break_trade(trade, outcome, exit_price, now)
+        pnl_pts = _log_wall_break_trade(trade, outcome, exit_price, now)
+        _update_wall_break_streak(state, pnl_pts, now)
         state.active_wall_break_trade = None
         try:
             n = client.cancel_all_orders(account_id)
@@ -2674,7 +2685,8 @@ def handle_active_wall_break_trade(client: TopstepClient, state,
             return
         exit_price = (state.vwaslr_bars[-1].close if state.vwaslr_bars
                       else (trade.fill_price or trade.sig.entry))
-        _log_wall_break_trade(trade, "TIME EXIT", exit_price, now)
+        pnl_pts = _log_wall_break_trade(trade, "TIME EXIT", exit_price, now)
+        _update_wall_break_streak(state, pnl_pts, now)
         state.active_wall_break_trade = None
         try:
             client.cancel_all_orders(account_id)
@@ -2746,7 +2758,7 @@ def _ensure_wall_break_log():
 
 
 def _log_wall_break_trade(trade: ActiveWallBreakTrade, outcome: str,
-                           exit_price: float, now: datetime):
+                           exit_price: float, now: datetime) -> float:
     fill    = trade.fill_price or trade.sig.entry
     pnl_pts = (exit_price - fill) * trade.sig.direction
     dirn    = "LONG" if trade.sig.direction == 1 else "SHORT"
@@ -2773,6 +2785,36 @@ def _log_wall_break_trade(trade: ActiveWallBreakTrade, outcome: str,
         f"wall={trade.sig.wall_price:.2f}  peak={trade.sig.peak_size:.0f}  "
         f"tests={trade.sig.test_count}"
     )
+    return pnl_pts
+
+
+def _wall_break_can_trade(state, now: datetime) -> bool:
+    """False if this instrument has hit WALL_BREAK_MAX_CONSEC_LOSSES straight
+    Wall Break losses so far today (ET calendar day). Also handles the daily
+    rollover so the halt doesn't carry over into a new day with no trades yet."""
+    today = now.astimezone(ET).date()
+    if state.wall_break_day != today:
+        state.wall_break_day           = today
+        state.wall_break_consec_losses = 0
+        state.wall_break_halted_today  = False
+    return not state.wall_break_halted_today
+
+
+def _update_wall_break_streak(state, pnl_pts: float, now: datetime):
+    """Update the per-day consecutive-loss counter after a Wall Break trade
+    closes, and halt further entries today once it reaches the threshold."""
+    _wall_break_can_trade(state, now)   # ensure day rollover has run
+    if pnl_pts < 0:
+        state.wall_break_consec_losses += 1
+    else:
+        state.wall_break_consec_losses = 0
+    if (state.wall_break_consec_losses >= WALL_BREAK_MAX_CONSEC_LOSSES
+            and not state.wall_break_halted_today):
+        state.wall_break_halted_today = True
+        log.info(
+            f"WALL_BREAK {state.instrument.symbol}: halting for the rest of "
+            f"the day after {state.wall_break_consec_losses} consecutive losses"
+        )
 
 
 # ── Wall-anchored stop helper ─────────────────────────────────────────────────
@@ -4113,7 +4155,9 @@ def run(account_id: int | None, paper: bool, strategies: set[str] | None = None)
 
                 # Wall Breakout signal: 10:30–13:00 ET only, no position
                 # Backtest: 9:30-10:30 and 13:00-16:00 are strongly negative; sweet spot is 10:30-13:00
-                if no_position and not past_cutoff and state.instrument.wall_enabled and (10, 30) <= now_et_hm < (13, 0):
+                if (no_position and not past_cutoff and state.instrument.wall_enabled
+                        and (10, 30) <= now_et_hm < (13, 0)
+                        and _wall_break_can_trade(state, now)):
                     wb_sig = evaluate_wall_break(state, now)
                     if wb_sig:
                         place_wall_break_signal(client, state, wb_sig, account_id, paper)
