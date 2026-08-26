@@ -38,7 +38,7 @@ echo ""
 
 echo "--- Stale Process Check ---"
 stale=0
-for pattern in "src/mes_monitor.py" "src/ml_monitor.py" "src/signal_monitor.py" "src/slr_monitor.py" "src/dom_client.py"; do
+for pattern in "src/mes_monitor.py" "src/ml_monitor.py" "src/signal_monitor.py" "src/slr_monitor.py"; do
     if pgrep -f "$pattern" > /dev/null 2>&1; then
         echo "  [WARN] Stale process running: $pattern"
         stale=1
