@@ -34,7 +34,7 @@ STRAT_STYLE = {
     "SLR":      "blue",
     "PL MOM":   "magenta",
     "PL REV":   "green",
-    "WBRK": "white",
+    "WBRK": "",
 }
 
 MES_MNQ = {"MES", "MNQ"}
@@ -150,19 +150,19 @@ def build_trade_summary_panel(max_rows: int = 20) -> Panel:
             elif "TIME" in outcome:
                 out_txt = Text("TIME EXIT", style="cyan")
             else:
-                out_txt = Text(outcome[:10], style="dim")
+                out_txt = Text(outcome[:10])
 
             is_long = row["direction"] != "SHORT"
             dir_txt = Text("▲ Long", style="green") if is_long else Text("▼ Short", style="red")
 
-            strat_style = STRAT_STYLE.get(strat, "white")
+            strat_style = STRAT_STYLE.get(strat, "")
             tbl.add_row(
                 row["sym"],
                 fired_et.strftime("%H:%M"),
                 Text(strat, style=strat_style),
                 dir_txt,
                 str(row["entry"]),
-                Text(row["detail"], style="dim"),
+                Text(row["detail"]),
                 out_txt,
                 Text(f"{pnl_sign}{abs(pnl):.2f}", style=pnl_col),
             )
