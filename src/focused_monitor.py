@@ -275,11 +275,16 @@ class MonitorState:
     # Wall Break
     wall_break_signal: "WallBreakSignal|None" = None
     wall_recent_events: list = field(default_factory=list)  # (ts, event, side, wall_price, test_count, entry, peak_size)
-    # Position
+    # Position — MES
     position_size:  int   = 0
     position_dir:   int   = 0
     position_entry: "float|None" = None
     position_strat: str   = ""
+    # Position — MNQ
+    mnq_position_size:  int   = 0
+    mnq_position_dir:   int   = 0
+    mnq_position_entry: "float|None" = None
+    mnq_position_strat: str   = ""
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -1143,19 +1148,27 @@ def build_sizing_panel(state: MonitorState) -> Panel:
                  border_style="blue", padding=(0, 1), expand=False)
 
 
+def _position_row(t, symbol: str, size: int, direction: int,
+                   entry_px: "float|None", strat: str):
+    entry = f"{entry_px:.2f}" if entry_px else ""
+    if size == 0:
+        t.add_row(symbol, "—", "", "", "")
+    elif direction == 1:
+        t.add_row(symbol, f"[green]{size}[/]", "[green]▲ LONG[/]",
+                  f"[green]{entry}[/]", f"[green]{strat}[/]")
+    else:
+        t.add_row(symbol, f"[red]{size}[/]", "[red]▼ SHORT[/]",
+                  f"[red]{entry}[/]", f"[red]{strat}[/]")
+
+
 def build_positions_panel(state: MonitorState) -> Panel:
     t = Table.grid(padding=(0, 2))
     t.add_column(width=5); t.add_column(width=4, justify="right")
     t.add_column(width=8); t.add_column(width=9, justify="right"); t.add_column(width=10)
-    entry = f"{state.position_entry:.2f}" if state.position_entry else ""
-    if state.position_size == 0:
-        t.add_row(SYMBOL, "—", "", "", "")
-    elif state.position_dir == 1:
-        t.add_row(SYMBOL, f"[green]{state.position_size}[/]", "[green]▲ LONG[/]",
-                  f"[green]{entry}[/]", f"[green]{state.position_strat}[/]")
-    else:
-        t.add_row(SYMBOL, f"[red]{state.position_size}[/]", "[red]▼ SHORT[/]",
-                  f"[red]{entry}[/]", f"[red]{state.position_strat}[/]")
+    _position_row(t, SYMBOL, state.position_size, state.position_dir,
+                  state.position_entry, state.position_strat)
+    _position_row(t, "MNQ", state.mnq_position_size, state.mnq_position_dir,
+                  state.mnq_position_entry, state.mnq_position_strat)
     return Panel(t, title="POSITIONS", border_style="blue", padding=(0, 1), expand=False)
 
 
@@ -1186,9 +1199,9 @@ def render(state: MonitorState) -> Table:
     root.add_row(build_header())
 
     # ── Layout ─────────────────────────────────────────────────────────────────
-    # Col 1 (ratio=1): VWASLR · MNQ ORB · MES ORB · Positions|Sizing
-    # Col 2 (ratio=1): [PL_REV + Wall Break | DOM]  ← top
-    #                  [Trade Summary (full col2+DOM width)] ← bottom
+    # Col 1 (natural width): VWASLR · MNQ ORB · MES ORB · Positions|Sizing
+    # Col 2 (ratio=1):       PL_REV MES · PL_REV MNQ · Wall Break
+    # Col 3 (ratio=1):       Trade Summary (own column so it has full height)
     pos_siz = Table(box=None, show_header=False, padding=(0, 0), expand=False)
     pos_siz.add_column(); pos_siz.add_column()
     pos_siz.add_row(build_positions_panel(state), build_sizing_panel(state))
@@ -1199,18 +1212,23 @@ def render(state: MonitorState) -> Table:
     col1.add_row(build_mes_orb_panel(state, now))
     col1.add_row(pos_siz)
 
-    # Right section: PL_REV MES, PL_REV MNQ, Wall Break stacked, Trade Summary below
-    right = Table(box=None, show_header=False, padding=(0, 0), expand=True)
-    right.add_column(ratio=1)
-    right.add_row(build_pl_rev_panel(state, now, "MES"))
-    right.add_row(build_pl_rev_panel(state, now, "MNQ"))
-    right.add_row(build_wall_panel(state, now))
-    right.add_row(build_trade_summary_panel())
+    # Col 2: PL_REV MES, PL_REV MNQ, Wall Break stacked
+    col2 = Table(box=None, show_header=False, padding=(0, 0), expand=True)
+    col2.add_column(ratio=1)
+    col2.add_row(build_pl_rev_panel(state, now, "MES"))
+    col2.add_row(build_pl_rev_panel(state, now, "MNQ"))
+    col2.add_row(build_wall_panel(state, now))
+
+    # Col 3: Trade Summary, given its own column so it isn't squeezed by col2
+    col3 = Table(box=None, show_header=False, padding=(0, 0), expand=True)
+    col3.add_column(ratio=1)
+    col3.add_row(build_trade_summary_panel())
 
     main = Table(box=None, show_header=False, padding=(0, 1), expand=True)
     main.add_column()           # col1: natural width, no ratio
-    main.add_column(ratio=1)    # right section: fills remaining space
-    main.add_row(col1, right)
+    main.add_column(ratio=1)    # col2: fills remaining space
+    main.add_column(ratio=1)    # col3: fills remaining space
+    main.add_row(col1, col2, col3)
     root.add_row(main)
 
     return root
@@ -1218,7 +1236,7 @@ def render(state: MonitorState) -> Table:
 
 # ─── Position strategy detection ─────────────────────────────────────────────
 
-def _detect_position_strategy() -> str:
+def _detect_position_strategy(symbol: str = SYMBOL) -> str:
     for log_path in [Path("logs/focused_bot.log"), Path("logs/trading_bot.log")]:
         if not log_path.exists():
             continue
@@ -1226,7 +1244,7 @@ def _detect_position_strategy() -> str:
             with open(log_path) as f:
                 lines = f.readlines()
             for line in reversed(lines[-500:]):
-                if f" {SYMBOL} " not in line:
+                if f" {symbol} " not in line:
                     continue
                 if "VWASLR ORDER" in line: return "VWASLR"
                 if "PL_REV ORDER" in line: return "PL REV"
@@ -1250,7 +1268,13 @@ def run():
         return
     cid = str(contracts[0]["id"])
 
-    state = MonitorState(contract_id=cid, wall_tracker=WallTracker(SYMBOL))
+    mnq_contracts = client.search_contracts("MNQ")
+    mnq_cid = str(mnq_contracts[0]["id"]) if mnq_contracts else ""
+    if not mnq_cid:
+        print("WARNING: no contract for MNQ — MNQ position row will stay blank")
+
+    state = MonitorState(contract_id=cid, mnq_contract_id=mnq_cid,
+                          wall_tracker=WallTracker(SYMBOL))
     fetch_1min_bars(client, state)
 
     # DOM reader (250ms)
@@ -1471,9 +1495,24 @@ def run():
                                         if pos and sz else None)
                 state.position_dir   = 0 if sz == 0 else (-1 if pt == 2 else 1)
                 if state.position_size > 0 and prev == 0:
-                    state.position_strat = _detect_position_strategy()
+                    state.position_strat = _detect_position_strategy(SYMBOL)
                 elif state.position_size == 0:
                     state.position_strat = ""
+
+                if state.mnq_contract_id:
+                    mnq_pos = next((p for p in positions
+                                     if str(p.get("contractId", "")) == state.mnq_contract_id), None)
+                    mnq_sz  = int(mnq_pos.get("size", 0)) if mnq_pos else 0
+                    mnq_pt  = int(mnq_pos.get("type", 0)) if mnq_pos else 0
+                    mnq_prev = state.mnq_position_size
+                    state.mnq_position_size  = abs(mnq_sz)
+                    state.mnq_position_entry = (float(mnq_pos.get("averagePrice", 0) or 0)
+                                                if mnq_pos and mnq_sz else None)
+                    state.mnq_position_dir   = 0 if mnq_sz == 0 else (-1 if mnq_pt == 2 else 1)
+                    if state.mnq_position_size > 0 and mnq_prev == 0:
+                        state.mnq_position_strat = _detect_position_strategy("MNQ")
+                    elif state.mnq_position_size == 0:
+                        state.mnq_position_strat = ""
             except Exception: traceback.print_exc()
             time.sleep(30)
     threading.Thread(target=_poll_positions, daemon=True, name="pos-poll").start()
