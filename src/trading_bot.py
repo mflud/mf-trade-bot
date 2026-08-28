@@ -1886,36 +1886,50 @@ def handle_active_orb_trade(client: TopstepClient, state: InstrumentState,
 
 def _get_exit_price(client: TopstepClient, account_id: int,
                     fired_at: datetime, contract_id: str, now: datetime,
-                    entry_price: float | None = None) -> float | None:
+                    entry_price: float | None = None,
+                    retries: int = 3, retry_delay_s: float = 1.5) -> float | None:
     """Fetch the actual exit fill price from trade history.
 
     Filters to trades after fired_at on the given contract.  If entry_price is
     provided, skips fills within 1 tick of entry (avoids returning the entry fill
     as the exit when only one trade is returned by the API).
+
+    Retries a few times with a short delay: the trade-history API can lag a
+    couple seconds behind a fill, especially right after a very fast move, and
+    a caller that gives up immediately falls back to a coarser bar-based
+    classifier that isn't reliable on that timescale (confirmed case: a real
+    +$60 WALL_BREAK target hit in 29s got logged as a stop because the exit
+    fill hadn't posted on the first check — 2026-08-25 07:30 MST).
     """
-    try:
-        trades = client.search_trades(account_id, fired_at, now)
-        closing = [
-            t for t in trades
-            if t.get("contractId") == contract_id
-            and datetime.fromisoformat(t.get("timestamp", "1970-01-01T00:00:00")).replace(tzinfo=timezone.utc)
-                > fired_at
-        ]
-        if not closing:
-            log.debug(f"_get_exit_price: no trades found after {fired_at} for {contract_id}")
+    for attempt in range(retries):
+        try:
+            trades = client.search_trades(account_id, fired_at, now)
+            closing = [
+                t for t in trades
+                if t.get("contractId") == contract_id
+                and datetime.fromisoformat(t.get("timestamp", "1970-01-01T00:00:00")).replace(tzinfo=timezone.utc)
+                    > fired_at
+            ]
+            price = float(closing[-1].get("price", 0)) if closing else 0.0
+            only_entry_fill = (entry_price is not None and len(closing) == 1
+                                and abs(price - entry_price) < 1.0)
+            if closing and price > 0 and not only_entry_fill:
+                log.debug(f"_get_exit_price: found exit fill {price:.2f} ({len(closing)} fills total)")
+                return price
+            if attempt < retries - 1:
+                time.sleep(retry_delay_s)
+                continue
+            if not closing:
+                log.debug(f"_get_exit_price: no trades found after {fired_at} for {contract_id}")
+            elif only_entry_fill:
+                log.debug(f"_get_exit_price: only fill matches entry ({price:.2f}) — waiting for exit fill")
             return None
-        # If multiple fills, the last one is the exit
-        # If only one fill and it matches entry, it's the entry fill — skip it
-        price = float(closing[-1].get("price", 0))
-        if price <= 0:
+        except Exception as e:
+            log.warning(f"Could not fetch trade history for exit price: {e}")
+            if attempt < retries - 1:
+                time.sleep(retry_delay_s)
+                continue
             return None
-        if entry_price is not None and len(closing) == 1 and abs(price - entry_price) < 1.0:
-            log.debug(f"_get_exit_price: only fill matches entry ({price:.2f}) — waiting for exit fill")
-            return None
-        log.debug(f"_get_exit_price: found exit fill {price:.2f} ({len(closing)} fills total)")
-        return price
-    except Exception as e:
-        log.warning(f"Could not fetch trade history for exit price: {e}")
     return None
 
 
@@ -2660,7 +2674,11 @@ def handle_active_wall_break_trade(client: TopstepClient, state,
                                    (d == -1 and exit_price <= trade.target_price())
                        else "STOPPED")
         else:
-            outcome, exit_price = _classify_wall_break_outcome(trade, state.vwaslr_bars)
+            # Prefer 5s bars (shared with PL_REV, same MES contract, same RTH
+            # window) over 1-min bars — fine enough resolution to catch fast
+            # moves that a 1-min bar wouldn't show until it closes.
+            classify_bars = state.pl_mom_5s_bars if state.pl_mom_5s_bars else state.vwaslr_bars
+            outcome, exit_price = _classify_wall_break_outcome(trade, classify_bars)
         pnl_pts = _log_wall_break_trade(trade, outcome, exit_price, now)
         _update_wall_break_streak(state, pnl_pts, now)
         state.active_wall_break_trade = None
