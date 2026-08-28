@@ -74,6 +74,12 @@ backoff=$MIN_BACKOFF
 attempt=0
 
 wait_for_session() {
+    # Poll every 60s rather than sleeping 30m at a stretch — a flat 30m sleep
+    # doesn't resume counting until the Mac has been awake for the full 30m,
+    # so a laptop nap near the session open can silently push the actual
+    # start out by however long it slept. Polling short caps that delay at
+    # ~60s. Log throttled to once per ~30m so this doesn't spam the log file.
+    local last_log_ts=0
     while true; do
         dow=$(TZ=America/New_York date +%u)       # 1=Mon…7=Sun
         hhmm=$(TZ=America/New_York date +%H%M)   # e.g. 0830
@@ -81,8 +87,12 @@ wait_for_session() {
         if [[ $dow -le 5 ]] && [[ $hhmm -ge 830 ]] && [[ $hhmm -lt 1700 ]]; then
             return
         fi
-        log "Outside 08:30–17:00 ET (ET=$(TZ=America/New_York date +%H:%M) dow=$dow) — sleeping 30m"
-        sleep 1800
+        now_ts=$(date +%s)
+        if (( now_ts - last_log_ts >= 1800 )); then
+            log "Outside 08:30–17:00 ET (ET=$(TZ=America/New_York date +%H:%M) dow=$dow) — polling every 60s"
+            last_log_ts=$now_ts
+        fi
+        sleep 60
     done
 }
 
