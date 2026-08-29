@@ -25,6 +25,7 @@ TRADE_LOGS = {
     "PL MOM":   Path("logs/pl_mom_trades.csv"),
     "PL REV":   Path("logs/pl_rev_trades.csv"),
     "WBRK": Path("logs/wall_break_trades.csv"),
+    "BA-BRK":   Path("logs/ba_brk_trades.csv"),
 }
 
 STRAT_STYLE = {
@@ -35,19 +36,23 @@ STRAT_STYLE = {
     "PL MOM":   "magenta",
     "PL REV":   "green",
     "WBRK": "",
+    "BA-BRK":   "red",
 }
 
 MES_MNQ = {"MES", "MNQ"}
 
 
-def _load_all() -> list[dict]:
+def _load_all(strategies: "set[str] | None" = None) -> list[dict]:
+    """strategies: restrict to these labels (keys of TRADE_LOGS); None = all."""
     now_et  = datetime.now(ET)
     today   = now_et.date()
     cutoff  = datetime(today.year, today.month, today.day, 8, 30,
                        tzinfo=ET).astimezone(timezone.utc)
     rows = []
 
-    for strat, path in TRADE_LOGS.items():
+    logs = ({k: v for k, v in TRADE_LOGS.items() if k in strategies}
+            if strategies is not None else TRADE_LOGS)
+    for strat, path in logs.items():
         if not path.exists():
             continue
         try:
@@ -88,6 +93,10 @@ def _load_all() -> list[dict]:
                         elif strat == "WBRK":
                             pk = int(float(r.get("peak_size", 0) or 0))
                             detail = f"pk={pk}"
+                        elif strat == "BA-BRK":
+                            side = r.get("side", "")
+                            cl   = r.get("cascade_len", "")
+                            detail = f"{side} x{cl}"
                         else:
                             detail = ""
 
@@ -110,8 +119,9 @@ def _load_all() -> list[dict]:
     return rows
 
 
-def build_trade_summary_panel(max_rows: int = 20) -> Panel:
-    rows = _load_all()
+def build_trade_summary_panel(max_rows: int = 20,
+                               strategies: "set[str] | None" = None) -> Panel:
+    rows = _load_all(strategies)
 
     tbl = Table(box=None, show_header=True, padding=(0, 1))
     tbl.add_column("Sym",        width=4)

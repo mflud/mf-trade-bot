@@ -167,6 +167,29 @@ class WallBreakSignal:
     expires_at: datetime
 
 
+# BA-BRK (Bid/Ask Break — wall cascade): mirrors trading_bot.py's live logic
+# (see BA_BRK_* constants there for the backtest this is based on).
+BA_BRK_CASCADE_MIN = 3
+BA_BRK_MAX_GAP_SEC = 45
+BA_BRK_STOP_PTS    = 4.5
+BA_BRK_TARGET_PTS  = 12.0
+BA_BRK_HOLD_MIN    = 15
+BA_BRK_BUFFER_MIN  = 5
+
+@dataclass
+class BaBrkSignal:
+    direction:      int      # +1 LONG (ask cascade), -1 SHORT (bid cascade)
+    side:           str      # "ask" | "bid"
+    entry:          float
+    target:         float
+    stop:           float
+    cascade_len:    int
+    first_break_ts: datetime
+    last_break_ts:  datetime
+    fired_at:       datetime
+    expires_at:     datetime
+
+
 @dataclass
 class ORBState:
     orb_high:    float = 0.0
@@ -275,6 +298,10 @@ class MonitorState:
     # Wall Break
     wall_break_signal: "WallBreakSignal|None" = None
     wall_recent_events: list = field(default_factory=list)  # (ts, event, side, wall_price, test_count, entry, peak_size)
+    # BA-BRK (wall cascade)
+    ba_brk_signal:    "BaBrkSignal|None" = None
+    ba_brk_breakouts: list = field(default_factory=list)   # raw WallEvent breakouts, both sides
+    day_open:         "float|None" = None
     # Position — MES
     position_size:  int   = 0
     position_dir:   int   = 0
@@ -304,6 +331,42 @@ def _compute_sigma_5s(bars: list, lookback: int) -> float:
     moves = [abs(rets[i:i+PL_WINDOW].sum())
              for i in range(n - lb, n - PL_WINDOW + 1) if i >= 0]
     return float(np.std(moves)) * 10000 if len(moves) >= 4 else 0.0
+
+
+def _day_open_price(bars: list, now: datetime) -> float | None:
+    """First bar's open on `now`'s local calendar day, or None if no bar yet today."""
+    today = now.astimezone(LOCAL).date()
+    for bar in bars:
+        if bar.ts.astimezone(LOCAL).date() == today:
+            return bar.open
+    return None
+
+
+def _detect_cascade_signal(events: list, side: str, cascade_min: int, max_gap_sec: int,
+                            after_ts: "datetime | None"):
+    """Mirrors trading_bot.py's _detect_cascade_signal — chains consecutive
+    same-side breakouts less than max_gap_sec apart; returns
+    (trigger_event, cascade_start_ts, cascade_len) for the most recent fresh
+    cascade past cascade_min, or None."""
+    same_side = sorted((e for e in events if e.side == side), key=lambda e: e.ts)
+    cascade_count = 0
+    cascade_start = None
+    last_ts = None
+    signaled_this_cascade = False
+    result = None
+    for e in same_side:
+        if last_ts is not None and (e.ts - last_ts).total_seconds() <= max_gap_sec:
+            cascade_count += 1
+        else:
+            cascade_count = 1
+            cascade_start = e.ts
+            signaled_this_cascade = False
+        last_ts = e.ts
+        if cascade_count >= cascade_min and not signaled_this_cascade:
+            signaled_this_cascade = True
+            if after_ts is None or e.ts > after_ts:
+                result = (e, cascade_start, cascade_count)
+    return result
 
 
 def _pl_bar(pl: float, dir_sym: str, half: int = 6) -> str:
@@ -1115,6 +1178,85 @@ def build_wall_panel(state: MonitorState, now: datetime) -> Panel:
                  padding=(0, 1), expand=False)
 
 
+def build_ba_brk_panel(state: MonitorState, now: datetime) -> Panel:
+    sig = state.ba_brk_signal
+
+    # Live cascade progress: consecutive ask breakouts chained within the gap
+    # window, ending at the most recent breakout (informational — mirrors
+    # trading_bot.py's _detect_cascade_signal but ignores the dedup cursor
+    # so the panel always shows current progress, not just fresh triggers).
+    ask_events = sorted((e for e in state.ba_brk_breakouts if e.side == "ask"), key=lambda e: e.ts)
+    gaps = [None] + [(ask_events[i].ts - ask_events[i-1].ts).total_seconds()
+                      for i in range(1, len(ask_events))]
+    live_len, live_start = 0, None
+    for gap, e in zip(gaps, ask_events):
+        if gap is not None and gap <= BA_BRK_MAX_GAP_SEC:
+            live_len += 1
+        else:
+            live_len, live_start = 1, e.ts
+    aligned = (state.day_open is not None and ask_events and
+               (ask_events[-1].price or ask_events[-1].wall_price) > state.day_open)
+
+    if sig and now < sig.expires_at:
+        status = "▲ CASCADE LONG"; border = "green"; style = "bold green"
+    elif live_len >= 2:
+        status = f"BUILDING ({live_len}/{BA_BRK_CASCADE_MIN})"; border = "yellow"; style = "bold yellow"
+    else:
+        status = "WATCHING"; border = "blue" if ask_events else "default"; style = "bold" if ask_events else ""
+
+    root = Table.grid(padding=(0, 0))
+    root.add_column(justify="center")
+    root.add_row(f"[{style}]  {status}  [/]" if style else f"  {status}  ")
+
+    if sig and now < sig.expires_at:
+        root.add_row("")
+        det = Table.grid(padding=(0, 1))
+        det.add_column(width=10, justify="right")
+        det.add_column()
+        rem = max(0, int((sig.expires_at - now).total_seconds()))
+        det.add_row("Cascade:", f"[bold]{sig.cascade_len}[/] breaks in "
+                                 f"{(sig.last_break_ts - sig.first_break_ts).total_seconds():.0f}s")
+        det.add_row("Entry:",   f"[bold green]{sig.entry:.2f}[/]")
+        det.add_row("Target:",  f"[bold green]{sig.target:.2f}[/]  (+{BA_BRK_TARGET_PTS:.0f}pt)")
+        det.add_row("Stop:",    f"[bold red]{sig.stop:.2f}[/]  (-{BA_BRK_STOP_PTS:.1f}pt)")
+        det.add_row("Hold:",    f"{rem//60}m {rem%60:02d}s remaining")
+        root.add_row(det)
+    elif state.day_open is not None:
+        root.add_row("")
+        det = Table.grid(padding=(0, 1))
+        det.add_column(width=14, justify="right")
+        det.add_column()
+        det.add_row("Day open:", f"{state.day_open:.2f}")
+        det.add_row("Aligned:",  ("[green]yes[/]" if aligned else "[red]no — filtered[/]")
+                                  if ask_events else "—")
+        root.add_row(det)
+
+    # Recent ask breakouts (last 10) — the raw feed cascades are built from
+    tail_n = min(10, len(ask_events))
+    if tail_n:
+        root.add_row("")
+        lt = Table(box=None, show_header=True, padding=(0, 1), header_style="bold")
+        lt.add_column("time",  justify="right")
+        lt.add_column("side",  justify="center")
+        lt.add_column("wall",  justify="right")
+        lt.add_column("gap",   justify="right")
+        for e, gap in list(zip(ask_events, gaps))[-tail_n:][::-1]:
+            t_s   = e.ts.astimezone(LOCAL).strftime("%H:%M:%S")
+            gap_s = "—" if gap is None else f"{gap:.0f}s"
+            lt.add_row(t_s, "[red]ask[/]", f"{e.wall_price:.2f}", gap_s)
+        root.add_row(lt)
+
+    root.add_row("")
+    foot = Table.grid(); foot.add_column(justify="center")
+    foot.add_row(f"{BA_BRK_CASCADE_MIN}+ breaks / {BA_BRK_MAX_GAP_SEC}s  "
+                 f"stop {BA_BRK_STOP_PTS:.1f}pt  target {BA_BRK_TARGET_PTS:.0f}pt  "
+                 f"hold {BA_BRK_HOLD_MIN}min  ask-only, aligned w/ day open  9:40–13:00 ET")
+    root.add_row(foot)
+
+    return Panel(root, title=f"BA-BRK  {SYMBOL}", border_style=border,
+                 padding=(0, 1), expand=False)
+
+
 def build_sizing_panel(state: MonitorState) -> Panel:
     sigma_pts = None
     if len(state.bars_1m) >= 2:
@@ -1185,11 +1327,17 @@ def build_header() -> Table:
     t = Table.grid(expand=True)
     t.add_column(ratio=1); t.add_column(ratio=1, justify="center"); t.add_column(ratio=1, justify="right")
     t.add_row(
-        f"[bold]Focused Bot Monitor[/]  {sess}  VWASLR · PL_REV · Wall Break · ORB (MNQ+MES)",
+        f"[bold]Focused Bot Monitor[/]  {sess}  ORB (MNQ+MES) · BA-BRK",
         f"{now_loc.strftime('%H:%M:%S')}  /  {now_et.strftime('%H:%M ET')}",
         "",
     )
     return t
+
+
+# Strategies the focused_bot currently trades (2026-08-29: switched from
+# VWASLR/PL_REV/Wall Break to ORB+BA-BRK for close monitoring). Restricts
+# the Trade Summary panel to just these — see trade_summary_panel.py.
+FOCUSED_STRATEGIES = {"ORB", "BA-BRK"}
 
 
 def render(state: MonitorState) -> Table:
@@ -1199,30 +1347,27 @@ def render(state: MonitorState) -> Table:
     root.add_row(build_header())
 
     # ── Layout ─────────────────────────────────────────────────────────────────
-    # Col 1 (natural width): VWASLR · MNQ ORB · MES ORB · Positions|Sizing
-    # Col 2 (ratio=1):       PL_REV MES · PL_REV MNQ · Wall Break
-    # Col 3 (ratio=1):       Trade Summary (own column so it has full height)
+    # Col 1 (natural width): MNQ ORB · MES ORB · Positions|Sizing
+    # Col 2 (ratio=1):       BA-BRK
+    # Col 3 (ratio=1):       Trade Summary (own column, ORB+BA-BRK only)
     pos_siz = Table(box=None, show_header=False, padding=(0, 0), expand=False)
     pos_siz.add_column(); pos_siz.add_column()
     pos_siz.add_row(build_positions_panel(state), build_sizing_panel(state))
 
     col1 = Table.grid(); col1.add_column()
-    col1.add_row(build_vwaslr_panel(state, now))
     col1.add_row(build_orb_panel(state, now))
     col1.add_row(build_mes_orb_panel(state, now))
     col1.add_row(pos_siz)
 
-    # Col 2: PL_REV MES, PL_REV MNQ, Wall Break stacked
+    # Col 2: BA-BRK
     col2 = Table(box=None, show_header=False, padding=(0, 0), expand=True)
     col2.add_column(ratio=1)
-    col2.add_row(build_pl_rev_panel(state, now, "MES"))
-    col2.add_row(build_pl_rev_panel(state, now, "MNQ"))
-    col2.add_row(build_wall_panel(state, now))
+    col2.add_row(build_ba_brk_panel(state, now))
 
     # Col 3: Trade Summary, given its own column so it isn't squeezed by col2
     col3 = Table(box=None, show_header=False, padding=(0, 0), expand=True)
     col3.add_column(ratio=1)
-    col3.add_row(build_trade_summary_panel())
+    col3.add_row(build_trade_summary_panel(strategies=FOCUSED_STRATEGIES))
 
     main = Table(box=None, show_header=False, padding=(0, 1), expand=True)
     main.add_column()           # col1: natural width, no ratio
@@ -1250,6 +1395,7 @@ def _detect_position_strategy(symbol: str = SYMBOL) -> str:
                 if "PL_REV ORDER" in line: return "PL REV"
                 if "ORB ORDER"    in line: return "ORB"
                 if "WALL"         in line and "ORDER" in line: return "WALL BRK"
+                if "BA_BRK ORDER" in line: return "BA-BRK"
         except Exception:
             pass
     return ""
@@ -1457,6 +1603,36 @@ def run():
                 if (state.wall_break_signal is not None and
                         now >= state.wall_break_signal.expires_at):
                     state.wall_break_signal = None
+
+                # BA-BRK: accumulate every raw breakout (both sides, unfiltered
+                # by wall size) and check for a fresh cascade.
+                for ev in events:
+                    if ev.event == "breakout":
+                        state.ba_brk_breakouts.append(ev)
+                prune_before = now - timedelta(minutes=BA_BRK_BUFFER_MIN)
+                state.ba_brk_breakouts = [e for e in state.ba_brk_breakouts if e.ts >= prune_before]
+
+                state.day_open = _day_open_price(state.bars_mes_orb, now) or state.day_open
+
+                last_ts = state.ba_brk_signal.last_break_ts if state.ba_brk_signal else None
+                r = _detect_cascade_signal(state.ba_brk_breakouts, "ask",
+                                            BA_BRK_CASCADE_MIN, BA_BRK_MAX_GAP_SEC, last_ts)
+                if r and (now - r[0].ts).total_seconds() <= BA_BRK_MAX_GAP_SEC + 15:
+                    trigger, cascade_start, cascade_len = r
+                    entry_price = trigger.price or trigger.wall_price
+                    if state.day_open is not None and entry_price > state.day_open:
+                        state.ba_brk_signal = BaBrkSignal(
+                            direction=1, side="ask", entry=entry_price,
+                            target=entry_price + BA_BRK_TARGET_PTS,
+                            stop=entry_price - BA_BRK_STOP_PTS,
+                            cascade_len=cascade_len, first_break_ts=cascade_start,
+                            last_break_ts=trigger.ts,
+                            fired_at=now, expires_at=now + timedelta(minutes=BA_BRK_HOLD_MIN),
+                        )
+                        play_alert()
+                if (state.ba_brk_signal is not None and
+                        now >= state.ba_brk_signal.expires_at):
+                    state.ba_brk_signal = None
     threading.Thread(target=_eval_walls, daemon=True, name="wall-eval").start()
 
     # Initial VWASLR EMA + ORB after bars loaded

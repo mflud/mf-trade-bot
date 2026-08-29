@@ -1,12 +1,12 @@
 """
 Automated trading bot — MES and MNQ micro futures.
 
-Run as focused_bot via: --strategies vwaslr,pl_rev,wall,orb
+Run as focused_bot via: --strategies orb,ba_brk (scripts/start_focused_bot.sh)
 Places market orders with native API bracket stops/targets. Only one open
 position per instrument at a time across all strategies.
 
 Logs: bot_trades.csv (CSR), orb_trades.csv, vwaslr_trades.csv,
-      slr_trades.csv, pl_rev_trades.csv, wall_break_trades.csv
+      slr_trades.csv, pl_rev_trades.csv, wall_break_trades.csv, ba_brk_trades.csv
 
 ━━━ ACTIVE strategies (focused_bot) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -37,6 +37,17 @@ Logs: bot_trades.csv (CSR), orb_trades.csv, vwaslr_trades.csv,
          stop=ORB midpoint (half-range, ~2:1 R:R), target=1×width, hold 10min
          Backtest (84 sessions Apr–Aug 2026): WR 65.9%, PF 3.03 (1 contract)
 
+  BA-BRK (Bid/Ask Break — wall cascade) — MES only, 9:40–13:00 ET
+    Entry : ASK: 3+ consecutive ask-wall breakouts within 45s of each other,
+                 AND aligned with the day's move since RTH open (hard filter)
+            BID: coded but disabled by default — backtest negative on every
+                 tested config; countertrend-fade variant unvalidated (thin sample)
+    Stop  : clamp(σ, 4-5pt)   Target: 12pt   Max hold: 15min
+    Backtest (logs/wall_events.csv, 2026-06-02..08-28, ask+aligned+9:40-13:00):
+      n=274  WR=48.9%  EV=+1.24pt/trade  ~9.5 trades/day
+    Not enabled for MNQ: DOM wall data too sparse to validate (261 events/35
+    days vs. MES's 11,627/59 days).
+
 ━━━ INACTIVE strategies ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
   CSR (3σ momentum) — disabled; dead in post-tariff low-vol regime
@@ -47,6 +58,7 @@ Logs: bot_trades.csv (CSR), orb_trades.csv, vwaslr_trades.csv,
 
 Usage:
   python src/trading_bot.py --strategies vwaslr,pl_rev,wall,orb  # focused_bot
+  python src/trading_bot.py --strategies orb,ba_brk               # BA-BRK bot
   python src/trading_bot.py --paper                              # paper mode
   python src/trading_bot.py --account 12345                      # specify account
 """
@@ -202,6 +214,7 @@ SUN_LOG_PATH  = Path("logs/sun_gap_trades.csv")
 PL_MOM_LOG_PATH     = Path("logs/pl_mom_trades.csv")
 PL_REV_LOG_PATH     = Path("logs/pl_rev_trades.csv")
 WALL_BREAK_LOG_PATH = Path("logs/wall_break_trades.csv")
+BA_BRK_LOG_PATH      = Path("logs/ba_brk_trades.csv")
 
 # ── DOM DB constants ──────────────────────────────────────────────────────────
 DOM_DB_PATH    = Path("data/dom.db")
@@ -224,6 +237,55 @@ WALL_STOP_SEARCH_PTS  = 10.0  # search radius for tested walls to anchor stop
 # -0.54pt/trade for trades taken, and no day's skipped remainder was net
 # positive. Revisit with more data — this was a 17-day sample.
 WALL_BREAK_MAX_CONSEC_LOSSES = 2
+
+# ── BA-BRK (Bid/Ask Break — wall cascade) parameters ────────────────────────
+# Requires N consecutive same-side wall breakouts within a short time window,
+# rather than acting on a single break like Wall Break above. Motivated by a
+# real discretionary trade (2026-08-28) where price broke through a rapid
+# sequence of ask walls; the single-wall wall_break strategy would have
+# mostly missed it (individual walls were below its size filter). Unlike Wall
+# Break, cascades are built from EVERY breakout event (not just ones meeting
+# WALL_MED_MIN/MAX + test_count) — the cascade pattern itself is the signal,
+# not individual wall size.
+#
+# Backtest (logs/wall_events.csv, 2026-06-02..08-28, 15min hold,
+# cascade_min=3/max_gap=45s), gated by direction-since-RTH-open:
+#   ask, aligned, 10:30-13:00 ET:  n=190  WR=53.2%  EV=+1.55pt/trade  total=294.5pt
+#   ask, against trend, any time: consistently negative, e.g. -1.21pt/trade
+# The alignment filter is a hard requirement for ask, not a preference — ask
+# cascades that fight the day's trend lose consistently across every window
+# tested. With the filter active, the edge extends well before 10:30 — the
+# best hours are 9:00-13:00 ET (EV +0.7 to +2.6pt/trade each), while 13:00+
+# degrades and 15:00 is sharply negative (-1.9pt/trade). Widening the window
+# to 9:40-13:00 (standard first-10min exclusion) nets MORE total profit than
+# the narrow 10:30-13:00 gate (n=274, EV=+1.24pt/trade, total=341pt) by
+# capturing the strong opening-hour trades. Without the alignment filter,
+# 10:30-13:00 was necessary to avoid the bad early/late trades; the filter
+# now does that job directly. Bid cascades were negative in every configuration tried, including
+# a "match the day's trend" filter (mirroring ask) and a wide stop/target/
+# hold grid — the one config that showed positive EV (countertrend fade,
+# tight stop/target, short hold) had only ~34 trades after a 125-combo
+# search, too thin to trust. Bid stays coded but disabled by default (see
+# BotInstrument.ba_brk_bid_enabled) until more data accumulates.
+BA_BRK_CASCADE_MIN        = 3      # consecutive same-side breakouts required
+BA_BRK_MAX_GAP_SEC        = 45     # max seconds between consecutive breakouts in a cascade
+BA_BRK_STOP_MIN           = 4.0
+BA_BRK_STOP_MAX           = 5.0
+# Actual stop = clamp(state.sigma_pts, BA_BRK_STOP_MIN, BA_BRK_STOP_MAX)
+BA_BRK_TARGET_PTS         = 12.0
+BA_BRK_HOLD_MIN           = 15
+BA_BRK_TRADE_START        = (9, 40)    # ET — standard first-10min blackout; backtest shows
+BA_BRK_TRADE_END          = (13, 0)    # ET   9:40-13:00 beats the narrower 10:30-13:00 gate
+                                        # once the alignment filter is applied (see above)
+BA_BRK_BUFFER_MIN         = 5      # minutes of raw breakout events kept for cascade scanning
+BA_BRK_MAX_CONSEC_LOSSES  = 2
+# Countertrend bid ("BID_FADE") shadow params — logged only, never live-traded
+# until BotInstrument.ba_brk_bid_enabled is turned on; smaller/faster than
+# the ask side per the (thin, unvalidated) backtest signal.
+BA_BRK_BID_STOP_PTS       = 3.0
+BA_BRK_BID_TARGET_PTS     = 8.0
+BA_BRK_BID_HOLD_MIN       = 10
+
 SLR_LOG_FIELDS = [
     "fired_at", "resolved_at", "symbol", "direction",
     "est_entry", "fill_price", "target", "stop",
@@ -271,6 +333,11 @@ LOG_FIELDS = [
 WALL_BREAK_LOG_FIELDS = [
     "fired_at", "resolved_at", "symbol", "direction",
     "est_entry", "fill_price", "wall_price", "peak_size", "test_count",
+    "stop", "target", "outcome", "pnl_pts",
+]
+BA_BRK_LOG_FIELDS = [
+    "fired_at", "resolved_at", "symbol", "direction", "side",
+    "est_entry", "fill_price", "cascade_len", "first_break_ts", "last_break_ts",
     "stop", "target", "outcome", "pnl_pts",
 ]
 
@@ -579,6 +646,11 @@ class BotInstrument:
     point_value:  float = 5.00  # $ per point (informational only)
     csr_enabled:  bool = True   # CSR/3σ continuation signal; disable via --strategies flag
     wall_enabled: bool = True   # Wall breakout signal; disable via --strategies flag
+    # BA-BRK: wall-cascade signal (N consecutive same-side breaks). ask/bid
+    # sides are gated independently — bid defaults off (backtest negative).
+    ba_brk_enabled:     bool = False
+    ba_brk_ask_enabled: bool = True
+    ba_brk_bid_enabled: bool = False
     # Dynamic CSR window: list of (gk_ann_vol_upper_bound, mom_bars)
     csr_vol_windows: list = field(default_factory=lambda: [(1.0, 8)])
     # Per-instrument blackout windows: (start_h, start_m, end_h, end_m, conditional)
@@ -649,7 +721,8 @@ INSTRUMENTS = [
                   eve_enabled=False,
                   sun_gap_enabled=False,
                   pl_mom_enabled=False,  # disabled: no base-rate edge (WR~35%); replaced by PL_REV
-                  pl_rev_enabled=True),
+                  pl_rev_enabled=True,
+                  ba_brk_enabled=True, ba_brk_ask_enabled=True, ba_brk_bid_enabled=False),
     # MNQ: 1-min ORB. Sweep (Apr–Aug 2026, 82 sessions):
     #   entry=close-break, stop=opposite-ORB capped at $500, target=1×width,
     #   width≤30bps, entry window=5min, hold=10min (exit ~9:40 ET).
@@ -668,7 +741,12 @@ INSTRUMENTS = [
                   slr_enabled=False,
                   wall_enabled=False,
                   pl_mom_enabled=False,
-                  pl_rev_enabled=True),
+                  pl_rev_enabled=True,
+                  # BA-BRK left off: MNQ wall-tracking data is too sparse to
+                  # validate a cascade signal (261 breakout events over 35
+                  # days vs. MES's 11,627 over 59 days; cascade_min>=3 gives
+                  # 0-2 signals total). Revisit once more DOM history exists.
+                  ba_brk_enabled=False),
 ]
 
 
@@ -984,6 +1062,42 @@ class ActiveWallBreakTrade:
 
 
 @dataclass
+class BaBrkSignal:
+    direction:      int      # +1 long (ask cascade), -1 short (bid cascade)
+    entry:          float
+    stop:           float
+    target:         float
+    side:           str      # "ask" | "bid"
+    cascade_len:    int
+    first_break_ts: datetime
+    last_break_ts:  datetime
+
+    def stop_pts(self):   return abs(self.stop   - self.entry)
+    def target_pts(self): return abs(self.target - self.entry)
+
+
+@dataclass
+class ActiveBaBrkTrade:
+    instrument:  BotInstrument
+    contract_id: str
+    sig:         BaBrkSignal
+    fired_at:    datetime
+    order_id:    int   | None = None
+    fill_price:  float | None = None
+
+    def target_price(self) -> float:
+        p = self.fill_price or self.sig.entry
+        return p + self.sig.direction * self.sig.target_pts()
+
+    def stop_price(self) -> float:
+        p = self.fill_price or self.sig.entry
+        return p - self.sig.direction * self.sig.stop_pts()
+
+    def expires_at(self) -> datetime:
+        return self.fired_at + timedelta(minutes=BA_BRK_HOLD_MIN)
+
+
+@dataclass
 class InstrumentState:
     instrument:   BotInstrument
     contract_id:  str = ""
@@ -1034,6 +1148,15 @@ class InstrumentState:
     wall_break_day:             "date | None"                 = None
     wall_break_consec_losses:   int                            = 0
     wall_break_halted_today:    bool                           = False
+    # BA-BRK state (reuses wall_tracker above; separate raw-event buffer since
+    # cascades are built from every breakout, not just the size-filtered ones
+    # wall_break qualifies).
+    recent_ba_brk_breakouts:    list                          = field(default_factory=list)
+    ba_brk_last_ts:             "datetime | None"             = None
+    active_ba_brk_trade:        "ActiveBaBrkTrade | None"     = None
+    ba_brk_day:                 "date | None"                 = None
+    ba_brk_consec_losses:       int                            = 0
+    ba_brk_halted_today:        bool                           = False
 
 
 # ── Trade logging ────────────────────────────────────────────────────────────
@@ -2730,6 +2853,306 @@ def _classify_wall_break_outcome(trade: ActiveWallBreakTrade,
     return "STOPPED", trade.stop_price()
 
 
+# ── BA-BRK (Bid/Ask Break — wall cascade) ───────────────────────────────────
+
+def _day_open_price(bars: list, now: datetime) -> float | None:
+    """First bar's open on `now`'s ET calendar day, or None if no bar yet today."""
+    today = now.astimezone(ET).date()
+    for bar in bars:
+        if bar.ts.astimezone(ET).date() == today:
+            return bar.open
+    return None
+
+
+def _detect_cascade_signal(events: list, side: str, cascade_min: int, max_gap_sec: int,
+                            after_ts: "datetime | None"):
+    """Scan time-ordered WallEvent breakouts for `side`, chaining consecutive
+    breakouts less than max_gap_sec apart. Returns (trigger_event,
+    cascade_start_ts, cascade_len) for the most recent point a fresh cascade
+    first reached cascade_min, considering only cascades whose trigger is
+    after `after_ts` (dedup) — or None. Mirrors backtest_wall_cascade.py's
+    detect_cascades() non-overlap chaining (one signal per cascade run)."""
+    same_side = sorted((e for e in events if e.side == side), key=lambda e: e.ts)
+
+    cascade_count = 0
+    cascade_start = None
+    last_ts = None
+    signaled_this_cascade = False
+    result = None
+    for e in same_side:
+        if last_ts is not None and (e.ts - last_ts).total_seconds() <= max_gap_sec:
+            cascade_count += 1
+        else:
+            cascade_count = 1
+            cascade_start = e.ts
+            signaled_this_cascade = False
+        last_ts = e.ts
+        if cascade_count >= cascade_min and not signaled_this_cascade:
+            signaled_this_cascade = True
+            if after_ts is None or e.ts > after_ts:
+                result = (e, cascade_start, cascade_count)
+    return result
+
+
+def evaluate_ba_brk(state, now: datetime) -> "BaBrkSignal | None":
+    """Find the most recent qualifying BA-BRK cascade (BA_BRK_CASCADE_MIN
+    consecutive same-side wall breakouts within BA_BRK_MAX_GAP_SEC) and
+    return a signal. Ask cascades are long, bid cascades are short — gated
+    independently via instrument.ba_brk_ask_enabled/ba_brk_bid_enabled.
+
+    Ask entries additionally require alignment with the day's move since the
+    RTH open (backtest: aligned EV=+1.52pt/trade vs against EV=-1.21pt/trade
+    — a hard filter, not a preference). Bid has no validated filter yet
+    (sample too thin); bid is disabled by default until that changes."""
+    if not state.recent_ba_brk_breakouts:
+        return None
+    with state.dom._lock:
+        best_bid = state.dom.best_bid
+        best_ask = state.dom.best_ask
+    if best_bid is None or best_ask is None:
+        return None
+
+    candidates = []
+    if state.instrument.ba_brk_ask_enabled:
+        r = _detect_cascade_signal(state.recent_ba_brk_breakouts, "ask",
+                                    BA_BRK_CASCADE_MIN, BA_BRK_MAX_GAP_SEC, state.ba_brk_last_ts)
+        if r:
+            candidates.append(("ask", *r))
+    if state.instrument.ba_brk_bid_enabled:
+        r = _detect_cascade_signal(state.recent_ba_brk_breakouts, "bid",
+                                    BA_BRK_CASCADE_MIN, BA_BRK_MAX_GAP_SEC, state.ba_brk_last_ts)
+        if r:
+            candidates.append(("bid", *r))
+    if not candidates:
+        return None
+
+    side, trigger, cascade_start, cascade_len = max(candidates, key=lambda c: c[1].ts)
+    if (now - trigger.ts).total_seconds() > BA_BRK_MAX_GAP_SEC + 15:
+        return None   # stale — cascade completed too long ago to act on
+
+    if side == "ask":
+        day_open = _day_open_price(state.vwaslr_bars, now)
+        if day_open is None or best_ask <= day_open:
+            return None   # not aligned with the day's move since open — hard filter
+        stop_pts = max(BA_BRK_STOP_MIN, min(state.sigma_pts, BA_BRK_STOP_MAX))
+        direction, entry = 1, best_ask
+        stop, target = entry - stop_pts, entry + BA_BRK_TARGET_PTS
+    else:
+        direction, entry = -1, best_bid
+        stop   = entry + BA_BRK_BID_STOP_PTS
+        target = entry - BA_BRK_BID_TARGET_PTS
+
+    return BaBrkSignal(
+        direction=direction, entry=entry, stop=stop, target=target,
+        side=side, cascade_len=cascade_len,
+        first_break_ts=cascade_start, last_break_ts=trigger.ts,
+    )
+
+
+def place_ba_brk_signal(client: TopstepClient, state,
+                         sig: BaBrkSignal, account_id: int,
+                         paper: bool) -> ActiveBaBrkTrade:
+    inst      = state.instrument
+    tick      = inst.tick_size
+    is_long   = sig.direction == 1
+    dir_label = "LONG" if is_long else "SHORT"
+    stop_mag   = max(1, round(sig.stop_pts()   / tick))
+    target_mag = max(1, round(sig.target_pts() / tick))
+    stop_ticks   = -stop_mag   if is_long else  stop_mag
+    target_ticks =  target_mag if is_long else -target_mag
+
+    trade = ActiveBaBrkTrade(
+        instrument=inst, contract_id=state.contract_id,
+        sig=sig, fired_at=sig.last_break_ts,
+    )
+
+    if paper:
+        log.info(
+            f"[PAPER] BA_BRK {inst.symbol} {dir_label}  side={sig.side}  "
+            f"cascade={sig.cascade_len}  entry≈{sig.entry:.2f}  "
+            f"stop={sig.stop:.2f} ({sig.stop_pts():.2f}pts)  "
+            f"target={sig.target:.2f} ({sig.target_pts():.2f}pts)"
+        )
+    else:
+        order_side = TopstepClient.BID if is_long else TopstepClient.ASK
+        resp = client.place_order(
+            account_id=account_id,
+            contract_id=state.contract_id,
+            side=order_side,
+            size=1,
+            order_type=TopstepClient.ORDER_MARKET,
+            stop_loss_ticks=stop_ticks,
+            take_profit_ticks=target_ticks,
+            custom_tag=f"babrk_{inst.symbol}_{sig.last_break_ts.strftime('%Y%m%d%H%M%S')}_{random.randint(100,999)}",
+        )
+        trade.order_id = resp.get("orderId")
+        log.info(
+            f"BA_BRK ORDER  {inst.symbol} {dir_label}  side={sig.side}  "
+            f"cascade={sig.cascade_len}  order_id={trade.order_id}  "
+            f"entry≈{sig.entry:.2f}  stop={stop_ticks}t  target={target_ticks}t"
+        )
+
+    state.active_ba_brk_trade = trade
+    state.ba_brk_last_ts      = sig.last_break_ts
+    return trade
+
+
+def handle_active_ba_brk_trade(client: TopstepClient, state,
+                                account_id: int, now: datetime, paper: bool):
+    trade = state.active_ba_brk_trade
+
+    if paper:
+        if now >= trade.expires_at():
+            exit_price = (state.vwaslr_bars[-1].close if state.vwaslr_bars
+                          else trade.sig.entry)
+            pnl_pts = _log_ba_brk_trade(trade, "TIME EXIT (paper)", exit_price, now)
+            _update_ba_brk_streak(state, pnl_pts, now)
+            state.active_ba_brk_trade = None
+        return
+
+    try:
+        positions = client.get_open_positions(account_id)
+    except Exception as e:
+        log.warning(f"BA_BRK {trade.instrument.symbol}: could not fetch positions: {e}")
+        return
+
+    pos = next(
+        (p for p in positions if p.get("contractId") == trade.contract_id),
+        None,
+    )
+
+    if pos and trade.fill_price is None:
+        trade.fill_price = pos.get("averagePrice")
+        log.info(f"BA_BRK {trade.instrument.symbol} fill confirmed: {trade.fill_price:.2f}")
+        play_trade_sound()
+
+    if pos is None:
+        exit_price = _get_exit_price(client, account_id, trade.fired_at,
+                                     trade.contract_id, now)
+        if exit_price is not None:
+            d = trade.sig.direction
+            outcome = ("TARGET" if (d == 1 and exit_price >= trade.target_price()) or
+                                   (d == -1 and exit_price <= trade.target_price())
+                       else "STOPPED")
+        else:
+            classify_bars = state.pl_mom_5s_bars if state.pl_mom_5s_bars else state.vwaslr_bars
+            outcome, exit_price = _classify_ba_brk_outcome(trade, classify_bars)
+        pnl_pts = _log_ba_brk_trade(trade, outcome, exit_price, now)
+        _update_ba_brk_streak(state, pnl_pts, now)
+        state.active_ba_brk_trade = None
+        try:
+            n = client.cancel_all_orders(account_id)
+            if n:
+                log.info(f"BA_BRK {trade.instrument.symbol} {outcome}: cancelled {n} residual order(s)")
+        except Exception as e:
+            log.warning(f"BA_BRK {trade.instrument.symbol}: cancel_all_orders failed: {e}")
+        return
+
+    if now >= trade.expires_at():
+        log.info(f"BA_BRK {trade.instrument.symbol} max hold reached — closing")
+        try:
+            client.cancel_all_orders(account_id)
+        except Exception as e:
+            log.warning(f"BA_BRK {trade.instrument.symbol}: pre-close cancel_all failed: {e}")
+        try:
+            client.close_position(account_id, trade.contract_id)
+        except Exception as e:
+            log.error(f"BA_BRK {trade.instrument.symbol}: failed to close position: {e}")
+            return
+        exit_price = (state.vwaslr_bars[-1].close if state.vwaslr_bars
+                      else (trade.fill_price or trade.sig.entry))
+        pnl_pts = _log_ba_brk_trade(trade, "TIME EXIT", exit_price, now)
+        _update_ba_brk_streak(state, pnl_pts, now)
+        state.active_ba_brk_trade = None
+        try:
+            client.cancel_all_orders(account_id)
+        except Exception:
+            pass
+
+
+def _classify_ba_brk_outcome(trade: ActiveBaBrkTrade, bars: list) -> tuple[str, float]:
+    d = trade.sig.direction
+    for bar in bars:
+        if bar.ts <= trade.fired_at:
+            continue
+        if d == 1:
+            if bar.low  <= trade.stop_price():   return "STOPPED", trade.stop_price()
+            if bar.high >= trade.target_price():  return "TARGET",  trade.target_price()
+        else:
+            if bar.high >= trade.stop_price():   return "STOPPED", trade.stop_price()
+            if bar.low  <= trade.target_price():  return "TARGET",  trade.target_price()
+    last_close = bars[-1].close if bars else (trade.fill_price or trade.sig.entry)
+    if abs(last_close - trade.target_price()) <= abs(last_close - trade.stop_price()):
+        return "TARGET",  trade.target_price()
+    return "STOPPED", trade.stop_price()
+
+
+# ── BA-BRK log ───────────────────────────────────────────────────────────────
+
+def _ensure_ba_brk_log():
+    BA_BRK_LOG_PATH.parent.mkdir(exist_ok=True)
+    if not BA_BRK_LOG_PATH.exists():
+        with open(BA_BRK_LOG_PATH, "w", newline="") as f:
+            csv.DictWriter(f, fieldnames=BA_BRK_LOG_FIELDS).writeheader()
+
+
+def _log_ba_brk_trade(trade: ActiveBaBrkTrade, outcome: str,
+                       exit_price: float, now: datetime) -> float:
+    fill    = trade.fill_price or trade.sig.entry
+    pnl_pts = (exit_price - fill) * trade.sig.direction
+    dirn    = "LONG" if trade.sig.direction == 1 else "SHORT"
+    row = {
+        "fired_at":       trade.fired_at.isoformat(),
+        "resolved_at":    now.isoformat(),
+        "symbol":         trade.instrument.symbol,
+        "direction":      dirn,
+        "side":           trade.sig.side,
+        "est_entry":      round(trade.sig.entry, 4),
+        "fill_price":     round(fill, 4),
+        "cascade_len":    trade.sig.cascade_len,
+        "first_break_ts": trade.sig.first_break_ts.isoformat(),
+        "last_break_ts":  trade.sig.last_break_ts.isoformat(),
+        "stop":           round(trade.stop_price(), 4),
+        "target":         round(trade.target_price(), 4),
+        "outcome":        outcome,
+        "pnl_pts":        round(pnl_pts, 4),
+    }
+    with open(BA_BRK_LOG_PATH, "a", newline="") as f:
+        csv.DictWriter(f, fieldnames=BA_BRK_LOG_FIELDS).writerow(row)
+    log.info(
+        f"BA_BRK LOGGED  {trade.instrument.symbol} {dirn}  {outcome}  "
+        f"fill={fill:.2f}  exit={exit_price:.2f}  pnl={pnl_pts:+.2f}pts  "
+        f"side={trade.sig.side}  cascade={trade.sig.cascade_len}"
+    )
+    return pnl_pts
+
+
+def _ba_brk_can_trade(state, now: datetime) -> bool:
+    """False if this instrument has hit BA_BRK_MAX_CONSEC_LOSSES straight
+    BA-BRK losses so far today (ET calendar day)."""
+    today = now.astimezone(ET).date()
+    if state.ba_brk_day != today:
+        state.ba_brk_day           = today
+        state.ba_brk_consec_losses = 0
+        state.ba_brk_halted_today  = False
+    return not state.ba_brk_halted_today
+
+
+def _update_ba_brk_streak(state, pnl_pts: float, now: datetime):
+    _ba_brk_can_trade(state, now)   # ensure day rollover has run
+    if pnl_pts < 0:
+        state.ba_brk_consec_losses += 1
+    else:
+        state.ba_brk_consec_losses = 0
+    if (state.ba_brk_consec_losses >= BA_BRK_MAX_CONSEC_LOSSES
+            and not state.ba_brk_halted_today):
+        state.ba_brk_halted_today = True
+        log.info(
+            f"BA_BRK {state.instrument.symbol}: halting for the rest of "
+            f"the day after {state.ba_brk_consec_losses} consecutive losses"
+        )
+
+
 # ── PL_Mom ───────────────────────────────────────────────────────────────────
 
 def _ensure_pl_mom_log():
@@ -3842,7 +4265,7 @@ def handle_active_sunday_gap_trade(client: TopstepClient, state: InstrumentState
 
 # ── Main loop ────────────────────────────────────────────────────────────────
 
-KNOWN_STRATEGIES = {"csr", "orb", "vwaslr", "slr", "eve", "sun", "pl_mom", "pl_rev", "wall"}
+KNOWN_STRATEGIES = {"csr", "orb", "vwaslr", "slr", "eve", "sun", "pl_mom", "pl_rev", "wall", "ba_brk"}
 
 
 def _apply_strategy_filter(inst: BotInstrument, strategies: set[str]) -> BotInstrument:
@@ -3858,6 +4281,7 @@ def _apply_strategy_filter(inst: BotInstrument, strategies: set[str]) -> BotInst
     if "pl_mom" not in strategies: overrides["pl_mom_enabled"]  = False
     if "pl_rev" not in strategies: overrides["pl_rev_enabled"]  = False
     if "wall"   not in strategies: overrides["wall_enabled"]    = False
+    if "ba_brk" not in strategies: overrides["ba_brk_enabled"]  = False
     return replace(inst, **overrides) if overrides else inst
 
 
@@ -3936,6 +4360,7 @@ def run(account_id: int | None, paper: bool, strategies: set[str] | None = None)
     _ensure_pl_mom_log()
     _ensure_pl_rev_log()
     _ensure_wall_break_log()
+    _ensure_ba_brk_log()
     _ensure_dom_signal_log()
     for state in states:
         if state.instrument.sun_gap_enabled:
@@ -4009,6 +4434,14 @@ def run(account_id: int | None, paper: bool, strategies: set[str] | None = None)
                         e for e in state.recent_wall_breakouts
                         if e.ts >= prune_before
                     ]
+                    ba_brk_prune_before = now - timedelta(minutes=BA_BRK_BUFFER_MIN)
+                    for evt in _wt_events:
+                        if evt.event == "breakout":
+                            state.recent_ba_brk_breakouts.append(evt)
+                    state.recent_ba_brk_breakouts = [
+                        e for e in state.recent_ba_brk_breakouts
+                        if e.ts >= ba_brk_prune_before
+                    ]
 
                 if state.active_trade:
                     handle_active_trade(client, state, account_id, now, paper)
@@ -4030,6 +4463,9 @@ def run(account_id: int | None, paper: bool, strategies: set[str] | None = None)
 
                 if state.active_wall_break_trade:
                     handle_active_wall_break_trade(client, state, account_id, now, paper)
+
+                if state.active_ba_brk_trade:
+                    handle_active_ba_brk_trade(client, state, account_id, now, paper)
 
                 # PL_Mom: fetch 5s bars when trade active (needed for PL exit check)
                 if state.active_pl_mom_trade and state.instrument.pl_mom_enabled:
@@ -4055,7 +4491,8 @@ def run(account_id: int | None, paper: bool, strategies: set[str] | None = None)
                                and not state.active_pl_rev_trade
                                and not state.active_evening_trade
                                and not state.active_sunday_gap_trade
-                               and not state.active_wall_break_trade)
+                               and not state.active_wall_break_trade
+                               and not state.active_ba_brk_trade)
                 last_bar_ts = state.bars[-1].ts if state.bars else None
 
                 # Don't enter new trades after TopstepX daily cutoff (RTH only)
@@ -4180,6 +4617,16 @@ def run(account_id: int | None, paper: bool, strategies: set[str] | None = None)
                     if wb_sig:
                         place_wall_break_signal(client, state, wb_sig, account_id, paper)
 
+                # BA-BRK: 9:40-13:00 ET, wall-cascade signal (N consecutive same-side
+                # breakouts). Ask requires alignment with the day's move since open
+                # (enforced inside evaluate_ba_brk); bid disabled by default.
+                if (no_position and not past_cutoff and state.instrument.ba_brk_enabled
+                        and BA_BRK_TRADE_START <= now_et_hm < BA_BRK_TRADE_END
+                        and _ba_brk_can_trade(state, now)):
+                    bb_sig = evaluate_ba_brk(state, now)
+                    if bb_sig:
+                        place_ba_brk_signal(client, state, bb_sig, account_id, paper)
+
             except Exception as e:
                 log.error(f"{state.instrument.symbol}: {e}", exc_info=True)
 
@@ -4190,6 +4637,7 @@ def run(account_id: int | None, paper: bool, strategies: set[str] | None = None)
                 s.active_trade or s.active_orb_trade or s.active_vwaslr_trade
                 or s.active_slr_trade or s.active_pl_mom_trade or s.active_pl_rev_trade
                 or s.active_evening_trade or s.active_sunday_gap_trade or s.active_wall_break_trade
+                or s.active_ba_brk_trade
                 for s in states
             )
             last_bars = {s.instrument.symbol: (s.bars[-1].ts if s.bars else None) for s in states}
