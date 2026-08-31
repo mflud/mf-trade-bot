@@ -42,9 +42,10 @@ Logs: bot_trades.csv (CSR), orb_trades.csv, vwaslr_trades.csv,
                  AND aligned with the day's move since RTH open (hard filter)
             BID: coded but disabled by default — backtest negative on every
                  tested config; countertrend-fade variant unvalidated (thin sample)
-    Stop  : clamp(σ, 4-5pt)   Target: 12pt   Max hold: 15min
-    Backtest (logs/wall_events.csv, 2026-06-02..08-28, ask+aligned+9:40-13:00):
-      n=274  WR=48.9%  EV=+1.24pt/trade  ~9.5 trades/day
+    Stop  : 3.5pt   Target: 12pt   Max hold: 25min
+    Backtest (logs/wall_events.csv, 2026-06-02..08-28, ask+aligned+9:40-13:00,
+    one-position-at-a-time constraint modeled — see BA_BRK_* comment below):
+      n=120  WR=35.8%  EV=+1.26pt/trade  total=151.2pt  ~2.0 trades/day
     Not enabled for MNQ: DOM wall data too sparse to validate (261 events/35
     days vs. MES's 11,627/59 days).
 
@@ -258,22 +259,43 @@ WALL_BREAK_MAX_CONSEC_LOSSES = 2
 # best hours are 9:00-13:00 ET (EV +0.7 to +2.6pt/trade each), while 13:00+
 # degrades and 15:00 is sharply negative (-1.9pt/trade). Widening the window
 # to 9:40-13:00 (standard first-10min exclusion) nets MORE total profit than
-# the narrow 10:30-13:00 gate (n=274, EV=+1.24pt/trade, total=341pt) by
-# capturing the strong opening-hour trades. Without the alignment filter,
-# 10:30-13:00 was necessary to avoid the bad early/late trades; the filter
-# now does that job directly. Bid cascades were negative in every configuration tried, including
-# a "match the day's trend" filter (mirroring ask) and a wide stop/target/
-# hold grid — the one config that showed positive EV (countertrend fade,
-# tight stop/target, short hold) had only ~34 trades after a 125-combo
-# search, too thin to trust. Bid stays coded but disabled by default (see
+# the narrow 10:30-13:00 gate by capturing the strong opening-hour trades.
+# Without the alignment filter, 10:30-13:00 was necessary to avoid the bad
+# early/late trades; the filter now does that job directly. Bid cascades
+# were negative in every configuration tried, including a "match the day's
+# trend" filter (mirroring ask) and a wide stop/target/hold grid — the one
+# config that showed positive EV (countertrend fade, tight stop/target,
+# short hold) had only ~34 trades after a 125-combo search, too thin to
+# trust. Bid stays coded but disabled by default (see
 # BotInstrument.ba_brk_bid_enabled) until more data accumulates.
+#
+# Stop/target/hold were originally carried over unmodified from Wall Break
+# (4-5pt/12pt/15min) rather than tuned for the cascade signal specifically.
+# A dedicated sweep (2026-08-30) corrected this — but naive per-signal EV is
+# misleading here because the bot only holds one position at a time, and
+# cascades cluster in "staircase" runs where a later, better-confirmed signal
+# often fires while an earlier trade is still open. Once that single-position
+# constraint is modeled (skip a signal if the prior trade hasn't exited yet),
+# realistic trade count for 12pt/15min drops from 274 (unconstrained) to 126,
+# total 106.0pt. Under the same constraint, extending the hold to 25min and
+# tightening the stop to 3.5pt (target unchanged at 12pt) gives n=120,
+# WR=35.8%, EV=+1.26pt/trade, total=151.2pt — the best total profit of every
+# config tried (fixed target/hold grid, a trailing stop, and a
+# volatility-contraction exit all evaluated; see project memory). Also tried
+# extending target/hold far beyond this (up to 45pt/120min) — EV/trade rose
+# monotonically to +6.6pt with the naive per-signal count, but collapsed
+# back down once the single-position constraint was applied (fewer, not
+# more, total points) — a reminder that a monotonic-to-the-boundary sweep
+# result is a red flag, not a green light.
 BA_BRK_CASCADE_MIN        = 3      # consecutive same-side breakouts required
 BA_BRK_MAX_GAP_SEC        = 45     # max seconds between consecutive breakouts in a cascade
-BA_BRK_STOP_MIN           = 4.0
-BA_BRK_STOP_MAX           = 5.0
-# Actual stop = clamp(state.sigma_pts, BA_BRK_STOP_MIN, BA_BRK_STOP_MAX)
+BA_BRK_STOP_MIN           = 3.5
+BA_BRK_STOP_MAX           = 3.5
+# Actual stop = clamp(state.sigma_pts, BA_BRK_STOP_MIN, BA_BRK_STOP_MAX) — flat
+# 3.5pt for now (MIN==MAX); the sigma-adaptive range wasn't re-validated for
+# this signal, unlike Wall Break's 4-5pt clamp.
 BA_BRK_TARGET_PTS         = 12.0
-BA_BRK_HOLD_MIN           = 15
+BA_BRK_HOLD_MIN           = 25
 BA_BRK_TRADE_START        = (9, 40)    # ET — standard first-10min blackout; backtest shows
 BA_BRK_TRADE_END          = (13, 0)    # ET   9:40-13:00 beats the narrower 10:30-13:00 gate
                                         # once the alignment filter is applied (see above)

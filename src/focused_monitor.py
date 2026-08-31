@@ -171,9 +171,9 @@ class WallBreakSignal:
 # (see BA_BRK_* constants there for the backtest this is based on).
 BA_BRK_CASCADE_MIN = 3
 BA_BRK_MAX_GAP_SEC = 45
-BA_BRK_STOP_PTS    = 4.5
+BA_BRK_STOP_PTS    = 3.5
 BA_BRK_TARGET_PTS  = 12.0
-BA_BRK_HOLD_MIN    = 15
+BA_BRK_HOLD_MIN    = 25
 BA_BRK_BUFFER_MIN  = 5
 
 @dataclass
