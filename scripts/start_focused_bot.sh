@@ -8,7 +8,7 @@ REPO=/Users/marek/mf-trade-bot
 PIDFILE="$REPO/logs/trading_bot.pid"
 LOGFILE="$REPO/logs/focused_bot.log"
 PYTHON=/Library/Frameworks/Python.framework/Versions/3.12/bin/python3
-STRATEGIES="orb,ba_brk"  # 2026-08-29: focused on ORB + BA-BRK only for close monitoring
+STRATEGIES="orb,orb_cls,ba_brk,ba_rev"  # 2026-10-01: added ORB-cls (15:50 ET closing-range breakout, no cross-confirm)
 
 mkdir -p "$REPO/logs"
 

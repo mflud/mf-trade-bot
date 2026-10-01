@@ -36,6 +36,15 @@ Logs: bot_trades.csv (CSR), orb_trades.csv, vwaslr_trades.csv,
     MES: 9:30 bar close-break, both directions, no width filter,
          stop=ORB midpoint (half-range, ~2:1 R:R), target=1×width, hold 10min
          Backtest (84 sessions Apr–Aug 2026): WR 65.9%, PF 3.03 (1 contract)
+         NOTE (2026-09-03): this WR/PF didn't reproduce in a faithful live-
+         mirror backtest — got WR=36.8% on the same window. Unresolved.
+    Cross-confirmation (orb_cross_confirm=True on both, added 2026-09-03):
+         neither leg fires until the other's own ORB breaks the same
+         direction (each becomes a "candidate" and waits; an unconfirmed
+         candidate just expires quietly if the 5min entry window closes).
+         Backtest (103 days, src/backtest_orb_cross_confirm.py): same-
+         direction days combined +495.6pt (56 days) vs opposite-direction
+         -440.0pt (19 days) — a real, well-powered effect on both legs.
 
   BA-BRK (Bid/Ask Break — wall cascade) — MES only, 9:40–13:00 ET
     Entry : ASK: 3+ consecutive ask-wall breakouts within 45s of each other,
@@ -77,6 +86,7 @@ import time
 import threading
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
+from datetime import time as dtime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -109,6 +119,11 @@ SIGNAL_SIGMA  = 3.0
 MAX_SCALED    = 5.0    # ignore extreme event spikes
 VOL_RATIO_MIN = 1.5
 MAX_HOLD_MIN  = 25     # force-close after this many minutes
+
+# ORB-cls (closing range breakout) — see BotInstrument.orb_cls_* and
+# evaluate_orb_cls(). Range = the 15:50 ET 1-min bar.
+ORB_CLS_RANGE_START_MIN     = 15 * 60 + 50   # 15:50 ET
+ORB_CLS_SAFETY_DEADLINE_MIN = 16 * 60 + 8    # hard force-flat — 2min inside TopstepX's 16:10 ET cutoff
 POLL_SECONDS     = 5    # poll interval — idle polls are SQLite-only, API only on signal/active trade
 POLL_SECONDS_ORB = 5    # ORB window (9:30–10:30 ET) — same as default
 POLL_SECONDS_RTH = 5    # fast poll during RTH for PL_MOM entry detection (matches 5s bar cadence)
@@ -216,6 +231,7 @@ PL_MOM_LOG_PATH     = Path("logs/pl_mom_trades.csv")
 PL_REV_LOG_PATH     = Path("logs/pl_rev_trades.csv")
 WALL_BREAK_LOG_PATH = Path("logs/wall_break_trades.csv")
 BA_BRK_LOG_PATH      = Path("logs/ba_brk_trades.csv")
+BA_REV_LOG_PATH      = Path("logs/ba_rev_trades.csv")
 
 # ── DOM DB constants ──────────────────────────────────────────────────────────
 DOM_DB_PATH    = Path("data/dom.db")
@@ -301,12 +317,84 @@ BA_BRK_TRADE_END          = (13, 0)    # ET   9:40-13:00 beats the narrower 10:3
                                         # once the alignment filter is applied (see above)
 BA_BRK_BUFFER_MIN         = 5      # minutes of raw breakout events kept for cascade scanning
 BA_BRK_MAX_CONSEC_LOSSES  = 2
-# Countertrend bid ("BID_FADE") shadow params — logged only, never live-traded
-# until BotInstrument.ba_brk_bid_enabled is turned on; smaller/faster than
-# the ask side per the (thin, unvalidated) backtest signal.
-BA_BRK_BID_STOP_PTS       = 3.0
-BA_BRK_BID_TARGET_PTS     = 8.0
-BA_BRK_BID_HOLD_MIN       = 10
+# Bid side, mirrors ask's "aligned with the day's move since open" filter
+# (fires only when price is BELOW the day's 9:30 open — i.e. aligned with a
+# downtrend, not countertrend fade; a separate countertrend-fade idea was
+# tested and found clearly negative, see project memory). Re-tested 2026-09-05
+# with more down-day data (65 days): best cluster stop=4.0/target=18/hold=30,
+# n=133, EV=+0.65pt/trade, total=+86.5pt — encouraging but only the best of a
+# 180-combo grid search on ~130-170 trades, not yet independently re-confirmed
+# on a second data update. Enabled live anyway (2026-09-14, user's explicit
+# call) on the practice account specifically to gather more out-of-sample data.
+BA_BRK_BID_STOP_PTS       = 4.0
+BA_BRK_BID_TARGET_PTS     = 18.0
+BA_BRK_BID_HOLD_MIN       = 30
+
+# BA-REV ("Bid/Ask Reversal"): opposite premise from BA-BRK — instead of
+# betting a wall breaks (continuation), bet it HOLDS (reversal). A wall that
+# survives BA_REV_TEST_COUNT touches without breaking is a rejection; enter
+# counter-wall (short on an ask-wall rejection, long on a bid-wall rejection).
+#
+# REDESIGNED 2026-09-15 (superseded the original pre-market overnight/prev-day
+# range gate — see project_ba_rev_strategy memory for that version's history).
+# Mechanics, backtested in src/backtest_wall_reject_trade.py:
+#   1. REFERENCE window BA_REV_REF_START (07:00 ET) -> BA_REV_LOCK_HM (10:30 ET):
+#      pure price data (high/low from bars.db) to establish a reference range.
+#      Never traded.
+#   2. Trading starts at BA_REV_LOCK_HM (10:30 ET), once the reference locks:
+#      only trade if price has stayed within [ref_low, ref_high] (the
+#      07:00-10:30 reference) since 10:30 ET — i.e. today hasn't broken out of
+#      its early range. One breakout (any bar's high/low outside the
+#      reference) permanently disables BA-REV for the rest of that day.
+# The reference-window length itself was swept 07:00 through 00:00 ET;  07:00
+# is a genuine interior optimum (pushing earlier degrades again), not a
+# boundary artifact.
+#
+# DROPPED THE PRE-10:30 FREE-TRADING WINDOW (2026-09-15, same day): originally
+# BA-REV also traded 09:40-10:30 ET unconditionally (no containment check yet
+# possible — the reference isn't locked until 10:30). Splitting the backtest
+# by window exposed that the free-window trades were a net LOSER on their own
+# (-27.4pt, n=321) while the contained (10:30+) trades carried the entire
+# edge (+203.4pt, n=344, top5_share=15%). Confirmed with a full apples-to-
+# apples one-position-at-a-time sim (not just isolated subsets, since an
+# early free-window trade can block a later, better contained-window signal):
+# dropping the free window entirely — trading starts at 10:30 ET, nothing
+# before — roughly halves trade count (652->344) but EV/trade more than
+# doubles (+0.285->+0.591pt/trade) and total profit still comes out higher
+# (186.0->203.4pt) at equal robustness. Net win on every axis except raw
+# trade count, which doesn't matter. BA_REV_TRADE_START == BA_REV_LOCK_HM now.
+# Result at the raw backtest optimum (N=3, stop=1.0pt, target=6.0pt,
+# hold=30min, realistic one-position-at-a-time, Apr-Sep 2026): n=834,
+# WR=18.0%, EV=+0.254pt/trade, total=+211.6pt, top5_share=14% (not
+# tail-driven) — best total-profit config across every variant tested
+# (pre-market gate, no gate, 9:30- vs 9:40-start, reference-window sweep).
+#
+# SHIPPED WIDER (2026-09-15, user's call before first live run): a 1.0pt stop
+# gets hit 82% of the time in the backtest — and entries are ORDER_MARKET
+# (crosses the spread) with the stop itself placed as an ORDER_STOP bracket
+# (not guaranteed — becomes a market order on trigger), so real fills can slip
+# ~1 tick on entry and ~1 tick on the stop, neither modeled in the backtest.
+# That's up to ~0.5pt of unmodeled friction against a nominal 1.0pt stop —
+# too large a fraction to trust blindly on the first live run. Stepped up to
+# stop=2.0pt/target=6.0pt/hold=60min instead: n=652, WR=28.7%, stopped=71.3%
+# (vs 82.0% at 1.0pt), EV=+0.285pt/trade (actually higher per-trade than
+# 1.0pt), total=+186.0pt, top5_share=16% — nearly the same edge, meaningfully
+# less exposed to stop-side slippage. Total is lower only because the longer
+# hold blocks more of the day per trade, not because the per-trade edge is
+# worse. Revisit once real fill data shows how much the 1.0pt config actually
+# would have slipped in practice.
+BA_REV_TEST_COUNT       = 3      # wall must survive exactly this many tests to fire
+BA_REV_STOP_PTS         = 2.0
+BA_REV_TARGET_PTS       = 6.0
+BA_REV_HOLD_MIN         = 60
+BA_REV_REF_START        = (7, 0)     # ET — reference window start (price data only, never traded)
+BA_REV_LOCK_HM          = (10, 30)   # ET — reference locks; containment check begins
+BA_REV_TRADE_START      = BA_REV_LOCK_HM   # trading starts once the reference locks — no free window
+BA_REV_TRADE_END        = (16, 0)    # ET
+BA_REV_SIGNAL_STALE_SEC = 60     # ignore a qualifying test event older than this
+BA_REV_BUFFER_MIN       = 3      # minutes of raw test events kept for signal scanning
+BA_REV_MAX_CONSEC_LOSSES = 2
+BA_REV_RANGE_LOOKBACK_BARS = 2500   # ~41hrs of 1-min bars; comfortably covers the reference window
 
 SLR_LOG_FIELDS = [
     "fired_at", "resolved_at", "symbol", "direction",
@@ -361,6 +449,11 @@ BA_BRK_LOG_FIELDS = [
     "fired_at", "resolved_at", "symbol", "direction", "side",
     "est_entry", "fill_price", "cascade_len", "first_break_ts", "last_break_ts",
     "stop", "target", "outcome", "pnl_pts",
+]
+BA_REV_LOG_FIELDS = [
+    "fired_at", "resolved_at", "symbol", "direction", "side",
+    "test_count", "wall_price", "ref_high", "ref_low",
+    "est_entry", "fill_price", "stop", "target", "outcome", "pnl_pts",
 ]
 
 log = logging.getLogger("bot")
@@ -673,6 +766,12 @@ class BotInstrument:
     ba_brk_enabled:     bool = False
     ba_brk_ask_enabled: bool = True
     ba_brk_bid_enabled: bool = False
+    # BA-REV: wall-rejection reversal signal (opposite premise from BA-BRK —
+    # bet the wall holds, not breaks). Gated on a quiet pre-market range; see
+    # BA_REV_* constants above.
+    ba_rev_enabled:     bool = False
+    ba_rev_ask_enabled: bool = True
+    ba_rev_bid_enabled: bool = True
     # Dynamic CSR window: list of (gk_ann_vol_upper_bound, mom_bars)
     csr_vol_windows: list = field(default_factory=lambda: [(1.0, 8)])
     # Per-instrument blackout windows: (start_h, start_m, end_h, end_m, conditional)
@@ -694,6 +793,24 @@ class BotInstrument:
     orb_full_range_stop:  bool  = False  # if True, stop at opposite ORB edge; default = half-range
     orb_hold_min:         int   = MAX_HOLD_MIN  # force-exit after this many minutes (per-instrument)
     orb_max_loss_dollars: float = 0.0   # cap stop distance: 0 = no cap
+    # Cross-confirmation: require MES and MNQ's own ORB breakouts to agree in
+    # direction before either one actually fires. Backtest (2026-09-03,
+    # src/backtest_orb_cross_confirm.py, 103 days): same-direction days
+    # combined +495.6pt (56 days) vs opposite-direction -440.0pt (19 days).
+    # Both legs must have this enabled to work (each checks the other).
+    orb_cross_confirm:    bool  = False
+    # ORB-cls (closing range breakout): range = the 15:50 ET 1-min bar instead
+    # of the 9:30 open — price whips around just before the 16:00 ET cash
+    # close similarly to just after the open. Backtested 2026-10-01
+    # (src/backtest_orb_cls.py, walk-forward validated) — close-break entry,
+    # midpoint stop, both directions, no width filter. Deliberately no
+    # cross-confirmation: src/backtest_orb_cls_cross_confirm.py found
+    # requiring MES/MNQ agreement HURTS here (opposite of morning ORB) —
+    # trades independently. See project memory project_orb_cls_strategy.
+    orb_cls_enabled:          bool  = False
+    orb_cls_target_mult:      float = 1.0
+    orb_cls_entry_window_min: int   = 5
+    orb_cls_hold_min:         int   = 15
     # VWASLR: 0 = disabled. n = look-back bars; threshold = signal level in σ/bar units.
     # vwaslr_start: earliest (hour, minute) ET for VWASLR signals (default 9:30 RTH open).
     vwaslr_n:         int   = 0
@@ -727,6 +844,9 @@ INSTRUMENTS = [
     #   entry window=5min, hold=10min, both directions.
     #   WR=65.9% PF=3.03 $1,325 (1 contract). Width filter makes no difference.
     #   Midpoint stop outperforms far_side for MES (better R:R at ~2:1).
+    #   NOTE (2026-09-03): this WR/PF didn't reproduce in a faithful live-mirror
+    #   backtest (src/backtest_orb_cross_confirm.py) — got WR=36.8% on the same
+    #   window. Unresolved; see project memory. Treat the WR/PF above with caution.
     BotInstrument("MES", "MES", tick_size=0.25, point_value=5.00,
                   csr_vol_windows=[(0.08, 4), (1.0, 8)],
                   blackout_windows=[
@@ -738,13 +858,24 @@ INSTRUMENTS = [
                   orb_target_mult=1.0,        orb_gap_fade_long=False,  # both directions
                   orb_full_range_stop=False,  orb_hold_min=10,          # midpoint stop, exit ~9:41 ET
                   orb_max_loss_dollars=0,                               # no dollar cap
+                  orb_cross_confirm=True,    # only fire once MNQ's own ORB agrees in direction
+                  # ORB-cls: close-break, midpoint stop, 3.25x target, 5-min
+                  # entry window (15:51-15:55 ET), 15-min hold. Walk-forward
+                  # test PF=1.44 (+$106, Aug13-Sep30 2026 holdout). No cross-confirm.
+                  # Worst-case entry (15:55) + 15min hold lands exactly on
+                  # TopstepX's 16:10 ET cutoff with zero margin — the
+                  # ORB_CLS_SAFETY_DEADLINE_MIN force-flat (16:08 ET) is the
+                  # real protection in that edge case, not the nominal hold.
+                  orb_cls_enabled=True,
+                  orb_cls_target_mult=3.25, orb_cls_entry_window_min=5, orb_cls_hold_min=15,
                   vwaslr_n=50, vwaslr_threshold=0.4, vwaslr_start=(9, 40),
                   slr_enabled=False,
                   eve_enabled=False,
                   sun_gap_enabled=False,
                   pl_mom_enabled=False,  # disabled: no base-rate edge (WR~35%); replaced by PL_REV
                   pl_rev_enabled=True,
-                  ba_brk_enabled=True, ba_brk_ask_enabled=True, ba_brk_bid_enabled=False),
+                  ba_brk_enabled=True, ba_brk_ask_enabled=True, ba_brk_bid_enabled=True,
+                  ba_rev_enabled=True, ba_rev_ask_enabled=True, ba_rev_bid_enabled=True),
     # MNQ: 1-min ORB. Sweep (Apr–Aug 2026, 82 sessions):
     #   entry=close-break, stop=opposite-ORB capped at $500, target=1×width,
     #   width≤30bps, entry window=5min, hold=10min (exit ~9:40 ET).
@@ -759,6 +890,15 @@ INSTRUMENTS = [
                   orb_target_mult=1.0,       orb_gap_fade_long=False,  # both directions
                   orb_full_range_stop=True,  orb_hold_min=10,          # exit ~9:40 ET
                   orb_max_loss_dollars=500,                            # $500 stop cap
+                  orb_cross_confirm=True,    # only fire once MES's own ORB agrees in direction
+                  # ORB-cls: close-break, midpoint stop, 3.25x target, 3-min
+                  # entry window (15:51-15:54 ET), 15-min hold — shorter window
+                  # than MES; walk-forward showed 5-min overfit for MNQ (test
+                  # PF~1.0) while 3-min held up (test PF=1.28, +$107). No
+                  # cross-confirm. Worst-case exit ~16:08 ET, 2min inside the
+                  # TopstepX 16:10 ET flat-by cutoff.
+                  orb_cls_enabled=True,
+                  orb_cls_target_mult=3.25, orb_cls_entry_window_min=3, orb_cls_hold_min=15,
                   vwaslr_n=0,
                   slr_enabled=False,
                   wall_enabled=False,
@@ -768,7 +908,10 @@ INSTRUMENTS = [
                   # validate a cascade signal (261 breakout events over 35
                   # days vs. MES's 11,627 over 59 days; cascade_min>=3 gives
                   # 0-2 signals total). Revisit once more DOM history exists.
-                  ba_brk_enabled=False),
+                  ba_brk_enabled=False,
+                  # BA-REV also left off for the same reason — the backtest
+                  # (src/backtest_wall_reject_trade.py) only used MES data.
+                  ba_rev_enabled=False),
 ]
 
 
@@ -843,6 +986,23 @@ class OrbState:
     prior_rth_close: float = 0.0   # last RTH close of prior session (for gap-fade filter)
     orb_930_open:    float = 0.0   # 9:30 first-bar open price (for gap detection)
     is_gap_down:     bool  = False  # 9:30 open < prior_rth_close → qualify for gap-fade-long
+    # Cross-confirmation: this instrument's own qualifying breakout direction,
+    # set the first time price closes beyond the ORB range in the entry
+    # window — independent of whether a trade has actually fired yet. The
+    # OTHER instrument's evaluate_orb() reads this to confirm/deny its own
+    # candidate. Reset each session alongside the other fields above.
+    candidate_direction: int = 0   # 0 = none yet, +1 = long candidate, -1 = short candidate
+
+
+@dataclass
+class OrbClsState:
+    """Session state for ORB-cls (closing range breakout, 15:50 ET range).
+    Deliberately no candidate_direction/cross-confirm field — see BotInstrument.orb_cls_*."""
+    session_date: date | None = None
+    range_high:   float = 0.0
+    range_low:    float = 0.0
+    range_seen:   bool  = False   # the 15:50 ET range bar has been captured
+    fired:        bool  = False   # one trade max per session (mirrors orb.morning_fired)
 
 
 @dataclass
@@ -1093,6 +1253,7 @@ class BaBrkSignal:
     cascade_len:    int
     first_break_ts: datetime
     last_break_ts:  datetime
+    hold_min:       int = BA_BRK_HOLD_MIN   # per-side hold (bid uses a longer hold — see evaluate_ba_brk)
 
     def stop_pts(self):   return abs(self.stop   - self.entry)
     def target_pts(self): return abs(self.target - self.entry)
@@ -1116,7 +1277,45 @@ class ActiveBaBrkTrade:
         return p - self.sig.direction * self.sig.stop_pts()
 
     def expires_at(self) -> datetime:
-        return self.fired_at + timedelta(minutes=BA_BRK_HOLD_MIN)
+        return self.fired_at + timedelta(minutes=self.sig.hold_min)
+
+
+@dataclass
+class BaRevSignal:
+    direction:   int      # +1 long (bid-wall rejection), -1 short (ask-wall rejection)
+    entry:       float
+    stop:        float
+    target:      float
+    side:        str      # "ask" | "bid" — which wall rejected
+    test_count:  int
+    wall_price:  float
+    trigger_ts:  datetime
+    ref_high:    "float | None"
+    ref_low:     "float | None"
+
+    def stop_pts(self):   return abs(self.stop   - self.entry)
+    def target_pts(self): return abs(self.target - self.entry)
+
+
+@dataclass
+class ActiveBaRevTrade:
+    instrument:  BotInstrument
+    contract_id: str
+    sig:         BaRevSignal
+    fired_at:    datetime
+    order_id:    int   | None = None
+    fill_price:  float | None = None
+
+    def target_price(self) -> float:
+        p = self.fill_price or self.sig.entry
+        return p + self.sig.direction * self.sig.target_pts()
+
+    def stop_price(self) -> float:
+        p = self.fill_price or self.sig.entry
+        return p - self.sig.direction * self.sig.stop_pts()
+
+    def expires_at(self) -> datetime:
+        return self.fired_at + timedelta(minutes=BA_REV_HOLD_MIN)
 
 
 @dataclass
@@ -1132,9 +1331,11 @@ class InstrumentState:
     csr:                float = 0.0
     active_trade:         ActiveTrade | None = None
     active_orb_trade:     ActiveOrbTrade | None = None
+    active_orb_cls_trade: ActiveOrbTrade | None = None
     active_vwaslr_trade:  ActiveVwasrlTrade | None = None
     active_slr_trade:     ActiveSLRTrade | None = None
     orb:                  OrbState = field(default_factory=OrbState)
+    orb_cls:               OrbClsState = field(default_factory=OrbClsState)
     last_evaluated_ts:    datetime | None = None
     vwaslr_last_ts:       datetime | None = None
     vwaslr_fetch_min:     int = -1               # UTC minute of last vwaslr fetch (throttle)
@@ -1179,6 +1380,18 @@ class InstrumentState:
     ba_brk_day:                 "date | None"                 = None
     ba_brk_consec_losses:       int                            = 0
     ba_brk_halted_today:        bool                           = False
+    # BA-REV state (reuses wall_tracker above; buffers raw "test" events)
+    recent_ba_rev_tests:        list                          = field(default_factory=list)
+    ba_rev_last_ts:             "datetime | None"             = None
+    active_ba_rev_trade:        "ActiveBaRevTrade | None"     = None
+    ba_rev_day:                 "date | None"                 = None
+    ba_rev_consec_losses:       int                            = 0
+    ba_rev_halted_today:        bool                           = False
+    # Reference window (07:00-10:30 ET) + containment state, per ET calendar day
+    ba_rev_ref_day:              "date | None"                 = None
+    ba_rev_ref_high:             "float | None"                = None
+    ba_rev_ref_low:              "float | None"                = None
+    ba_rev_contained:            bool                           = True   # False = broke out since 10:30, disabled rest of day
 
 
 # ── Trade logging ────────────────────────────────────────────────────────────
@@ -1447,11 +1660,16 @@ def fetch_vwaslr_bars(client: TopstepClient, state: InstrumentState):
     elif not db_fresh:
         since = state.vwaslr_bars[-1].ts
         end   = datetime.now(timezone.utc)
+        # Size the catch-up fetch to the actual gap, not a fixed 10 bars —
+        # a fixed small limit only trickles in ~10 bars/poll after a long
+        # bars.db stall (e.g. an hour+), leaving a real gap in vwaslr_bars
+        # for many minutes instead of catching up in one shot.
+        gap_min = max(10, int((end - since).total_seconds() // 60) + 5)
         raw   = client.get_bars(
             contract_id=state.contract_id,
             start=since, end=end,
             unit=TopstepClient.MINUTE, unit_number=1,
-            limit=10,
+            limit=min(gap_min, 1000),
         )
         new_bars = [
             Bar(ts=datetime.fromisoformat(b["t"]),
@@ -1598,7 +1816,7 @@ def handle_active_trade(client: TopstepClient, state: InstrumentState,
                     f"trail={CSR_TRAIL_SIGMA}σ={trail_dist:.2f}pts"
                 )
                 try:
-                    n = client.cancel_all_orders(account_id)
+                    n = client.cancel_orders_for_contract(account_id, trade.contract_id)
                     if n:
                         log.info(f"{trade.instrument.symbol}: cancelled {n} bracket(s) before trail close")
                 except Exception as e:
@@ -1620,7 +1838,7 @@ def handle_active_trade(client: TopstepClient, state: InstrumentState,
                 _log_trade(trade, "TRAIL STOP", actual_exit, now)
                 state.active_trade = None
                 try:
-                    client.cancel_all_orders(account_id)
+                    client.cancel_orders_for_contract(account_id, trade.contract_id)
                 except Exception:
                     pass
                 return
@@ -1643,7 +1861,7 @@ def handle_active_trade(client: TopstepClient, state: InstrumentState,
         _log_trade(trade, outcome, exit_price, now)
         state.active_trade = None
         try:
-            n_cancelled = client.cancel_all_orders(account_id)
+            n_cancelled = client.cancel_orders_for_contract(account_id, trade.contract_id)
             if n_cancelled:
                 log.info(f"{trade.instrument.symbol} {outcome}: cancelled {n_cancelled} residual order(s)")
         except Exception as e:
@@ -1657,7 +1875,7 @@ def handle_active_trade(client: TopstepClient, state: InstrumentState,
         # market order and can attach fresh brackets to it, or leave orphan OCO legs
         # that later fill and open an unwanted opposing position.
         try:
-            n_cancelled = client.cancel_all_orders(account_id)
+            n_cancelled = client.cancel_orders_for_contract(account_id, trade.contract_id)
             if n_cancelled:
                 log.info(f"{trade.instrument.symbol}: cancelled {n_cancelled} bracket order(s) before time exit")
         except Exception as e:
@@ -1667,12 +1885,16 @@ def handle_active_trade(client: TopstepClient, state: InstrumentState,
         except Exception as e:
             log.error(f"Failed to close position for {trade.instrument.symbol}: {e}")
             return
-        exit_price = state.bars[-1].close if state.bars else (trade.fill_price or trade.est_entry)
+        actual_exit = _get_exit_price(client, account_id, trade.fired_at,
+                                      trade.contract_id, now,
+                                      entry_price=trade.fill_price or trade.est_entry)
+        exit_price = actual_exit if actual_exit is not None else (
+            state.bars[-1].close if state.bars else (trade.fill_price or trade.est_entry))
         _log_trade(trade, "TIME EXIT", exit_price, now)
         state.active_trade = None
         # Cancel again in case the closing order itself spawned new brackets
         try:
-            n_cancelled = client.cancel_all_orders(account_id)
+            n_cancelled = client.cancel_orders_for_contract(account_id, trade.contract_id)
             if n_cancelled:
                 log.info(f"{trade.instrument.symbol} TIME EXIT: cancelled {n_cancelled} residual order(s) after close")
         except Exception as e:
@@ -1759,7 +1981,7 @@ def _orb_window(bar_et: datetime) -> str | None:
     return None
 
 
-def evaluate_orb(state: InstrumentState) -> OrbSignal | None:
+def evaluate_orb(state: InstrumentState, all_states: "list|None" = None) -> OrbSignal | None:
     """Update OrbState incrementally; return a new OrbSignal on qualifying breakout.
 
     Supports two bar-resolution modes:
@@ -1770,6 +1992,17 @@ def evaluate_orb(state: InstrumentState) -> OrbSignal | None:
     Stop: half ORB range by default; opposite ORB edge when orb_full_range_stop=True.
     Target: orb_width × orb_target_mult.
     Gap-fade-long filter: if orb_gap_fade_long, only LONG on gap-down sessions.
+
+    Cross-confirmation (instrument.orb_cross_confirm): when this instrument's
+    own ORB breaks, it's recorded as a candidate (orb.candidate_direction) but
+    doesn't fire immediately — it only fires once the other instrument in
+    `all_states` has registered its own qualifying candidate in the same
+    direction (checked here every poll until the entry window closes, at
+    which point an unconfirmed candidate just expires unfired). Entry price
+    is priced off the current bar at confirmation time, not the original
+    candidate bar, since that's what an order placed now would actually fill
+    near. Requires `all_states` — falls back to firing unconfirmed if the
+    counterpart instrument can't be found.
     """
     inst = state.instrument
 
@@ -1808,6 +2041,7 @@ def evaluate_orb(state: InstrumentState) -> OrbSignal | None:
         orb.prior_rth_close = prev_rth_close
         orb.orb_930_open    = 0.0
         orb.is_gap_down     = False
+        orb.candidate_direction = 0
 
     current_min   = bar_et.hour * 60 + bar_et.minute
     orb_start_min = 9 * 60 + 30
@@ -1866,45 +2100,137 @@ def evaluate_orb(state: InstrumentState) -> OrbSignal | None:
             return entry - direction * max_pts
         return raw_stop
 
-    # ── LONG breakout ─────────────────────────────────────────────────────────
+    def _build_signal(direction: int, entry: float) -> OrbSignal:
+        if inst.orb_full_range_stop:
+            stop = orb.orb_low if direction == 1 else orb.orb_high
+        else:
+            stop = entry - direction * orb_width / 2.0  # half-range (ORB midpoint)
+        stop = _apply_stop_cap(stop, entry, direction)
+        return OrbSignal(
+            entry=entry, target=entry + direction * target_pts, stop=stop,
+            orb_high=orb.orb_high, orb_low=orb.orb_low,
+            sigma_pts=state.sigma_pts, window="Morning", bar_ts=bar.ts,
+            direction=direction,
+        )
+
+    def _other_confirm_state():
+        if not all_states:
+            return None
+        return next((s for s in all_states
+                     if s is not state and s.instrument.orb_enabled
+                     and s.instrument.orb_cross_confirm), None)
+
+    # ── Determine this bar's candidate direction, if any ──────────────────────
+    bar_direction = 0
     if bar.close > orb.orb_high:
-        if inst.orb_gap_fade_long and not orb.is_gap_down:
-            return None  # gap-fade-long: only LONG on gap-down sessions
-        entry    = bar.close
-        if inst.orb_full_range_stop:
-            stop = orb.orb_low              # opposite side of ORB range
-        else:
-            stop = entry - orb_width / 2.0  # half-range (ORB midpoint)
-        stop = _apply_stop_cap(stop, entry, 1)
-        sig = OrbSignal(
-            entry=entry, target=entry + target_pts, stop=stop,
-            orb_high=orb.orb_high, orb_low=orb.orb_low,
-            sigma_pts=state.sigma_pts, window="Morning", bar_ts=bar.ts,
-            direction=1,
-        )
+        if not (inst.orb_gap_fade_long and not orb.is_gap_down):
+            bar_direction = 1        # gap-fade-long: only LONG on gap-down sessions
+    elif bar.close < orb.orb_low:
+        if not inst.orb_gap_fade_long:
+            bar_direction = -1       # gap-fade-long mode is LONG-only
+
+    if not inst.orb_cross_confirm:
+        if bar_direction != 0:
+            sig = _build_signal(bar_direction, bar.close)
+            orb.morning_fired = True
+            return sig
+        return None
+
+    # ── Cross-confirmation path ────────────────────────────────────────────────
+    # Record (but don't fire on) this instrument's own candidate breakout;
+    # only fire once the other instrument's own candidate agrees in direction.
+    if orb.candidate_direction == 0 and bar_direction != 0:
+        orb.candidate_direction = bar_direction
+        log.info(f"ORB {inst.symbol}: candidate "
+                 f"{'LONG' if bar_direction == 1 else 'SHORT'} at {bar.close:.2f} "
+                 f"— waiting for cross-confirmation")
+
+    if orb.candidate_direction == 0:
+        return None
+
+    other = _other_confirm_state()
+    if other is None:
+        # Counterpart not configured/found — fall back to firing unconfirmed
+        # rather than blocking forever on a feature that can't apply.
+        sig = _build_signal(orb.candidate_direction, bar.close)
         orb.morning_fired = True
         return sig
 
-    # ── SHORT breakout — only when gap-fade-long is disabled ─────────────────
-    if bar.close < orb.orb_low:
-        if inst.orb_gap_fade_long:
-            return None  # gap-fade-long mode is LONG-only
-        entry    = bar.close
-        if inst.orb_full_range_stop:
-            stop = orb.orb_high             # opposite side of ORB range
-        else:
-            stop = entry + orb_width / 2.0  # half-range
-        stop = _apply_stop_cap(stop, entry, -1)
-        sig = OrbSignal(
-            entry=entry, target=entry - target_pts, stop=stop,
-            orb_high=orb.orb_high, orb_low=orb.orb_low,
-            sigma_pts=state.sigma_pts, window="Morning", bar_ts=bar.ts,
-            direction=-1,
-        )
+    if other.orb.candidate_direction == orb.candidate_direction:
+        sig = _build_signal(orb.candidate_direction, bar.close)
         orb.morning_fired = True
+        log.info(f"ORB {inst.symbol}: cross-confirmed by {other.instrument.symbol} — firing "
+                 f"{'LONG' if sig.direction == 1 else 'SHORT'} at {sig.entry:.2f}")
         return sig
 
-    return None
+    return None  # not yet confirmed (or contradicted) — keep waiting until the window closes
+
+
+def evaluate_orb_cls(state: InstrumentState) -> OrbSignal | None:
+    """ORB-cls: range = the 15:50 ET 1-min bar (vs. 9:30 for the morning
+    ORB). Close-break entry, midpoint stop, one trade max per session — no
+    cross-confirmation (see BotInstrument.orb_cls_enabled docstring).
+    Requires 1-min bars (state.vwaslr_bars), same source as the morning
+    ORB's 1-min path.
+    """
+    inst = state.instrument
+    bar_list = state.vwaslr_bars
+    if not bar_list:
+        return None
+
+    bar    = bar_list[-1]
+    bar_et = bar.ts.astimezone(ET)
+    today  = bar_et.date()
+    ocls   = state.orb_cls
+
+    if ocls.session_date != today:
+        ocls.session_date = today
+        ocls.range_high   = 0.0
+        ocls.range_low    = 0.0
+        ocls.range_seen   = False
+        ocls.fired        = False
+
+    current_min = bar_et.hour * 60 + bar_et.minute
+
+    # ── Range bar: the 15:50 ET 1-min bar ──────────────────────────────────────
+    if current_min == ORB_CLS_RANGE_START_MIN and not ocls.range_seen:
+        ocls.range_high = bar.high
+        ocls.range_low  = bar.low
+        ocls.range_seen = True
+        return None
+
+    # ── Guards ────────────────────────────────────────────────────────────────
+    if not ocls.range_seen or ocls.fired:
+        return None
+    if current_min <= ORB_CLS_RANGE_START_MIN:
+        return None
+    if current_min > ORB_CLS_RANGE_START_MIN + inst.orb_cls_entry_window_min:
+        return None  # entry window closed — candidate expires unfired
+
+    width = ocls.range_high - ocls.range_low
+    if width <= 0:
+        return None
+    mid = (ocls.range_high + ocls.range_low) / 2.0
+
+    direction = 0
+    if bar.close > ocls.range_high:
+        direction = 1
+    elif bar.close < ocls.range_low:
+        direction = -1
+    if direction == 0:
+        return None
+
+    entry      = bar.close
+    target_pts = width * inst.orb_cls_target_mult
+    stop_pts   = (ocls.range_high - mid) if direction == 1 else (mid - ocls.range_low)
+
+    ocls.fired = True
+    return OrbSignal(
+        entry=entry, target=entry + direction * target_pts, stop=entry - direction * stop_pts,
+        orb_high=ocls.range_high, orb_low=ocls.range_low,
+        sigma_pts=state.sigma_pts, window="Closing", bar_ts=bar.ts,
+        direction=direction,
+    )
 
 
 # ── ORB order placement ───────────────────────────────────────────────────────
@@ -1960,6 +2286,65 @@ def place_orb_signal(client: TopstepClient, state: InstrumentState,
     return trade
 
 
+def place_orb_cls_signal(client: TopstepClient, state: InstrumentState,
+                         sig: OrbSignal, account_id: int, paper: bool) -> ActiveOrbTrade:
+    inst      = state.instrument
+    tick      = inst.tick_size
+    is_long   = sig.direction == 1
+    dir_label = "LONG" if is_long else "SHORT"
+    stop_mag   = max(1, round(sig.stop_pts()   / tick))
+    target_mag = max(1, round(sig.target_pts() / tick))
+    stop_ticks   = -stop_mag   if is_long else  stop_mag
+    target_ticks =  target_mag if is_long else -target_mag
+
+    trade = ActiveOrbTrade(
+        instrument=inst, contract_id=state.contract_id,
+        sig=sig, fired_at=sig.bar_ts,
+    )
+    # Hard safety cap: force-flat by ORB_CLS_SAFETY_DEADLINE_MIN ET regardless
+    # of the nominal hold — the entry window + hold can land right at (or, with
+    # any slop, past) TopstepX's 16:10 ET cutoff. See BotInstrument.orb_cls_*.
+    fired_et  = sig.bar_ts.astimezone(ET)
+    safety_dt = datetime.combine(
+        fired_et.date(),
+        dtime(ORB_CLS_SAFETY_DEADLINE_MIN // 60, ORB_CLS_SAFETY_DEADLINE_MIN % 60),
+        tzinfo=ET,
+    )
+    nominal_expiry = sig.bar_ts + timedelta(minutes=inst.orb_cls_hold_min)
+    trade.expires_at = min(nominal_expiry, safety_dt)
+
+    orb_width_pct = (sig.orb_high - sig.orb_low) / ((sig.orb_high + sig.orb_low) / 2) * 100
+    if paper:
+        log.info(
+            f"[PAPER] ORB_CLS {inst.symbol} {dir_label}  entry≈{sig.entry:.2f}  "
+            f"target={sig.target:.2f} ({sig.target_pts():.2f}pts)  "
+            f"stop={sig.stop:.2f} ({sig.stop_pts():.2f}pts)  "
+            f"range={sig.orb_low:.2f}–{sig.orb_high:.2f}  width={orb_width_pct:.2f}%  "
+            f"expires={trade.expires_at.astimezone(ET):%H:%M} ET"
+        )
+    else:
+        order_side = TopstepClient.BID if is_long else TopstepClient.ASK
+        resp = client.place_order(
+            account_id=account_id,
+            contract_id=state.contract_id,
+            side=order_side,
+            size=1,
+            order_type=TopstepClient.ORDER_MARKET,
+            stop_loss_ticks=stop_ticks,
+            take_profit_ticks=target_ticks,
+            custom_tag=f"orb_cls_{inst.symbol}_{sig.bar_ts.strftime('%Y%m%d%H%M%S')}_{random.randint(100,999)}",
+        )
+        trade.order_id = resp.get("orderId")
+        log.info(
+            f"ORB_CLS ORDER  {inst.symbol} {dir_label}  order_id={trade.order_id}  "
+            f"entry≈{sig.entry:.2f}  stop={stop_ticks}t  target={target_ticks}t  "
+            f"width={orb_width_pct:.2f}%  expires={trade.expires_at.astimezone(ET):%H:%M} ET"
+        )
+
+    state.active_orb_cls_trade = trade
+    return trade
+
+
 # ── ORB position monitoring ───────────────────────────────────────────────────
 
 def handle_active_orb_trade(client: TopstepClient, state: InstrumentState,
@@ -2002,7 +2387,7 @@ def handle_active_orb_trade(client: TopstepClient, state: InstrumentState,
         _log_orb_trade(trade, outcome, exit_price, now)
         state.active_orb_trade = None
         try:
-            n = client.cancel_all_orders(account_id)
+            n = client.cancel_orders_for_contract(account_id, trade.contract_id)
             if n:
                 log.info(f"ORB {trade.instrument.symbol} {outcome}: cancelled {n} residual order(s)")
         except Exception as e:
@@ -2012,7 +2397,7 @@ def handle_active_orb_trade(client: TopstepClient, state: InstrumentState,
     if now >= trade.expires_at:
         log.info(f"ORB {trade.instrument.symbol} max hold reached — closing")
         try:
-            client.cancel_all_orders(account_id)
+            client.cancel_orders_for_contract(account_id, trade.contract_id)
         except Exception as e:
             log.warning(f"ORB {trade.instrument.symbol}: pre-close cancel_all failed: {e}")
         try:
@@ -2020,11 +2405,90 @@ def handle_active_orb_trade(client: TopstepClient, state: InstrumentState,
         except Exception as e:
             log.error(f"ORB {trade.instrument.symbol}: failed to close position: {e}")
             return
-        exit_price = state.bars[-1].close if state.bars else (trade.fill_price or trade.sig.entry)
+        actual_exit = _get_exit_price(client, account_id, trade.fired_at,
+                                      trade.contract_id, now,
+                                      entry_price=trade.fill_price or trade.sig.entry)
+        exit_price = actual_exit if actual_exit is not None else (
+            state.bars[-1].close if state.bars else (trade.fill_price or trade.sig.entry))
         _log_orb_trade(trade, "TIME EXIT", exit_price, now)
         state.active_orb_trade = None
         try:
-            client.cancel_all_orders(account_id)
+            client.cancel_orders_for_contract(account_id, trade.contract_id)
+        except Exception:
+            pass
+
+
+def handle_active_orb_cls_trade(client: TopstepClient, state: InstrumentState,
+                                account_id: int, now: datetime, paper: bool):
+    """Mirrors handle_active_orb_trade. trade.expires_at already bakes in the
+    ORB_CLS_SAFETY_DEADLINE_MIN cap (set in place_orb_cls_signal), so the
+    `now >= trade.expires_at` check below force-flattens on time alone —
+    no separate wall-clock cutoff check needed here."""
+    trade = state.active_orb_cls_trade
+
+    if paper:
+        if now >= trade.expires_at:
+            exit_price = state.bars[-1].close if state.bars else trade.sig.entry
+            _log_orb_trade(trade, "TIME EXIT (paper)", exit_price, now)
+            state.active_orb_cls_trade = None
+        return
+
+    try:
+        positions = client.get_open_positions(account_id)
+    except Exception as e:
+        log.warning(f"ORB_CLS {trade.instrument.symbol}: could not fetch positions: {e}")
+        return
+
+    pos = next(
+        (p for p in positions if p.get("contractId") == trade.contract_id),
+        None,
+    )
+
+    if pos and trade.fill_price is None:
+        trade.fill_price = pos.get("averagePrice")
+        log.info(f"ORB_CLS {trade.instrument.symbol} fill confirmed: {trade.fill_price:.2f}")
+        play_trade_sound()
+
+    if pos is None:
+        exit_price = _get_exit_price(client, account_id, trade.fired_at,
+                                     trade.contract_id, now)
+        if exit_price is not None:
+            d = trade.sig.direction
+            outcome = ("TARGET" if (d == 1 and exit_price >= trade.target_price()) or
+                                   (d == -1 and exit_price <= trade.target_price())
+                       else "STOPPED")
+        else:
+            outcome, exit_price = _classify_orb_outcome(trade, state.bars)
+        _log_orb_trade(trade, outcome, exit_price, now)
+        state.active_orb_cls_trade = None
+        try:
+            n = client.cancel_orders_for_contract(account_id, trade.contract_id)
+            if n:
+                log.info(f"ORB_CLS {trade.instrument.symbol} {outcome}: cancelled {n} residual order(s)")
+        except Exception as e:
+            log.warning(f"ORB_CLS {trade.instrument.symbol}: cancel_all_orders failed: {e}")
+        return
+
+    if now >= trade.expires_at:
+        log.info(f"ORB_CLS {trade.instrument.symbol} max hold reached — closing")
+        try:
+            client.cancel_orders_for_contract(account_id, trade.contract_id)
+        except Exception as e:
+            log.warning(f"ORB_CLS {trade.instrument.symbol}: pre-close cancel_all failed: {e}")
+        try:
+            client.close_position(account_id, trade.contract_id)
+        except Exception as e:
+            log.error(f"ORB_CLS {trade.instrument.symbol}: failed to close position: {e}")
+            return
+        actual_exit = _get_exit_price(client, account_id, trade.fired_at,
+                                      trade.contract_id, now,
+                                      entry_price=trade.fill_price or trade.sig.entry)
+        exit_price = actual_exit if actual_exit is not None else (
+            state.bars[-1].close if state.bars else (trade.fill_price or trade.sig.entry))
+        _log_orb_trade(trade, "TIME EXIT", exit_price, now)
+        state.active_orb_cls_trade = None
+        try:
+            client.cancel_orders_for_contract(account_id, trade.contract_id)
         except Exception:
             pass
 
@@ -2362,7 +2826,7 @@ def handle_active_vwaslr_trade(client: TopstepClient, state: InstrumentState,
             f"ema={ema:+.3f}  half_thr=±{half_thr:.2f}"
         )
         try:
-            n = client.cancel_all_orders(account_id)
+            n = client.cancel_orders_for_contract(account_id, trade.contract_id)
             if n:
                 log.info(f"VWASLR {trade.instrument.symbol}: cancelled {n} bracket(s) before signal exit")
         except Exception as e:
@@ -2378,7 +2842,7 @@ def handle_active_vwaslr_trade(client: TopstepClient, state: InstrumentState,
         state.active_vwaslr_trade = None
         state.vwaslr_wall_extended_until = None
         try:
-            client.cancel_all_orders(account_id)
+            client.cancel_orders_for_contract(account_id, trade.contract_id)
         except Exception:
             pass
         return
@@ -2397,7 +2861,7 @@ def handle_active_vwaslr_trade(client: TopstepClient, state: InstrumentState,
         state.active_vwaslr_trade = None
         state.vwaslr_wall_extended_until = None
         try:
-            n = client.cancel_all_orders(account_id)
+            n = client.cancel_orders_for_contract(account_id, trade.contract_id)
             if n:
                 log.info(f"VWASLR {trade.instrument.symbol} {outcome}: cancelled {n} residual order(s)")
         except Exception as e:
@@ -2407,7 +2871,7 @@ def handle_active_vwaslr_trade(client: TopstepClient, state: InstrumentState,
     if now >= trade.expires_at:
         log.info(f"VWASLR {trade.instrument.symbol} max hold reached — closing")
         try:
-            client.cancel_all_orders(account_id)
+            client.cancel_orders_for_contract(account_id, trade.contract_id)
         except Exception as e:
             log.warning(f"VWASLR {trade.instrument.symbol}: pre-close cancel_all failed: {e}")
         try:
@@ -2415,13 +2879,17 @@ def handle_active_vwaslr_trade(client: TopstepClient, state: InstrumentState,
         except Exception as e:
             log.error(f"VWASLR {trade.instrument.symbol}: failed to close position: {e}")
             return
-        exit_price = (state.vwaslr_bars[-1].close if state.vwaslr_bars
-                      else (trade.fill_price or trade.sig.entry))
+        actual_exit = _get_exit_price(client, account_id, trade.fired_at,
+                                      trade.contract_id, now,
+                                      entry_price=trade.fill_price or trade.sig.entry)
+        exit_price = actual_exit if actual_exit is not None else (
+            state.vwaslr_bars[-1].close if state.vwaslr_bars
+            else (trade.fill_price or trade.sig.entry))
         _log_vwaslr_trade(trade, "TIME EXIT", exit_price, now)
         state.active_vwaslr_trade = None
         state.vwaslr_wall_extended_until = None
         try:
-            client.cancel_all_orders(account_id)
+            client.cancel_orders_for_contract(account_id, trade.contract_id)
         except Exception:
             pass
 
@@ -2647,7 +3115,7 @@ def handle_active_slr_trade(client: TopstepClient, state: InstrumentState,
         _log_slr_trade(trade, outcome, exit_price, now)
         state.active_slr_trade = None
         try:
-            n = client.cancel_all_orders(account_id)
+            n = client.cancel_orders_for_contract(account_id, trade.contract_id)
             if n:
                 log.info(f"SLR {trade.instrument.symbol} {outcome}: cancelled {n} residual order(s)")
         except Exception as e:
@@ -2657,7 +3125,7 @@ def handle_active_slr_trade(client: TopstepClient, state: InstrumentState,
     if now >= trade.fired_at + timedelta(seconds=PL_MOM_MAX_HOLD_S):
         log.info(f"SLR {trade.instrument.symbol} max hold reached — closing")
         try:
-            client.cancel_all_orders(account_id)
+            client.cancel_orders_for_contract(account_id, trade.contract_id)
         except Exception as e:
             log.warning(f"SLR {trade.instrument.symbol}: pre-close cancel_all failed: {e}")
         try:
@@ -2665,12 +3133,16 @@ def handle_active_slr_trade(client: TopstepClient, state: InstrumentState,
         except Exception as e:
             log.error(f"SLR {trade.instrument.symbol}: failed to close position: {e}")
             return
-        exit_price = (state.vwaslr_bars[-1].close if state.vwaslr_bars
-                      else (trade.fill_price or trade.sig.entry))
+        actual_exit = _get_exit_price(client, account_id, trade.fired_at,
+                                      trade.contract_id, now,
+                                      entry_price=trade.fill_price or trade.sig.entry)
+        exit_price = actual_exit if actual_exit is not None else (
+            state.vwaslr_bars[-1].close if state.vwaslr_bars
+            else (trade.fill_price or trade.sig.entry))
         _log_slr_trade(trade, "TIME EXIT", exit_price, now)
         state.active_slr_trade = None
         try:
-            client.cancel_all_orders(account_id)
+            client.cancel_orders_for_contract(account_id, trade.contract_id)
         except Exception:
             pass
 
@@ -2828,7 +3300,7 @@ def handle_active_wall_break_trade(client: TopstepClient, state,
         _update_wall_break_streak(state, pnl_pts, now)
         state.active_wall_break_trade = None
         try:
-            n = client.cancel_all_orders(account_id)
+            n = client.cancel_orders_for_contract(account_id, trade.contract_id)
             if n:
                 log.info(f"WALL_BREAK {trade.instrument.symbol} {outcome}: cancelled {n} residual order(s)")
         except Exception as e:
@@ -2838,7 +3310,7 @@ def handle_active_wall_break_trade(client: TopstepClient, state,
     if now >= trade.expires_at():
         log.info(f"WALL_BREAK {trade.instrument.symbol} max hold reached — closing")
         try:
-            client.cancel_all_orders(account_id)
+            client.cancel_orders_for_contract(account_id, trade.contract_id)
         except Exception as e:
             log.warning(f"WALL_BREAK {trade.instrument.symbol}: pre-close cancel_all failed: {e}")
         try:
@@ -2846,13 +3318,17 @@ def handle_active_wall_break_trade(client: TopstepClient, state,
         except Exception as e:
             log.error(f"WALL_BREAK {trade.instrument.symbol}: failed to close position: {e}")
             return
-        exit_price = (state.vwaslr_bars[-1].close if state.vwaslr_bars
-                      else (trade.fill_price or trade.sig.entry))
+        actual_exit = _get_exit_price(client, account_id, trade.fired_at,
+                                      trade.contract_id, now,
+                                      entry_price=trade.fill_price or trade.sig.entry)
+        exit_price = actual_exit if actual_exit is not None else (
+            state.vwaslr_bars[-1].close if state.vwaslr_bars
+            else (trade.fill_price or trade.sig.entry))
         pnl_pts = _log_wall_break_trade(trade, "TIME EXIT", exit_price, now)
         _update_wall_break_streak(state, pnl_pts, now)
         state.active_wall_break_trade = None
         try:
-            client.cancel_all_orders(account_id)
+            client.cancel_orders_for_contract(account_id, trade.contract_id)
         except Exception:
             pass
 
@@ -2922,10 +3398,12 @@ def evaluate_ba_brk(state, now: datetime) -> "BaBrkSignal | None":
     return a signal. Ask cascades are long, bid cascades are short — gated
     independently via instrument.ba_brk_ask_enabled/ba_brk_bid_enabled.
 
-    Ask entries additionally require alignment with the day's move since the
-    RTH open (backtest: aligned EV=+1.52pt/trade vs against EV=-1.21pt/trade
-    — a hard filter, not a preference). Bid has no validated filter yet
-    (sample too thin); bid is disabled by default until that changes."""
+    Both sides require alignment with the day's move since the RTH open — a
+    hard filter, not a preference. Ask: backtest aligned EV=+1.52pt/trade vs
+    against EV=-1.21pt/trade (well-validated). Bid: aligned-with-downtrend
+    EV=+0.65pt/trade in a 2026-09-05 re-test (n=133, 65 days) — encouraging
+    but only the best of a grid search, not yet independently re-confirmed;
+    enabled live anyway to gather more data (see BA_BRK_BID_* constants)."""
     if not state.recent_ba_brk_breakouts:
         return None
     with state.dom._lock:
@@ -2952,22 +3430,30 @@ def evaluate_ba_brk(state, now: datetime) -> "BaBrkSignal | None":
     if (now - trigger.ts).total_seconds() > BA_BRK_MAX_GAP_SEC + 15:
         return None   # stale — cascade completed too long ago to act on
 
+    day_open = _day_open_price(state.vwaslr_bars, now)
+    if day_open is None:
+        return None
+
     if side == "ask":
-        day_open = _day_open_price(state.vwaslr_bars, now)
-        if day_open is None or best_ask <= day_open:
+        if best_ask <= day_open:
             return None   # not aligned with the day's move since open — hard filter
         stop_pts = max(BA_BRK_STOP_MIN, min(state.sigma_pts, BA_BRK_STOP_MAX))
         direction, entry = 1, best_ask
         stop, target = entry - stop_pts, entry + BA_BRK_TARGET_PTS
+        hold_min = BA_BRK_HOLD_MIN
     else:
+        if best_bid >= day_open:
+            return None   # not aligned with the day's downtrend since open — hard filter
         direction, entry = -1, best_bid
         stop   = entry + BA_BRK_BID_STOP_PTS
         target = entry - BA_BRK_BID_TARGET_PTS
+        hold_min = BA_BRK_BID_HOLD_MIN
 
     return BaBrkSignal(
         direction=direction, entry=entry, stop=stop, target=target,
         side=side, cascade_len=cascade_len,
         first_break_ts=cascade_start, last_break_ts=trigger.ts,
+        hold_min=hold_min,
     )
 
 
@@ -3063,7 +3549,7 @@ def handle_active_ba_brk_trade(client: TopstepClient, state,
         _update_ba_brk_streak(state, pnl_pts, now)
         state.active_ba_brk_trade = None
         try:
-            n = client.cancel_all_orders(account_id)
+            n = client.cancel_orders_for_contract(account_id, trade.contract_id)
             if n:
                 log.info(f"BA_BRK {trade.instrument.symbol} {outcome}: cancelled {n} residual order(s)")
         except Exception as e:
@@ -3073,7 +3559,7 @@ def handle_active_ba_brk_trade(client: TopstepClient, state,
     if now >= trade.expires_at():
         log.info(f"BA_BRK {trade.instrument.symbol} max hold reached — closing")
         try:
-            client.cancel_all_orders(account_id)
+            client.cancel_orders_for_contract(account_id, trade.contract_id)
         except Exception as e:
             log.warning(f"BA_BRK {trade.instrument.symbol}: pre-close cancel_all failed: {e}")
         try:
@@ -3081,13 +3567,17 @@ def handle_active_ba_brk_trade(client: TopstepClient, state,
         except Exception as e:
             log.error(f"BA_BRK {trade.instrument.symbol}: failed to close position: {e}")
             return
-        exit_price = (state.vwaslr_bars[-1].close if state.vwaslr_bars
-                      else (trade.fill_price or trade.sig.entry))
+        actual_exit = _get_exit_price(client, account_id, trade.fired_at,
+                                      trade.contract_id, now,
+                                      entry_price=trade.fill_price or trade.sig.entry)
+        exit_price = actual_exit if actual_exit is not None else (
+            state.vwaslr_bars[-1].close if state.vwaslr_bars
+            else (trade.fill_price or trade.sig.entry))
         pnl_pts = _log_ba_brk_trade(trade, "TIME EXIT", exit_price, now)
         _update_ba_brk_streak(state, pnl_pts, now)
         state.active_ba_brk_trade = None
         try:
-            client.cancel_all_orders(account_id)
+            client.cancel_orders_for_contract(account_id, trade.contract_id)
         except Exception:
             pass
 
@@ -3172,6 +3662,330 @@ def _update_ba_brk_streak(state, pnl_pts: float, now: datetime):
         log.info(
             f"BA_BRK {state.instrument.symbol}: halting for the rest of "
             f"the day after {state.ba_brk_consec_losses} consecutive losses"
+        )
+
+
+# ── BA-REV ("Bid/Ask Reversal") ───────────────────────────────────────────────
+
+def _find_test_signal(events: list, side: str, test_count: int,
+                       after_ts: "datetime | None"):
+    """Most recent WallEvent in `events` matching event=='test', the given
+    side, and exactly `test_count` — i.e. the moment a wall reached that many
+    touches for the first time. after_ts dedups against a signal already
+    acted on."""
+    matches = [e for e in events
+               if e.side == side and e.test_count == test_count
+               and (after_ts is None or e.ts > after_ts)]
+    return max(matches, key=lambda e: e.ts) if matches else None
+
+
+def _update_ba_rev_reference(state, now: datetime):
+    """Lock in the BA_REV_REF_START (07:00 ET) -> BA_REV_LOCK_HM (10:30 ET)
+    reference range, once per ET calendar day, right at 10:30 ET. This window
+    is pure price history — never traded — so there's no look-ahead risk
+    computing it right when it completes."""
+    now_et = now.astimezone(ET)
+    today  = now_et.date()
+    if state.ba_rev_ref_day == today:
+        return
+    lock_et = datetime.combine(today, dtime(*BA_REV_LOCK_HM), tzinfo=ET)
+    if now_et < lock_et:
+        return   # reference window isn't complete yet
+
+    state.ba_rev_ref_day   = today
+    state.ba_rev_ref_high  = None
+    state.ba_rev_ref_low   = None
+    state.ba_rev_contained = True
+
+    raw = get_bars_from_db(state.instrument.symbol, 1, BA_REV_RANGE_LOOKBACK_BARS)
+    if not raw:
+        log.warning(f"BA_REV {state.instrument.symbol}: no bars available for reference window — skipping today")
+        return
+
+    ref_start_et = datetime.combine(today, dtime(*BA_REV_REF_START), tzinfo=ET)
+    ref_hi = ref_lo = None
+    for b in raw:
+        ts = datetime.fromisoformat(b["t"])
+        ts_et = ts.astimezone(ET)
+        if ref_start_et <= ts_et < lock_et:
+            ref_hi = b["h"] if ref_hi is None else max(ref_hi, b["h"])
+            ref_lo = b["l"] if ref_lo is None else min(ref_lo, b["l"])
+
+    if ref_hi is None:
+        log.warning(f"BA_REV {state.instrument.symbol}: no bars in reference window — skipping today")
+        return
+
+    state.ba_rev_ref_high = ref_hi
+    state.ba_rev_ref_low  = ref_lo
+    log.info(
+        f"BA_REV {state.instrument.symbol}: reference window locked for {today} — "
+        f"{BA_REV_REF_START[0]:02d}:{BA_REV_REF_START[1]:02d}-{BA_REV_LOCK_HM[0]:02d}:{BA_REV_LOCK_HM[1]:02d} ET  "
+        f"high={ref_hi:.2f}  low={ref_lo:.2f}  range={ref_hi-ref_lo:.2f}pt"
+    )
+
+
+def _update_ba_rev_containment(state, now: datetime):
+    """After the reference locks, check the latest bar against [ref_low,
+    ref_high]; one breakout permanently disables BA-REV for the rest of the
+    day (mirrors the backtest's cumulative 'since' check — once broken, the
+    day's range only ever grows, never shrinks back to contained)."""
+    if state.ba_rev_ref_high is None or not state.ba_rev_contained:
+        return
+    bars = state.vwaslr_bars
+    if not bars:
+        return
+    last = bars[-1]
+    if last.high > state.ba_rev_ref_high or last.low < state.ba_rev_ref_low:
+        state.ba_rev_contained = False
+        log.info(
+            f"BA_REV {state.instrument.symbol}: broke out of reference range "
+            f"({state.ba_rev_ref_low:.2f}-{state.ba_rev_ref_high:.2f}) — disabled for the rest of today"
+        )
+
+
+def evaluate_ba_rev(state, now: datetime) -> "BaRevSignal | None":
+    """A wall that survives BA_REV_TEST_COUNT touches without breaking is a
+    rejection; bet price continues AWAY from it (short on an ask-wall
+    rejection, long on a bid-wall rejection). Only trades from BA_REV_LOCK_HM
+    (10:30 ET) onward, once the 07:00-10:30 reference has locked, and only
+    while state.ba_rev_contained is still True (today hasn't broken that
+    reference range) — see _update_ba_rev_reference/_update_ba_rev_containment."""
+    if not state.recent_ba_rev_tests or not state.ba_rev_contained:
+        return None
+
+    candidates = []
+    if state.instrument.ba_rev_ask_enabled:
+        e = _find_test_signal(state.recent_ba_rev_tests, "ask", BA_REV_TEST_COUNT, state.ba_rev_last_ts)
+        if e:
+            candidates.append(("ask", e))
+    if state.instrument.ba_rev_bid_enabled:
+        e = _find_test_signal(state.recent_ba_rev_tests, "bid", BA_REV_TEST_COUNT, state.ba_rev_last_ts)
+        if e:
+            candidates.append(("bid", e))
+    if not candidates:
+        return None
+
+    side, trigger = max(candidates, key=lambda c: c[1].ts)
+    if (now - trigger.ts).total_seconds() > BA_REV_SIGNAL_STALE_SEC:
+        return None   # stale — react promptly or not at all
+
+    direction = -1 if side == "ask" else 1   # ask rejection -> short, bid rejection -> long
+    entry = trigger.price
+    stop   = entry - direction * BA_REV_STOP_PTS
+    target = entry + direction * BA_REV_TARGET_PTS
+
+    return BaRevSignal(
+        direction=direction, entry=entry, stop=stop, target=target,
+        side=side, test_count=trigger.test_count, wall_price=trigger.wall_price,
+        trigger_ts=trigger.ts,
+        ref_high=state.ba_rev_ref_high, ref_low=state.ba_rev_ref_low,
+    )
+
+
+def place_ba_rev_signal(client: TopstepClient, state,
+                         sig: BaRevSignal, account_id: int,
+                         paper: bool) -> ActiveBaRevTrade:
+    inst      = state.instrument
+    tick      = inst.tick_size
+    is_long   = sig.direction == 1
+    dir_label = "LONG" if is_long else "SHORT"
+    stop_mag   = max(1, round(sig.stop_pts()   / tick))
+    target_mag = max(1, round(sig.target_pts() / tick))
+    stop_ticks   = -stop_mag   if is_long else  stop_mag
+    target_ticks =  target_mag if is_long else -target_mag
+
+    trade = ActiveBaRevTrade(
+        instrument=inst, contract_id=state.contract_id,
+        sig=sig, fired_at=sig.trigger_ts,
+    )
+
+    if paper:
+        log.info(
+            f"[PAPER] BA_REV {inst.symbol} {dir_label}  side={sig.side}  "
+            f"tests={sig.test_count}  wall={sig.wall_price:.2f}  entry≈{sig.entry:.2f}  "
+            f"stop={sig.stop:.2f} ({sig.stop_pts():.2f}pts)  "
+            f"target={sig.target:.2f} ({sig.target_pts():.2f}pts)"
+        )
+    else:
+        order_side = TopstepClient.BID if is_long else TopstepClient.ASK
+        resp = client.place_order(
+            account_id=account_id,
+            contract_id=state.contract_id,
+            side=order_side,
+            size=1,
+            order_type=TopstepClient.ORDER_MARKET,
+            stop_loss_ticks=stop_ticks,
+            take_profit_ticks=target_ticks,
+            custom_tag=f"barev_{inst.symbol}_{sig.trigger_ts.strftime('%Y%m%d%H%M%S')}_{random.randint(100,999)}",
+        )
+        trade.order_id = resp.get("orderId")
+        log.info(
+            f"BA_REV ORDER  {inst.symbol} {dir_label}  side={sig.side}  "
+            f"tests={sig.test_count}  order_id={trade.order_id}  "
+            f"entry≈{sig.entry:.2f}  stop={stop_ticks}t  target={target_ticks}t"
+        )
+
+    state.active_ba_rev_trade = trade
+    state.ba_rev_last_ts      = sig.trigger_ts
+    return trade
+
+
+def handle_active_ba_rev_trade(client: TopstepClient, state,
+                                account_id: int, now: datetime, paper: bool):
+    trade = state.active_ba_rev_trade
+
+    if paper:
+        if now >= trade.expires_at():
+            exit_price = (state.vwaslr_bars[-1].close if state.vwaslr_bars
+                          else trade.sig.entry)
+            pnl_pts = _log_ba_rev_trade(trade, "TIME EXIT (paper)", exit_price, now)
+            _update_ba_rev_streak(state, pnl_pts, now)
+            state.active_ba_rev_trade = None
+        return
+
+    try:
+        positions = client.get_open_positions(account_id)
+    except Exception as e:
+        log.warning(f"BA_REV {trade.instrument.symbol}: could not fetch positions: {e}")
+        return
+
+    pos = next(
+        (p for p in positions if p.get("contractId") == trade.contract_id),
+        None,
+    )
+
+    if pos and trade.fill_price is None:
+        trade.fill_price = pos.get("averagePrice")
+        log.info(f"BA_REV {trade.instrument.symbol} fill confirmed: {trade.fill_price:.2f}")
+        play_trade_sound()
+
+    if pos is None:
+        exit_price = _get_exit_price(client, account_id, trade.fired_at,
+                                     trade.contract_id, now)
+        if exit_price is not None:
+            d = trade.sig.direction
+            outcome = ("TARGET" if (d == 1 and exit_price >= trade.target_price()) or
+                                   (d == -1 and exit_price <= trade.target_price())
+                       else "STOPPED")
+        else:
+            classify_bars = state.pl_mom_5s_bars if state.pl_mom_5s_bars else state.vwaslr_bars
+            outcome, exit_price = _classify_ba_rev_outcome(trade, classify_bars)
+        pnl_pts = _log_ba_rev_trade(trade, outcome, exit_price, now)
+        _update_ba_rev_streak(state, pnl_pts, now)
+        state.active_ba_rev_trade = None
+        try:
+            n = client.cancel_orders_for_contract(account_id, trade.contract_id)
+            if n:
+                log.info(f"BA_REV {trade.instrument.symbol} {outcome}: cancelled {n} residual order(s)")
+        except Exception as e:
+            log.warning(f"BA_REV {trade.instrument.symbol}: cancel_all_orders failed: {e}")
+        return
+
+    if now >= trade.expires_at():
+        log.info(f"BA_REV {trade.instrument.symbol} max hold reached — closing")
+        try:
+            client.cancel_orders_for_contract(account_id, trade.contract_id)
+        except Exception as e:
+            log.warning(f"BA_REV {trade.instrument.symbol}: pre-close cancel_all failed: {e}")
+        try:
+            client.close_position(account_id, trade.contract_id)
+        except Exception as e:
+            log.error(f"BA_REV {trade.instrument.symbol}: failed to close position: {e}")
+            return
+        actual_exit = _get_exit_price(client, account_id, trade.fired_at,
+                                      trade.contract_id, now,
+                                      entry_price=trade.fill_price or trade.sig.entry)
+        exit_price = actual_exit if actual_exit is not None else (
+            state.vwaslr_bars[-1].close if state.vwaslr_bars
+            else (trade.fill_price or trade.sig.entry))
+        pnl_pts = _log_ba_rev_trade(trade, "TIME EXIT", exit_price, now)
+        _update_ba_rev_streak(state, pnl_pts, now)
+        state.active_ba_rev_trade = None
+        try:
+            client.cancel_orders_for_contract(account_id, trade.contract_id)
+        except Exception:
+            pass
+
+
+def _classify_ba_rev_outcome(trade: ActiveBaRevTrade, bars: list) -> tuple[str, float]:
+    d = trade.sig.direction
+    for bar in bars:
+        if bar.ts <= trade.fired_at:
+            continue
+        if d == 1:
+            if bar.low  <= trade.stop_price():   return "STOPPED", trade.stop_price()
+            if bar.high >= trade.target_price():  return "TARGET",  trade.target_price()
+        else:
+            if bar.high >= trade.stop_price():   return "STOPPED", trade.stop_price()
+            if bar.low  <= trade.target_price():  return "TARGET",  trade.target_price()
+    last_close = bars[-1].close if bars else (trade.fill_price or trade.sig.entry)
+    if abs(last_close - trade.target_price()) <= abs(last_close - trade.stop_price()):
+        return "TARGET",  trade.target_price()
+    return "STOPPED", trade.stop_price()
+
+
+def _ensure_ba_rev_log():
+    BA_REV_LOG_PATH.parent.mkdir(exist_ok=True)
+    if not BA_REV_LOG_PATH.exists():
+        with open(BA_REV_LOG_PATH, "w", newline="") as f:
+            csv.DictWriter(f, fieldnames=BA_REV_LOG_FIELDS).writeheader()
+
+
+def _log_ba_rev_trade(trade: ActiveBaRevTrade, outcome: str,
+                       exit_price: float, now: datetime) -> float:
+    fill    = trade.fill_price or trade.sig.entry
+    pnl_pts = (exit_price - fill) * trade.sig.direction
+    dirn    = "LONG" if trade.sig.direction == 1 else "SHORT"
+    row = {
+        "fired_at":        trade.fired_at.isoformat(),
+        "resolved_at":     now.isoformat(),
+        "symbol":          trade.instrument.symbol,
+        "direction":       dirn,
+        "side":            trade.sig.side,
+        "test_count":      trade.sig.test_count,
+        "wall_price":      round(trade.sig.wall_price, 4),
+        "ref_high":        round(trade.sig.ref_high, 2) if trade.sig.ref_high is not None else None,
+        "ref_low":         round(trade.sig.ref_low, 2) if trade.sig.ref_low is not None else None,
+        "est_entry":       round(trade.sig.entry, 4),
+        "fill_price":      round(fill, 4),
+        "stop":            round(trade.stop_price(), 4),
+        "target":          round(trade.target_price(), 4),
+        "outcome":         outcome,
+        "pnl_pts":         round(pnl_pts, 4),
+    }
+    with open(BA_REV_LOG_PATH, "a", newline="") as f:
+        csv.DictWriter(f, fieldnames=BA_REV_LOG_FIELDS).writerow(row)
+    log.info(
+        f"BA_REV LOGGED  {trade.instrument.symbol} {dirn}  {outcome}  "
+        f"fill={fill:.2f}  exit={exit_price:.2f}  pnl={pnl_pts:+.2f}pts  "
+        f"side={trade.sig.side}  tests={trade.sig.test_count}"
+    )
+    return pnl_pts
+
+
+def _ba_rev_can_trade(state, now: datetime) -> bool:
+    """False if this instrument has hit BA_REV_MAX_CONSEC_LOSSES straight
+    BA-REV losses so far today (ET calendar day)."""
+    today = now.astimezone(ET).date()
+    if state.ba_rev_day != today:
+        state.ba_rev_day           = today
+        state.ba_rev_consec_losses = 0
+        state.ba_rev_halted_today  = False
+    return not state.ba_rev_halted_today
+
+
+def _update_ba_rev_streak(state, pnl_pts: float, now: datetime):
+    _ba_rev_can_trade(state, now)   # ensure day rollover has run
+    if pnl_pts < 0:
+        state.ba_rev_consec_losses += 1
+    else:
+        state.ba_rev_consec_losses = 0
+    if (state.ba_rev_consec_losses >= BA_REV_MAX_CONSEC_LOSSES
+            and not state.ba_rev_halted_today):
+        state.ba_rev_halted_today = True
+        log.info(
+            f"BA_REV {state.instrument.symbol}: halting for the rest of "
+            f"the day after {state.ba_rev_consec_losses} consecutive losses"
         )
 
 
@@ -3528,7 +4342,7 @@ def handle_active_pl_mom_trade(client: TopstepClient, state: InstrumentState,
         _log_pl_mom_trade(trade, "STOPPED", exit_price, now)
         state.active_pl_mom_trade = None
         try:
-            n = client.cancel_all_orders(account_id)
+            n = client.cancel_orders_for_contract(account_id, trade.contract_id)
             if n:
                 log.info(f"PL_MOM {trade.instrument.symbol} STOPPED: cancelled {n} residual order(s)")
         except Exception as e:
@@ -3550,7 +4364,7 @@ def handle_active_pl_mom_trade(client: TopstepClient, state: InstrumentState,
                     f"cur_pl={cur_pl:.3f} ≤ {trade.instrument.pl_mom_exit_pl}"
                 )
                 try:
-                    n = client.cancel_all_orders(account_id)
+                    n = client.cancel_orders_for_contract(account_id, trade.contract_id)
                     if n:
                         log.info(f"PL_MOM {trade.instrument.symbol}: cancelled {n} bracket(s) before PL exit")
                 except Exception as e:
@@ -3569,7 +4383,7 @@ def handle_active_pl_mom_trade(client: TopstepClient, state: InstrumentState,
                 _log_pl_mom_trade(trade, "PL EXIT", exit_price, now)
                 state.active_pl_mom_trade = None
                 try:
-                    client.cancel_all_orders(account_id)
+                    client.cancel_orders_for_contract(account_id, trade.contract_id)
                 except Exception:
                     pass
                 return
@@ -3578,7 +4392,7 @@ def handle_active_pl_mom_trade(client: TopstepClient, state: InstrumentState,
     if now >= trade.entry_ts + timedelta(seconds=PL_MOM_MAX_HOLD_S):
         log.info(f"PL_MOM {trade.instrument.symbol} max hold reached — closing")
         try:
-            client.cancel_all_orders(account_id)
+            client.cancel_orders_for_contract(account_id, trade.contract_id)
         except Exception as e:
             log.warning(f"PL_MOM {trade.instrument.symbol}: pre-close cancel_all failed: {e}")
         try:
@@ -3595,7 +4409,7 @@ def handle_active_pl_mom_trade(client: TopstepClient, state: InstrumentState,
         _log_pl_mom_trade(trade, "TIME EXIT", exit_price, now)
         state.active_pl_mom_trade = None
         try:
-            client.cancel_all_orders(account_id)
+            client.cancel_orders_for_contract(account_id, trade.contract_id)
         except Exception:
             pass
 
@@ -3793,7 +4607,7 @@ def handle_active_pl_rev_trade(client: TopstepClient, state: InstrumentState,
         _log_pl_rev_trade(trade, outcome, exit_price, now)
         state.active_pl_rev_trade = None
         try:
-            n = client.cancel_all_orders(account_id)
+            n = client.cancel_orders_for_contract(account_id, trade.contract_id)
             if n:
                 log.info(f"PL_REV {trade.instrument.symbol} {outcome}: cancelled {n} residual order(s)")
         except Exception as e:
@@ -3815,7 +4629,7 @@ def handle_active_pl_rev_trade(client: TopstepClient, state: InstrumentState,
                     f"cur_pl={cur_pl:.3f} ≥ {PL_REV_RESUME_PL} (trend resuming)"
                 )
                 try:
-                    client.cancel_all_orders(account_id)
+                    client.cancel_orders_for_contract(account_id, trade.contract_id)
                 except Exception as e:
                     log.warning(f"PL_REV {trade.instrument.symbol}: pre-resume cancel failed: {e}")
                 try:
@@ -3832,7 +4646,7 @@ def handle_active_pl_rev_trade(client: TopstepClient, state: InstrumentState,
                 _log_pl_rev_trade(trade, "RESUME EXIT", exit_price, now)
                 state.active_pl_rev_trade = None
                 try:
-                    client.cancel_all_orders(account_id)
+                    client.cancel_orders_for_contract(account_id, trade.contract_id)
                 except Exception:
                     pass
                 return
@@ -3841,7 +4655,7 @@ def handle_active_pl_rev_trade(client: TopstepClient, state: InstrumentState,
     if now >= trade.entry_ts + timedelta(seconds=PL_REV_MAX_HOLD_S):
         log.info(f"PL_REV {trade.instrument.symbol} max hold reached — closing")
         try:
-            client.cancel_all_orders(account_id)
+            client.cancel_orders_for_contract(account_id, trade.contract_id)
         except Exception as e:
             log.warning(f"PL_REV {trade.instrument.symbol}: pre-close cancel_all failed: {e}")
         try:
@@ -3858,7 +4672,7 @@ def handle_active_pl_rev_trade(client: TopstepClient, state: InstrumentState,
         _log_pl_rev_trade(trade, "TIME EXIT", exit_price, now)
         state.active_pl_rev_trade = None
         try:
-            client.cancel_all_orders(account_id)
+            client.cancel_orders_for_contract(account_id, trade.contract_id)
         except Exception:
             pass
 
@@ -4287,15 +5101,16 @@ def handle_active_sunday_gap_trade(client: TopstepClient, state: InstrumentState
 
 # ── Main loop ────────────────────────────────────────────────────────────────
 
-KNOWN_STRATEGIES = {"csr", "orb", "vwaslr", "slr", "eve", "sun", "pl_mom", "pl_rev", "wall", "ba_brk"}
+KNOWN_STRATEGIES = {"csr", "orb", "orb_cls", "vwaslr", "slr", "eve", "sun", "pl_mom", "pl_rev", "wall", "ba_brk", "ba_rev"}
 
 
 def _apply_strategy_filter(inst: BotInstrument, strategies: set[str]) -> BotInstrument:
     """Return a copy of inst with only the requested strategies enabled."""
     from dataclasses import replace
     overrides: dict = {}
-    if "csr"    not in strategies: overrides["csr_enabled"]     = False
-    if "orb"    not in strategies: overrides["orb_enabled"]     = False
+    if "csr"     not in strategies: overrides["csr_enabled"]     = False
+    if "orb"     not in strategies: overrides["orb_enabled"]     = False
+    if "orb_cls" not in strategies: overrides["orb_cls_enabled"] = False
     if "vwaslr" not in strategies: overrides["vwaslr_n"]        = 0
     if "slr"    not in strategies: overrides["slr_enabled"]     = False
     if "eve"    not in strategies: overrides["eve_enabled"]     = False
@@ -4304,6 +5119,7 @@ def _apply_strategy_filter(inst: BotInstrument, strategies: set[str]) -> BotInst
     if "pl_rev" not in strategies: overrides["pl_rev_enabled"]  = False
     if "wall"   not in strategies: overrides["wall_enabled"]    = False
     if "ba_brk" not in strategies: overrides["ba_brk_enabled"]  = False
+    if "ba_rev" not in strategies: overrides["ba_rev_enabled"]  = False
     return replace(inst, **overrides) if overrides else inst
 
 
@@ -4383,6 +5199,7 @@ def run(account_id: int | None, paper: bool, strategies: set[str] | None = None)
     _ensure_pl_rev_log()
     _ensure_wall_break_log()
     _ensure_ba_brk_log()
+    _ensure_ba_rev_log()
     _ensure_dom_signal_log()
     for state in states:
         if state.instrument.sun_gap_enabled:
@@ -4414,6 +5231,7 @@ def run(account_id: int | None, paper: bool, strategies: set[str] | None = None)
                 _needs_1min_bars = (state.instrument.vwaslr_n > 0
                                     or state.instrument.slr_enabled
                                     or state.instrument.eve_enabled
+                                    or state.instrument.orb_cls_enabled
                                     or (state.instrument.orb_enabled
                                         and state.instrument.orb_period_min < TF_MINUTES))
                 if _needs_1min_bars:
@@ -4464,12 +5282,23 @@ def run(account_id: int | None, paper: bool, strategies: set[str] | None = None)
                         e for e in state.recent_ba_brk_breakouts
                         if e.ts >= ba_brk_prune_before
                     ]
+                    ba_rev_prune_before = now - timedelta(minutes=BA_REV_BUFFER_MIN)
+                    for evt in _wt_events:
+                        if evt.event == "test":
+                            state.recent_ba_rev_tests.append(evt)
+                    state.recent_ba_rev_tests = [
+                        e for e in state.recent_ba_rev_tests
+                        if e.ts >= ba_rev_prune_before
+                    ]
 
                 if state.active_trade:
                     handle_active_trade(client, state, account_id, now, paper)
 
                 if state.active_orb_trade:
                     handle_active_orb_trade(client, state, account_id, now, paper)
+
+                if state.active_orb_cls_trade:
+                    handle_active_orb_cls_trade(client, state, account_id, now, paper)
 
                 if state.active_vwaslr_trade:
                     handle_active_vwaslr_trade(client, state, account_id, now, paper)
@@ -4489,6 +5318,9 @@ def run(account_id: int | None, paper: bool, strategies: set[str] | None = None)
                 if state.active_ba_brk_trade:
                     handle_active_ba_brk_trade(client, state, account_id, now, paper)
 
+                if state.active_ba_rev_trade:
+                    handle_active_ba_rev_trade(client, state, account_id, now, paper)
+
                 # PL_Mom: fetch 5s bars when trade active (needed for PL exit check)
                 if state.active_pl_mom_trade and state.instrument.pl_mom_enabled:
                     fetch_pl_mom_bars(client, state)
@@ -4507,6 +5339,7 @@ def run(account_id: int | None, paper: bool, strategies: set[str] | None = None)
                 # Only enter new trades when no position is open on this instrument
                 no_position = (not state.active_trade
                                and not state.active_orb_trade
+                               and not state.active_orb_cls_trade
                                and not state.active_vwaslr_trade
                                and not state.active_slr_trade
                                and not state.active_pl_mom_trade
@@ -4514,7 +5347,8 @@ def run(account_id: int | None, paper: bool, strategies: set[str] | None = None)
                                and not state.active_evening_trade
                                and not state.active_sunday_gap_trade
                                and not state.active_wall_break_trade
-                               and not state.active_ba_brk_trade)
+                               and not state.active_ba_brk_trade
+                               and not state.active_ba_rev_trade)
                 last_bar_ts = state.bars[-1].ts if state.bars else None
 
                 # Don't enter new trades after TopstepX daily cutoff (RTH only)
@@ -4540,9 +5374,14 @@ def run(account_id: int | None, paper: bool, strategies: set[str] | None = None)
                         state.last_evaluated_ts = last_bar_ts
 
                 if no_position and not past_cutoff and state.instrument.orb_enabled:
-                    orb_sig = evaluate_orb(state)
+                    orb_sig = evaluate_orb(state, states)
                     if orb_sig:
                         place_orb_signal(client, state, orb_sig, account_id, paper)
+
+                if no_position and not past_cutoff and state.instrument.orb_cls_enabled:
+                    orb_cls_sig = evaluate_orb_cls(state)
+                    if orb_cls_sig:
+                        place_orb_cls_signal(client, state, orb_cls_sig, account_id, paper)
 
                 vwaslr_open_window = not ((9, 30) <= now_et_hm < (9, 40))  # block 9:30–9:40 ET open
                 if no_position and not past_cutoff and vwaslr_open_window and state.instrument.vwaslr_n > 0:
@@ -4649,6 +5488,19 @@ def run(account_id: int | None, paper: bool, strategies: set[str] | None = None)
                     if bb_sig:
                         place_ba_brk_signal(client, state, bb_sig, account_id, paper)
 
+                # BA-REV: wall-rejection reversal. Free 09:40-10:30 ET; after
+                # 10:30 ET, only while still contained within the 07:00-10:30
+                # reference range (see _update_ba_rev_reference/_containment).
+                if state.instrument.ba_rev_enabled:
+                    _update_ba_rev_reference(state, now)
+                    _update_ba_rev_containment(state, now)
+                    if (no_position and not past_cutoff
+                            and BA_REV_TRADE_START <= now_et_hm < BA_REV_TRADE_END
+                            and _ba_rev_can_trade(state, now)):
+                        br_sig = evaluate_ba_rev(state, now)
+                        if br_sig:
+                            place_ba_rev_signal(client, state, br_sig, account_id, paper)
+
             except Exception as e:
                 log.error(f"{state.instrument.symbol}: {e}", exc_info=True)
 
@@ -4656,10 +5508,10 @@ def run(account_id: int | None, paper: bool, strategies: set[str] | None = None)
         _now_hb = datetime.now(timezone.utc)
         if (_now_hb - _last_heartbeat).total_seconds() >= 300:
             any_active = any(
-                s.active_trade or s.active_orb_trade or s.active_vwaslr_trade
+                s.active_trade or s.active_orb_trade or s.active_orb_cls_trade or s.active_vwaslr_trade
                 or s.active_slr_trade or s.active_pl_mom_trade or s.active_pl_rev_trade
                 or s.active_evening_trade or s.active_sunday_gap_trade or s.active_wall_break_trade
-                or s.active_ba_brk_trade
+                or s.active_ba_brk_trade or s.active_ba_rev_trade
                 for s in states
             )
             last_bars = {s.instrument.symbol: (s.bars[-1].ts if s.bars else None) for s in states}
@@ -4712,6 +5564,25 @@ if __name__ == "__main__":
                               f"Default: all strategies enabled per instrument config. "
                               f"Example: --strategies pl_rev,orb"))
     args = parser.parse_args()
+
+    # TEMP (2026-10-01): guard against a second live instance. Added after a
+    # bare `python trading_bot.py` ran alongside the launchd focused_bot and
+    # doubled live MES/MNQ ORB positions. Remove once we trust this won't
+    # recur, or replace with a proper lockfile.
+    _self_pid = os.getpid()
+    _ps_out = subprocess.run(
+        ["pgrep", "-f", "trading_bot.py"], capture_output=True, text=True
+    ).stdout
+    _other_pids = [p for p in _ps_out.split() if p.isdigit() and int(p) != _self_pid]
+    if _other_pids:
+        print(
+            f"Another trading_bot.py instance is already running (PID "
+            f"{', '.join(_other_pids)}). Refusing to start a second live "
+            f"instance — this is what caused the 2026-10-01 double-ORB "
+            f"incident. Kill the existing process first, or confirm this is "
+            f"intentional and remove this guard in src/trading_bot.py."
+        )
+        sys.exit(1)
 
     strategies: set[str] | None = None
     if args.strategies:
