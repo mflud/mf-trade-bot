@@ -1,19 +1,20 @@
 """
-focused_monitor.py — Monitor for the focused bot (VWASLR, PL_REV, Wall Break, ORB).
+focused_monitor.py — Monitor for the focused bot (ORB, ORB-cls, BA-BRK, BA-REV).
 
 Layout:
-  ┌────────────────────────┬───────────────────────────────────────────────┐
-  │ VWASLR                 │ PL_REV MES                                    │
-  │ MNQ ORB                │ PL_REV MNQ                                    │
-  │ MES ORB                │ Wall Break                                    │
-  │ Positions │ Sizing     │ Trade Summary                                 │
-  └────────────────────────┴───────────────────────────────────────────────┘
+  ┌────────────────────────┬──────────────────┬───────────────────────────┐
+  │ MNQ ORB                │ BA-BRK            │ Trade Summary             │
+  │ MES ORB                │ BA-REV            │ Positions                 │
+  │ MNQ ORB-cls             │                   │                           │
+  │ MES ORB-cls             │                   │                           │
+  └────────────────────────┴──────────────────┴───────────────────────────┘
 
 Usage:
     python src/focused_monitor.py
 """
 
 import json
+import re
 import sqlite3
 import subprocess
 import sys
@@ -22,6 +23,7 @@ import time
 import traceback
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from datetime import time as dtime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -92,6 +94,17 @@ ORB_WIDTH_MAX = ORB_MNQ_WIDTH_MAX
 ORB_MAX_LOSS  = ORB_MNQ_MAX_LOSS
 ORB_PV        = ORB_MNQ_PV
 
+# ── ORB-cls constants (mirrors trading_bot.py's BotInstrument.orb_cls_*) ───────
+# Closing-range breakout: range = the 15:50 ET 1-min bar instead of 9:30.
+# No cross-confirmation (see project_orb_cls_strategy memory) — each
+# instrument fires independently, no "awaiting other leg" phase.
+ORB_CLS_RANGE_HM      = (15, 50)   # ET — range bar start
+ORB_CLS_TGT_MULT      = 3.25
+ORB_CLS_HOLD_MIN      = 15
+ORB_CLS_SAFETY_HM     = (16, 8)    # hard force-flat, 2min inside TopstepX's 16:10 ET cutoff
+ORB_CLS_MES_ENTRY_WIN = 5
+ORB_CLS_MNQ_ENTRY_WIN = 3
+
 # ── DOM constants ─────────────────────────────────────────────────────────────
 WALL_MULT     = 2.5
 DOM_DB_PATH   = Path("data/dom.db")
@@ -104,10 +117,6 @@ DOM_BKT_CAP   = 500
 DOM_PRICE_COL = 10
 DOM_NEAR_BAR  = 16
 DOM_BKT_BAR   = 14
-
-# ── Sizing ────────────────────────────────────────────────────────────────────
-SIZING_SIGMA_BARS = 100
-SIZING_RISKS      = [100, 200, 300, 400, 500, 600, 700, 800, 900, 1000]
 
 # ── Settlement ────────────────────────────────────────────────────────────────
 SETTLE_UTC_START = 21
@@ -174,7 +183,13 @@ BA_BRK_MAX_GAP_SEC = 45
 BA_BRK_STOP_PTS    = 3.5
 BA_BRK_TARGET_PTS  = 12.0
 BA_BRK_HOLD_MIN    = 25
-BA_BRK_BUFFER_MIN  = 5
+# Bid side, enabled live 2026-09-14 (own alignment filter + params, see trading_bot.py)
+BA_BRK_BID_STOP_PTS   = 4.0
+BA_BRK_BID_TARGET_PTS = 18.0
+BA_BRK_BID_HOLD_MIN   = 30
+BA_BRK_BUFFER_MIN  = 10  # display buffer only — cascade detection itself only cares about
+                          # gaps within BA_BRK_MAX_GAP_SEC, so this just controls how much
+                          # history the panel's activity table can show
 
 @dataclass
 class BaBrkSignal:
@@ -190,6 +205,35 @@ class BaBrkSignal:
     expires_at:     datetime
 
 
+# BA-REV (Bid/Ask Reversal — wall rejection): mirrors trading_bot.py's live
+# logic (see BA_REV_* constants there). Opposite premise from BA-BRK: bet a
+# wall that survives BA_REV_TEST_COUNT touches HOLDS, not breaks. Redesigned
+# 2026-09-15: free 09:40-10:30 ET, then only while still contained within the
+# 07:00-10:30 ET reference range (one breakout disables the rest of the day).
+BA_REV_TEST_COUNT       = 3
+BA_REV_STOP_PTS         = 2.0   # stepped up from backtest-optimal 1.0pt — see trading_bot.py
+BA_REV_TARGET_PTS       = 6.0
+BA_REV_HOLD_MIN         = 60
+BA_REV_REF_START_HM     = 7 * 60          # 07:00 ET — reference window start
+BA_REV_LOCK_HM          = 10 * 60 + 30    # 10:30 ET — reference locks; trading starts here (no free window)
+BA_REV_TRADE_START_HM   = BA_REV_LOCK_HM
+BA_REV_SIGNAL_STALE_SEC = 60
+BA_REV_RANGE_LOOKBACK_BARS = 2500
+
+@dataclass
+class BaRevSignal:
+    direction:   int      # +1 LONG (bid rejection), -1 SHORT (ask rejection)
+    side:        str      # "ask" | "bid" — which wall rejected
+    entry:       float
+    target:      float
+    stop:        float
+    test_count:  int
+    wall_price:  float
+    trigger_ts:  datetime
+    fired_at:    datetime
+    expires_at:  datetime
+
+
 @dataclass
 class ORBState:
     orb_high:    float = 0.0
@@ -198,10 +242,16 @@ class ORBState:
     orb_mid:     float = 0.0
     valid:       bool  = False    # width passes filter
     entry_price: float = 0.0
-    direction:   int   = 0       # +1 LONG, -1 SHORT; 0 = no breakout yet
+    direction:   int   = 0       # +1 LONG, -1 SHORT candidate; 0 = no breakout yet
     target:      float = 0.0
     stop:        float = 0.0
     session_date: "object" = None   # date object
+    # Cross-confirmation display (mirrors trading_bot.py's live gate — see
+    # evaluate_orb's orb_cross_confirm): `direction` is set the moment this
+    # instrument's own range breaks, same as before, but that's only a
+    # candidate now. `confirmed` tracks whether the OTHER instrument's own
+    # candidate has matched direction — only then did a real trade fire live.
+    confirmed:   bool  = False
 
 
 @dataclass
@@ -295,6 +345,9 @@ class MonitorState:
     # ORB
     orb:     ORBState = field(default_factory=ORBState)   # MNQ ORB
     orb_mes: ORBState = field(default_factory=ORBState)   # MES ORB
+    # ORB-cls (15:50 ET closing range) — separate session state, no cross-confirm
+    orb_cls:     ORBState = field(default_factory=ORBState)   # MNQ ORB-cls
+    orb_cls_mes: ORBState = field(default_factory=ORBState)   # MES ORB-cls
     # Wall Break
     wall_break_signal: "WallBreakSignal|None" = None
     wall_recent_events: list = field(default_factory=list)  # (ts, event, side, wall_price, test_count, entry, peak_size)
@@ -302,6 +355,14 @@ class MonitorState:
     ba_brk_signal:    "BaBrkSignal|None" = None
     ba_brk_breakouts: list = field(default_factory=list)   # raw WallEvent breakouts, both sides
     day_open:         "float|None" = None
+    day_open_date:    "object|None" = None   # date this day_open was computed for — set once/day
+    # BA-REV (wall rejection reversal) — reuses ba_brk_breakouts above for its
+    # "test" events (same buffer already holds both event types)
+    ba_rev_signal:     "BaRevSignal|None" = None
+    ba_rev_ref_day:    "object|None" = None
+    ba_rev_ref_high:   "float|None" = None
+    ba_rev_ref_low:    "float|None" = None
+    ba_rev_contained:  bool = True
     # Position — MES
     position_size:  int   = 0
     position_dir:   int   = 0
@@ -367,6 +428,62 @@ def _detect_cascade_signal(events: list, side: str, cascade_min: int, max_gap_se
             if after_ts is None or e.ts > after_ts:
                 result = (e, cascade_start, cascade_count)
     return result
+
+
+def _find_test_signal(events: list, side: str, test_count: int,
+                       after_ts: "datetime | None"):
+    """Mirrors trading_bot.py's _find_test_signal — most recent WallEvent
+    matching event=='test', the given side, and exactly `test_count`."""
+    matches = [e for e in events
+               if e.side == side and e.event == "test" and e.test_count == test_count
+               and (after_ts is None or e.ts > after_ts)]
+    return max(matches, key=lambda e: e.ts) if matches else None
+
+
+def _update_ba_rev_reference(state: "MonitorState", now: datetime):
+    """Mirrors trading_bot.py's _update_ba_rev_reference — display-only copy.
+    Locks the 07:00-10:30 ET reference range once per day, right at 10:30 ET."""
+    now_et = now.astimezone(ET)
+    today  = now_et.date()
+    if state.ba_rev_ref_day == today:
+        return
+    lock_et = datetime.combine(today, dtime(BA_REV_LOCK_HM // 60, BA_REV_LOCK_HM % 60), tzinfo=ET)
+    if now_et < lock_et:
+        return
+
+    state.ba_rev_ref_day   = today
+    state.ba_rev_ref_high  = None
+    state.ba_rev_ref_low   = None
+    state.ba_rev_contained = True
+
+    raw = get_bars_from_db(SYMBOL, 1, BA_REV_RANGE_LOOKBACK_BARS)
+    if not raw:
+        return
+
+    ref_start_et = datetime.combine(today, dtime(BA_REV_REF_START_HM // 60, BA_REV_REF_START_HM % 60), tzinfo=ET)
+    ref_hi = ref_lo = None
+    for b in raw:
+        ts_et = datetime.fromisoformat(b["t"]).astimezone(ET)
+        if ref_start_et <= ts_et < lock_et:
+            ref_hi = b["h"] if ref_hi is None else max(ref_hi, b["h"])
+            ref_lo = b["l"] if ref_lo is None else min(ref_lo, b["l"])
+
+    if ref_hi is None:
+        return
+    state.ba_rev_ref_high = ref_hi
+    state.ba_rev_ref_low  = ref_lo
+
+
+def _update_ba_rev_containment(state: "MonitorState", bars_1m: list):
+    """After the reference locks, one bar breaking [ref_low, ref_high]
+    permanently disables containment for the rest of the day."""
+    if state.ba_rev_ref_high is None or not state.ba_rev_contained:
+        return
+    if not bars_1m:
+        return
+    last = bars_1m[-1]
+    if last.high > state.ba_rev_ref_high or last.low < state.ba_rev_ref_low:
+        state.ba_rev_contained = False
 
 
 def _pl_bar(pl: float, dir_sym: str, half: int = 6) -> str:
@@ -503,6 +620,77 @@ def _update_mes_orb(state: MonitorState):
                 orb.target      = b.close - w * ORB_TGT_MULT
                 orb.stop        = b.close + w / 2.0   # midpoint stop
                 break
+
+    # Cross-confirmation: re-checked every call so it can flip True as soon
+    # as MNQ's own candidate catches up (mirrors trading_bot.py's live gate).
+    if orb.direction != 0 and not orb.confirmed:
+        if state.orb.direction == orb.direction:
+            orb.confirmed = True
+
+
+def _update_orb_cls_generic(orb: ORBState, bars: list, entry_win: int):
+    """Shared ORB-cls logic for one instrument — range = the 15:50 ET 1-min
+    bar, midpoint stop, no cross-confirmation (mirrors evaluate_orb_cls in
+    trading_bot.py). `confirmed` is left False here; _sync_orb_cls_from_log
+    sets it once the real order log shows a fill, same pattern as the
+    morning ORB panels."""
+    if not bars:
+        return
+    now_et = datetime.now(ET)
+    today  = now_et.date()
+
+    if orb.session_date != today:
+        orb.__init__()
+        orb.session_date = today
+
+    range_hm     = ORB_CLS_RANGE_HM[0] * 60 + ORB_CLS_RANGE_HM[1]
+    range_end_hm = range_hm + 1              # the range bar is 1 minute wide
+    entry_end_hm = range_end_hm + entry_win
+
+    today_bars = [b for b in bars
+                  if b.ts.astimezone(ET).date() == today
+                  and range_hm <= b.ts.astimezone(ET).hour * 60 + b.ts.astimezone(ET).minute < 16 * 60]
+    if not today_bars:
+        return
+
+    range_bar = next((b for b in today_bars
+                      if b.ts.astimezone(ET).hour * 60 + b.ts.astimezone(ET).minute == range_hm), None)
+    if range_bar:
+        orb.orb_high  = range_bar.high
+        orb.orb_low   = range_bar.low
+        orb.orb_mid   = (orb.orb_high + orb.orb_low) / 2
+        orb.orb_width = orb.orb_high - orb.orb_low
+        orb.valid     = True   # no width filter for ORB-cls
+
+    if orb.valid and orb.direction == 0:
+        after_range = [b for b in today_bars
+                       if range_end_hm <= b.ts.astimezone(ET).hour * 60 + b.ts.astimezone(ET).minute < entry_end_hm]
+        for b in after_range:
+            w = orb.orb_width
+            if b.close > orb.orb_high:
+                orb.direction   = 1
+                orb.entry_price = b.close
+                orb.target      = b.close + w * ORB_CLS_TGT_MULT
+                orb.stop        = b.close - w / 2.0   # midpoint stop
+                break
+            if b.close < orb.orb_low:
+                orb.direction   = -1
+                orb.entry_price = b.close
+                orb.target      = b.close - w * ORB_CLS_TGT_MULT
+                orb.stop        = b.close + w / 2.0   # midpoint stop
+                break
+
+
+def _update_orb_cls(state: MonitorState):
+    """MNQ ORB-cls — reuses the same MNQ 1-min bars fetched for the morning ORB."""
+    bars = state.bars_orb if state.bars_orb else state.bars_1m
+    _update_orb_cls_generic(state.orb_cls, bars, ORB_CLS_MNQ_ENTRY_WIN)
+
+
+def _update_mes_orb_cls(state: MonitorState):
+    """MES ORB-cls — reuses the same MES 1-min bars fetched for the morning ORB."""
+    bars = state.bars_mes_orb if state.bars_mes_orb else state.bars_1m
+    _update_orb_cls_generic(state.orb_cls_mes, bars, ORB_CLS_MES_ENTRY_WIN)
 
 
 # ─── DOM reader ───────────────────────────────────────────────────────────────
@@ -671,6 +859,12 @@ def _update_orb(state: MonitorState):
                 orb.target      = b.close - w * ORB_TGT_MULT
                 orb.stop        = stop
                 break
+
+    # Cross-confirmation: re-checked every call so it can flip True as soon
+    # as MES's own candidate catches up (mirrors trading_bot.py's live gate).
+    if orb.direction != 0 and not orb.confirmed:
+        if state.orb_mes.direction == orb.direction:
+            orb.confirmed = True
 
 
 # ─── PL_REV evaluation ───────────────────────────────────────────────────────
@@ -886,6 +1080,137 @@ def build_pl_rev_panel(state: MonitorState, now: datetime, symbol: str = "MES") 
                  padding=(0, 1), expand=True)
 
 
+# ─── ORB ground-truth sync ─────────────────────────────────────────────────
+# This monitor recomputes ORB candidates locally (above) purely to show the
+# reference range while it's forming. But that local recompute is a separate
+# simulation from trading_bot.py's own live ORB state — it can diverge (e.g.
+# a late bar-fetch skips the bar where trading_bot's candidate first latched,
+# so this monitor latches a different, later bar/direction instead). Since
+# only trading_bot.py's process actually holds the broker connection, its
+# log is ground truth for whether a candidate fired, confirmed, and what
+# price it's actually working at. Sync local state to that truth whenever
+# it's available so "Confirmed: yes — order placed" only shows when a real
+# order was actually sent.
+_ORB_CANDIDATE_RE = re.compile(r"ORB (MES|MNQ): candidate (LONG|SHORT) at ([\d.]+)")
+_ORB_FIRE_RE       = re.compile(r"ORB (MES|MNQ): cross-confirmed by \w+ — firing (LONG|SHORT) at ([\d.]+)")
+_ORB_ORDER_RE      = re.compile(r"ORB ORDER\s+(MES|MNQ) (LONG|SHORT)\s+order_id=(\S+)\s+entry≈([\d.]+)")
+_ORB_FILL_RE       = re.compile(r"ORB (MES|MNQ) fill confirmed: ([\d.]+)")
+# ORB-cls fires immediately on breakout (no cross-confirm candidate phase),
+# so there's no equivalent of _ORB_CANDIDATE_RE/_ORB_FIRE_RE here.
+_ORB_CLS_ORDER_RE = re.compile(r"ORB_CLS ORDER\s+(MES|MNQ) (LONG|SHORT)\s+order_id=(\S+)\s+entry≈([\d.]+)")
+_ORB_CLS_FILL_RE  = re.compile(r"ORB_CLS (MES|MNQ) fill confirmed: ([\d.]+)")
+
+
+def _sync_orb_from_log(state: MonitorState):
+    today_str = datetime.now().date().isoformat()   # log timestamps are local system time
+    found: dict = {}
+    for log_path in (Path("logs/focused_bot.log"), Path("logs/trading_bot.log")):
+        if not log_path.exists():
+            continue
+        try:
+            with open(log_path) as f:
+                lines = f.readlines()[-500:]
+        except Exception:
+            continue
+        for line in lines:
+            if not line.startswith(today_str):
+                continue
+            m = _ORB_CANDIDATE_RE.search(line)
+            if m:
+                sym, dirw, price = m.group(1), m.group(2), float(m.group(3))
+                found[sym] = {"direction": 1 if dirw == "LONG" else -1,
+                              "entry": price, "confirmed": False}
+                continue
+            m = _ORB_FIRE_RE.search(line)
+            if m:
+                sym, dirw, price = m.group(1), m.group(2), float(m.group(3))
+                found[sym] = {"direction": 1 if dirw == "LONG" else -1,
+                              "entry": price, "confirmed": True}
+                continue
+            m = _ORB_ORDER_RE.search(line)
+            if m:
+                sym, dirw, price = m.group(1), m.group(2), float(m.group(4))
+                found[sym] = {"direction": 1 if dirw == "LONG" else -1,
+                              "entry": price, "confirmed": True}
+                continue
+            m = _ORB_FILL_RE.search(line)
+            if m:
+                sym, price = m.group(1), float(m.group(2))
+                if sym in found:
+                    found[sym]["entry"] = price
+                continue
+
+    for sym, info in found.items():
+        orb = state.orb_mes if sym == "MES" else state.orb
+        if orb.session_date != datetime.now(ET).date() or not orb.orb_high:
+            continue   # local range not built yet for today — nothing to reconcile against
+        orb.direction   = info["direction"]
+        orb.entry_price = info["entry"]
+        orb.confirmed   = info["confirmed"]
+        w = orb.orb_width
+        if sym == "MES":
+            if orb.direction == 1:
+                orb.target = orb.entry_price + w * ORB_TGT_MULT
+                orb.stop   = orb.entry_price - w / 2.0
+            else:
+                orb.target = orb.entry_price - w * ORB_TGT_MULT
+                orb.stop   = orb.entry_price + w / 2.0
+        else:
+            max_pts = ORB_MAX_LOSS / ORB_PV
+            if orb.direction == 1:
+                orb.target = orb.entry_price + w * ORB_TGT_MULT
+                orb.stop   = max(orb.orb_low, orb.entry_price - max_pts)
+            else:
+                orb.target = orb.entry_price - w * ORB_TGT_MULT
+                orb.stop   = min(orb.orb_high, orb.entry_price + max_pts)
+
+
+def _sync_orb_cls_from_log(state: MonitorState):
+    """Mirrors _sync_orb_from_log for ORB-cls. Both MES and MNQ use a plain
+    midpoint stop here (no far-side/dollar-cap variant), so target/stop use
+    the same formula for both symbols."""
+    today_str = datetime.now().date().isoformat()
+    found: dict = {}
+    for log_path in (Path("logs/focused_bot.log"), Path("logs/trading_bot.log")):
+        if not log_path.exists():
+            continue
+        try:
+            with open(log_path) as f:
+                lines = f.readlines()[-500:]
+        except Exception:
+            continue
+        for line in lines:
+            if not line.startswith(today_str):
+                continue
+            m = _ORB_CLS_ORDER_RE.search(line)
+            if m:
+                sym, dirw, price = m.group(1), m.group(2), float(m.group(4))
+                found[sym] = {"direction": 1 if dirw == "LONG" else -1,
+                              "entry": price, "confirmed": True}
+                continue
+            m = _ORB_CLS_FILL_RE.search(line)
+            if m:
+                sym, price = m.group(1), float(m.group(2))
+                if sym in found:
+                    found[sym]["entry"] = price
+                continue
+
+    for sym, info in found.items():
+        orb = state.orb_cls_mes if sym == "MES" else state.orb_cls
+        if orb.session_date != datetime.now(ET).date() or not orb.orb_high:
+            continue   # local range not built yet for today — nothing to reconcile against
+        orb.direction   = info["direction"]
+        orb.entry_price = info["entry"]
+        orb.confirmed   = info["confirmed"]
+        w = orb.orb_width
+        if orb.direction == 1:
+            orb.target = orb.entry_price + w * ORB_CLS_TGT_MULT
+            orb.stop   = orb.entry_price - w / 2.0
+        else:
+            orb.target = orb.entry_price - w * ORB_CLS_TGT_MULT
+            orb.stop   = orb.entry_price + w / 2.0
+
+
 def build_orb_panel(state: MonitorState, now: datetime) -> Panel:
     orb    = state.orb
     now_et = now.astimezone(ET)
@@ -903,9 +1228,10 @@ def build_orb_panel(state: MonitorState, now: datetime) -> Panel:
             status = "LOADING…"; style = ""; border = "default"
         root.add_row(f"[{style}]  {status}  [/]" if style else f"  {status}  ")
         return Panel(root, title=f"ORB  MNQ  (1-min)", border_style=border,
-                     padding=(0, 1), expand=True)
+                     padding=(0, 1), width=68)
 
     # Determine status
+    dir_word = "LONG" if orb.direction == 1 else "SHORT"
     if hm_et < orb_end_hm:
         status = "FORMING"; style = "bold"; border = "default"
     elif not orb.valid:
@@ -914,10 +1240,14 @@ def build_orb_panel(state: MonitorState, now: datetime) -> Panel:
         status = "EXPIRED"; style = ""; border = "default"
     elif orb.direction == 0:
         status = "WATCHING"; style = "bold"; border = "blue"
-    elif orb.direction == 1:
+    elif orb.confirmed and orb.direction == 1:
         status = "▲ BREAKOUT LONG"; style = "bold green"; border = "green"
-    else:
+    elif orb.confirmed:
         status = "▼ BREAKOUT SHORT"; style = "bold red"; border = "red"
+    elif hm_et >= entry_end_hm:
+        status = f"EXPIRED (unconfirmed {dir_word})"; style = "yellow"; border = "yellow"
+    else:
+        status = f"CANDIDATE {dir_word} — awaiting MES"; style = "bold yellow"; border = "yellow"
 
     root.add_row(f"[{style}]  {status}  [/]" if style else f"  {status}  ")
     root.add_row("")
@@ -947,12 +1277,15 @@ def build_orb_panel(state: MonitorState, now: datetime) -> Panel:
         clr = "green" if orb.direction == 1 else "red"
         exit_et_min = 9*60+31 + ORB_ENTRY_WIN - 1 + ORB_HOLD_MIN
         exit_h, exit_m = divmod(exit_et_min, 60)
-        bdet.add_row("Entry:",  f"[bold {clr}]{orb.entry_price:.2f}[/]")
+        bdet.add_row("Confirmed:", "[green]yes — order placed[/]" if orb.confirmed
+                                    else "[yellow]not yet — no trade[/]")
+        bdet.add_row("Entry:",  f"[bold {clr}]{orb.entry_price:.2f}[/]"
+                                 + ("" if orb.confirmed else "  (candidate level)"))
         bdet.add_row("Target:", f"[bold green]{orb.target:.2f}[/]  "
                                 f"(+{abs(orb.target-orb.entry_price):.2f}pt)")
         bdet.add_row("Stop:",   f"[bold red]{orb.stop:.2f}[/]  "
                                 f"({abs(orb.stop-orb.entry_price):.2f}pt)")
-        bdet.add_row("Exit by:", f"~{exit_h:02d}:{exit_m:02d} ET")
+        bdet.add_row("Exit by:", f"~{exit_h:02d}:{exit_m:02d} ET" if orb.confirmed else "—")
         root.add_row(bdet)
     elif orb.valid and hm_et < entry_end_hm:
         root.add_row("")
@@ -962,11 +1295,11 @@ def build_orb_panel(state: MonitorState, now: datetime) -> Panel:
 
     root.add_row("")
     foot = Table.grid(); foot.add_column(justify="center")
-    foot.add_row(f"MNQ ORB  ≤{ORB_ENTRY_WIN}min  hold {ORB_HOLD_MIN}min  stop=opp(cap ${ORB_MAX_LOSS:.0f})  tgt={ORB_TGT_MULT:.0f}×  w≤{ORB_WIDTH_MAX*10000:.0f}bp")
+    foot.add_row(f"MNQ ORB  ≤{ORB_ENTRY_WIN}min  hold {ORB_HOLD_MIN}min  stop=opp(cap ${ORB_MAX_LOSS:.0f})  tgt={ORB_TGT_MULT:.0f}×  w≤{ORB_WIDTH_MAX*10000:.0f}bp  cross-confirm w/ MES")
     root.add_row(foot)
 
     return Panel(root, title=f"ORB  MNQ  (1-min)", border_style=border,
-                 padding=(0, 1), expand=False)
+                 padding=(0, 1), width=68)
 
 
 def build_mes_orb_panel(state: MonitorState, now: datetime) -> Panel:
@@ -983,18 +1316,23 @@ def build_mes_orb_panel(state: MonitorState, now: datetime) -> Panel:
         status = "PRE-MARKET" if hm_et < 9*60+30 else "LOADING…"
         root.add_row(f"  {status}  ")
         return Panel(root, title="ORB  MES  (1-min)", border_style="default",
-                     padding=(0, 1), expand=True)
+                     padding=(0, 1), width=72)
 
+    dir_word = "LONG" if orb.direction == 1 else "SHORT"
     if hm_et < orb_end_hm:
         status = "FORMING"; style = "bold"; border = "default"
     elif orb.direction == 0 and hm_et >= entry_end_hm:
         status = "EXPIRED"; style = ""; border = "default"
     elif orb.direction == 0:
         status = "WATCHING"; style = "bold"; border = "blue"
-    elif orb.direction == 1:
+    elif orb.confirmed and orb.direction == 1:
         status = "▲ BREAKOUT LONG"; style = "bold green"; border = "green"
-    else:
+    elif orb.confirmed:
         status = "▼ BREAKOUT SHORT"; style = "bold red"; border = "red"
+    elif hm_et >= entry_end_hm:
+        status = f"EXPIRED (unconfirmed {dir_word})"; style = "yellow"; border = "yellow"
+    else:
+        status = f"CANDIDATE {dir_word} — awaiting MNQ"; style = "bold yellow"; border = "yellow"
 
     root.add_row(f"[{style}]  {status}  [/]" if style else f"  {status}  ")
     root.add_row("")
@@ -1018,12 +1356,15 @@ def build_mes_orb_panel(state: MonitorState, now: datetime) -> Panel:
         clr = "green" if orb.direction == 1 else "red"
         exit_et_min = 9*60+31 + ORB_ENTRY_WIN - 1 + ORB_HOLD_MIN
         exit_h, exit_m = divmod(exit_et_min, 60)
-        bdet.add_row("Entry:",   f"[bold {clr}]{orb.entry_price:.2f}[/]")
+        bdet.add_row("Confirmed:", "[green]yes — order placed[/]" if orb.confirmed
+                                    else "[yellow]not yet — no trade[/]")
+        bdet.add_row("Entry:",   f"[bold {clr}]{orb.entry_price:.2f}[/]"
+                                  + ("" if orb.confirmed else "  (candidate level)"))
         bdet.add_row("Target:",  f"[bold green]{orb.target:.2f}[/]  "
                                  f"(+{abs(orb.target-orb.entry_price):.2f}pt)")
         bdet.add_row("Stop:",    f"[bold red]{orb.stop:.2f}[/]  "
                                  f"({abs(orb.stop-orb.entry_price):.2f}pt  midpoint)")
-        bdet.add_row("Exit by:", f"~{exit_h:02d}:{exit_m:02d} ET")
+        bdet.add_row("Exit by:", f"~{exit_h:02d}:{exit_m:02d} ET" if orb.confirmed else "—")
         root.add_row(bdet)
     elif hm_et < entry_end_hm:
         root.add_row("")
@@ -1033,11 +1374,103 @@ def build_mes_orb_panel(state: MonitorState, now: datetime) -> Panel:
 
     root.add_row("")
     foot = Table.grid(); foot.add_column(justify="center")
-    foot.add_row(f"MES ORB  ≤{ORB_ENTRY_WIN}min  hold {ORB_HOLD_MIN}min  stop=midpoint  tgt={ORB_TGT_MULT:.0f}×  no width filter")
+    foot.add_row(f"MES ORB  ≤{ORB_ENTRY_WIN}min  hold {ORB_HOLD_MIN}min  stop=midpoint  tgt={ORB_TGT_MULT:.0f}×  no width filter  cross-confirm w/ MNQ")
     root.add_row(foot)
 
     return Panel(root, title="ORB  MES  (1-min)", border_style=border,
-                 padding=(0, 1), expand=True)
+                 padding=(0, 1), width=72)
+
+
+def _build_orb_cls_panel(orb: ORBState, now: datetime, symbol: str,
+                         entry_win: int, panel_width: int) -> Panel:
+    """Shared ORB-cls rendering for MES/MNQ — identical mechanics for both
+    (midpoint stop, no cross-confirm), only symbol/entry_win/width differ."""
+    now_et = now.astimezone(ET)
+    hm_et  = now_et.hour * 60 + now_et.minute
+    range_hm     = ORB_CLS_RANGE_HM[0] * 60 + ORB_CLS_RANGE_HM[1]
+    range_end_hm = range_hm + 1
+    entry_end_hm = range_end_hm + entry_win
+    safety_min   = ORB_CLS_SAFETY_HM[0] * 60 + ORB_CLS_SAFETY_HM[1]
+
+    root = Table.grid(padding=(0, 0))
+    root.add_column(justify="center")
+
+    if orb.session_date is None or not orb.orb_high:
+        status = "PRE-MARKET" if hm_et < range_hm else "LOADING…"
+        root.add_row(f"  {status}  ")
+        return Panel(root, title=f"ORB-cls  {symbol}  (15:50 ET)", border_style="default",
+                     padding=(0, 1), width=panel_width)
+
+    dir_word = "LONG" if orb.direction == 1 else "SHORT"
+    if hm_et < range_end_hm:
+        status = "FORMING"; style = "bold"; border = "default"
+    elif orb.direction == 0 and hm_et >= entry_end_hm:
+        status = "EXPIRED"; style = ""; border = "default"
+    elif orb.direction == 0:
+        status = "WATCHING"; style = "bold"; border = "blue"
+    elif orb.confirmed and orb.direction == 1:
+        status = "▲ BREAKOUT LONG"; style = "bold green"; border = "green"
+    elif orb.confirmed:
+        status = "▼ BREAKOUT SHORT"; style = "bold red"; border = "red"
+    else:
+        status = f"{dir_word} — confirming…"; style = "bold yellow"; border = "yellow"
+
+    root.add_row(f"[{style}]  {status}  [/]" if style else f"  {status}  ")
+    root.add_row("")
+
+    rng = Table.grid(padding=(0, 1))
+    rng.add_column(width=10, justify="right")
+    rng.add_column()
+    if orb.orb_high:
+        w_pct = orb.orb_width / orb.orb_mid * 100 if orb.orb_mid else 0
+        rng.add_row("Range Hi:", f"[bold]{orb.orb_high:.2f}[/]")
+        rng.add_row("Range Lo:", f"[bold]{orb.orb_low:.2f}[/]")
+        rng.add_row("Width:",    f"{orb.orb_width:.2f}pt  {w_pct:.3f}%")
+        rng.add_row("Midpoint:", f"{orb.orb_mid:.2f}")
+    root.add_row(rng)
+
+    if orb.direction != 0:
+        root.add_row("")
+        bdet = Table.grid(padding=(0, 1))
+        bdet.add_column(width=10, justify="right")
+        bdet.add_column()
+        clr = "green" if orb.direction == 1 else "red"
+        nominal_exit_min = entry_end_hm - 1 + ORB_CLS_HOLD_MIN
+        exit_et_min = min(nominal_exit_min, safety_min)
+        exit_h, exit_m = divmod(exit_et_min, 60)
+        bdet.add_row("Confirmed:", "[green]yes — order placed[/]" if orb.confirmed
+                                    else "[yellow]not yet — no trade[/]")
+        bdet.add_row("Entry:",   f"[bold {clr}]{orb.entry_price:.2f}[/]"
+                                  + ("" if orb.confirmed else "  (candidate level)"))
+        bdet.add_row("Target:",  f"[bold green]{orb.target:.2f}[/]  "
+                                 f"(+{abs(orb.target-orb.entry_price):.2f}pt)")
+        bdet.add_row("Stop:",    f"[bold red]{orb.stop:.2f}[/]  "
+                                 f"({abs(orb.stop-orb.entry_price):.2f}pt  midpoint)")
+        bdet.add_row("Exit by:", f"~{exit_h:02d}:{exit_m:02d} ET" if orb.confirmed else "—")
+        root.add_row(bdet)
+    elif hm_et < entry_end_hm:
+        root.add_row("")
+        root.add_row(f"  Entry window: 15:51–{(range_end_hm+entry_win-1)//60:02d}:{(range_end_hm+entry_win-1)%60:02d} ET  "
+                     f"(close > {orb.orb_high:.2f} → LONG  /  "
+                     f"close < {orb.orb_low:.2f} → SHORT)")
+
+    root.add_row("")
+    foot = Table.grid(); foot.add_column(justify="center")
+    foot.add_row(f"{symbol} ORB-cls  ≤{entry_win}min  hold {ORB_CLS_HOLD_MIN}min  stop=midpoint  "
+                f"tgt={ORB_CLS_TGT_MULT:.2f}×  no cross-confirm  "
+                f"safety cutoff {ORB_CLS_SAFETY_HM[0]:02d}:{ORB_CLS_SAFETY_HM[1]:02d} ET")
+    root.add_row(foot)
+
+    return Panel(root, title=f"ORB-cls  {symbol}  (15:50 ET)", border_style=border,
+                 padding=(0, 1), width=panel_width)
+
+
+def build_orb_cls_panel(state: MonitorState, now: datetime) -> Panel:
+    return _build_orb_cls_panel(state.orb_cls, now, "MNQ", ORB_CLS_MNQ_ENTRY_WIN, 68)
+
+
+def build_mes_orb_cls_panel(state: MonitorState, now: datetime) -> Panel:
+    return _build_orb_cls_panel(state.orb_cls_mes, now, "MES", ORB_CLS_MES_ENTRY_WIN, 72)
 
 
 def build_dom_panel(state: MonitorState) -> Panel:
@@ -1181,28 +1614,39 @@ def build_wall_panel(state: MonitorState, now: datetime) -> Panel:
 def build_ba_brk_panel(state: MonitorState, now: datetime) -> Panel:
     sig = state.ba_brk_signal
 
-    # Live cascade progress: consecutive ask breakouts chained within the gap
-    # window, ending at the most recent breakout (informational — mirrors
-    # trading_bot.py's _detect_cascade_signal but ignores the dedup cursor
-    # so the panel always shows current progress, not just fresh triggers).
-    ask_events = sorted((e for e in state.ba_brk_breakouts if e.side == "ask"), key=lambda e: e.ts)
-    gaps = [None] + [(ask_events[i].ts - ask_events[i-1].ts).total_seconds()
-                      for i in range(1, len(ask_events))]
-    live_len, live_start = 0, None
-    for gap, e in zip(gaps, ask_events):
-        if gap is not None and gap <= BA_BRK_MAX_GAP_SEC:
-            live_len += 1
-        else:
-            live_len, live_start = 1, e.ts
-    aligned = (state.day_open is not None and ask_events and
-               (ask_events[-1].price or ask_events[-1].wall_price) > state.day_open)
+    # Live cascade progress: consecutive same-side breakouts chained within
+    # the gap window, ending at the most recent breakout (informational —
+    # mirrors trading_bot.py's _detect_cascade_signal but ignores the dedup
+    # cursor so the panel always shows current progress, not just fresh
+    # triggers). Tracked for both sides since the real bot trades both.
+    def _live_cascade_len(side: str):
+        evs = sorted((e for e in state.ba_brk_breakouts
+                      if e.side == side and e.event == "breakout"), key=lambda e: e.ts)
+        gaps = [None] + [(evs[i].ts - evs[i-1].ts).total_seconds() for i in range(1, len(evs))]
+        n = 0
+        for gap in gaps:
+            n = n + 1 if (gap is not None and gap <= BA_BRK_MAX_GAP_SEC) else 1
+        return n, evs
+
+    live_len, ask_breakouts = _live_cascade_len("ask")
+    aligned = (state.day_open is not None and ask_breakouts and
+               (ask_breakouts[-1].price or ask_breakouts[-1].wall_price) > state.day_open)
+
+    bid_live_len, bid_breakouts = _live_cascade_len("bid")
+    bid_aligned = (state.day_open is not None and bid_breakouts and
+                   (bid_breakouts[-1].price or bid_breakouts[-1].wall_price) < state.day_open)
 
     if sig and now < sig.expires_at:
-        status = "▲ CASCADE LONG"; border = "green"; style = "bold green"
-    elif live_len >= 2:
-        status = f"BUILDING ({live_len}/{BA_BRK_CASCADE_MIN})"; border = "yellow"; style = "bold yellow"
+        if sig.direction == 1:
+            status = "▲ CASCADE LONG"; border = "green"; style = "bold green"
+        else:
+            status = "▼ CASCADE SHORT"; border = "red"; style = "bold red"
+    elif max(live_len, bid_live_len) >= 2:
+        side_word = "ask" if live_len >= bid_live_len else "bid"
+        status = f"BUILDING {side_word} ({max(live_len, bid_live_len)}/{BA_BRK_CASCADE_MIN})"
+        border = "yellow"; style = "bold yellow"
     else:
-        status = "WATCHING"; border = "blue" if ask_events else "default"; style = "bold" if ask_events else ""
+        status = "WATCHING"; border = "blue" if state.ba_brk_breakouts else "default"; style = "bold" if state.ba_brk_breakouts else ""
 
     root = Table.grid(padding=(0, 0))
     root.add_column(justify="center")
@@ -1214,11 +1658,16 @@ def build_ba_brk_panel(state: MonitorState, now: datetime) -> Panel:
         det.add_column(width=10, justify="right")
         det.add_column()
         rem = max(0, int((sig.expires_at - now).total_seconds()))
+        clr = "green" if sig.direction == 1 else "red"
+        tgt_pts  = BA_BRK_TARGET_PTS if sig.side == "ask" else BA_BRK_BID_TARGET_PTS
+        stop_pts = BA_BRK_STOP_PTS   if sig.side == "ask" else BA_BRK_BID_STOP_PTS
         det.add_row("Cascade:", f"[bold]{sig.cascade_len}[/] breaks in "
                                  f"{(sig.last_break_ts - sig.first_break_ts).total_seconds():.0f}s")
-        det.add_row("Entry:",   f"[bold green]{sig.entry:.2f}[/]")
-        det.add_row("Target:",  f"[bold green]{sig.target:.2f}[/]  (+{BA_BRK_TARGET_PTS:.0f}pt)")
-        det.add_row("Stop:",    f"[bold red]{sig.stop:.2f}[/]  (-{BA_BRK_STOP_PTS:.1f}pt)")
+        det.add_row("Entry:",   f"[bold {clr}]{sig.entry:.2f}[/]")
+        det.add_row("Target:",  f"[bold green]{sig.target:.2f}[/]  "
+                                 f"({'+' if sig.direction == 1 else '-'}{tgt_pts:.0f}pt)")
+        det.add_row("Stop:",    f"[bold red]{sig.stop:.2f}[/]  "
+                                 f"({'-' if sig.direction == 1 else '+'}{stop_pts:.1f}pt)")
         det.add_row("Hold:",    f"{rem//60}m {rem%60:02d}s remaining")
         root.add_row(det)
     elif state.day_open is not None:
@@ -1227,67 +1676,129 @@ def build_ba_brk_panel(state: MonitorState, now: datetime) -> Panel:
         det.add_column(width=14, justify="right")
         det.add_column()
         det.add_row("Day open:", f"{state.day_open:.2f}")
-        det.add_row("Aligned:",  ("[green]yes[/]" if aligned else "[red]no — filtered[/]")
-                                  if ask_events else "—")
+        det.add_row("Ask Aligned:", ("[green]yes[/]" if aligned else "[red]no — filtered[/]")
+                                     if ask_breakouts else "—")
+        det.add_row("Bid Aligned:", ("[green]yes[/]" if bid_aligned else "[red]no — filtered[/]")
+                                     if bid_breakouts else "—")
         root.add_row(det)
 
-    # Recent ask breakouts (last 10) — the raw feed cascades are built from
-    tail_n = min(10, len(ask_events))
-    if tail_n:
+    # Recent wall activity, both sides, test + breakout (last 12) — same
+    # richer view as WALL BREAK's event log, so there's something to watch
+    # even on a bid-heavy day when no ask cascade has fired yet.
+    notable = sorted(state.ba_brk_breakouts, key=lambda e: e.ts, reverse=True)[:12]
+    if notable:
         root.add_row("")
         lt = Table(box=None, show_header=True, padding=(0, 1), header_style="bold")
-        lt.add_column("time",  justify="right")
-        lt.add_column("side",  justify="center")
-        lt.add_column("wall",  justify="right")
-        lt.add_column("gap",   justify="right")
-        for e, gap in list(zip(ask_events, gaps))[-tail_n:][::-1]:
-            t_s   = e.ts.astimezone(LOCAL).strftime("%H:%M:%S")
-            gap_s = "—" if gap is None else f"{gap:.0f}s"
-            lt.add_row(t_s, "[red]ask[/]", f"{e.wall_price:.2f}", gap_s)
+        lt.add_column("time",   justify="right")
+        lt.add_column("event",  justify="center")
+        lt.add_column("side",   justify="center")
+        lt.add_column("wall",   justify="right")
+        lt.add_column("peak",   justify="right")
+        lt.add_column("tests",  justify="center")
+        for e in notable:
+            t_s  = e.ts.astimezone(LOCAL).strftime("%H:%M:%S")
+            ec   = "bold yellow" if e.event == "breakout" else ""
+            sc   = "green" if e.side == "bid" else "red"
+            pk   = e.peak_size
+            pk_s = f"[bold green]{pk:.0f}[/]" if pk >= 100 else f"{pk:.0f}"
+            lt.add_row(t_s, f"[{ec}]{e.event}[/]" if ec else e.event, f"[{sc}]{e.side}[/]",
+                       f"{e.wall_price:.2f}", pk_s, f"T{e.test_count}")
         root.add_row(lt)
 
     root.add_row("")
     foot = Table.grid(); foot.add_column(justify="center")
-    foot.add_row(f"{BA_BRK_CASCADE_MIN}+ breaks / {BA_BRK_MAX_GAP_SEC}s  "
-                 f"stop {BA_BRK_STOP_PTS:.1f}pt  target {BA_BRK_TARGET_PTS:.0f}pt  "
-                 f"hold {BA_BRK_HOLD_MIN}min  ask-only, aligned w/ day open  9:40–13:00 ET")
+    foot.add_row(f"{BA_BRK_CASCADE_MIN}+ breaks / {BA_BRK_MAX_GAP_SEC}s  aligned w/ day open  9:40–13:00 ET")
+    foot.add_row(f"ask {BA_BRK_STOP_PTS:.1f}/{BA_BRK_TARGET_PTS:.0f}/{BA_BRK_HOLD_MIN}  "
+                 f"bid {BA_BRK_BID_STOP_PTS:.1f}/{BA_BRK_BID_TARGET_PTS:.0f}/{BA_BRK_BID_HOLD_MIN}  "
+                 f"(stop/target/hold)")
     root.add_row(foot)
 
     return Panel(root, title=f"BA-BRK  {SYMBOL}", border_style=border,
-                 padding=(0, 1), expand=False)
+                 padding=(0, 1), width=127)
 
 
-def build_sizing_panel(state: MonitorState) -> Panel:
-    sigma_pts = None
-    if len(state.bars_1m) >= 2:
-        recent = state.bars_1m[-min(SIZING_SIGMA_BARS, len(state.bars_1m)):]
-        closes = [b.close for b in recent]
-        lrs    = [np.log(closes[i] / closes[i-1])
-                  for i in range(1, len(closes)) if closes[i-1] > 0]
-        if len(lrs) >= 2:
-            sigma_pts = float(np.std(lrs, ddof=1)) * closes[-1]
+def build_ba_rev_panel(state: MonitorState, now: datetime) -> Panel:
+    sig = state.ba_rev_signal
+    now_et_hm = now.astimezone(ET).hour * 60 + now.astimezone(ET).minute
+    past_lock = now_et_hm >= BA_REV_LOCK_HM
 
-    t = Table(box=box.SIMPLE_HEAD, show_header=True, padding=(0, 2))
-    t.add_column("", justify="right")
-    t.add_column(SYMBOL, justify="right", style="bold")
+    # Live test-count progress per side (most recent test event, informational)
+    ask_tests  = [e for e in state.ba_brk_breakouts if e.side == "ask" and e.event == "test"]
+    bid_tests  = [e for e in state.ba_brk_breakouts if e.side == "bid" and e.event == "test"]
+    ask_latest = max(ask_tests, key=lambda e: e.ts) if ask_tests else None
+    bid_latest = max(bid_tests, key=lambda e: e.ts) if bid_tests else None
 
-    if sigma_pts:
-        close = state.bars_1m[-1].close
-        t.add_row("bp",  f"{2*sigma_pts/close*10000:.1f}", style="cyan")
-        t.add_row("pts", f"{2*sigma_pts:.2f}",             style="bold cyan")
+    if sig and now < sig.expires_at:
+        dir_arrow = "▲" if sig.direction == 1 else "▼"
+        status = f"{dir_arrow} REVERSAL {'LONG' if sig.direction == 1 else 'SHORT'}"
+        border, style = "green", "bold green"
+    elif past_lock and not state.ba_rev_contained:
+        status = "BROKE OUT — disabled today"; border = "red"; style = "bold red"
+    elif not past_lock and state.ba_rev_ref_day is None:
+        status = "BUILDING REFERENCE (07:00-10:30)"; border = "blue"; style = "bold"
+    elif ((ask_latest and ask_latest.test_count >= BA_REV_TEST_COUNT - 1) or
+          (bid_latest and bid_latest.test_count >= BA_REV_TEST_COUNT - 1)):
+        status = "BUILDING"; border = "yellow"; style = "bold yellow"
     else:
-        t.add_row("bp",  "—", style="cyan")
-        t.add_row("pts", "—", style="bold cyan")
+        status = "WATCHING" + (" (pre-lock)" if not past_lock else " (contained)")
+        border = "blue" if state.ba_brk_breakouts else "default"
+        style = "bold" if state.ba_brk_breakouts else ""
 
-    t.add_row("RISK", "")
-    for risk in SIZING_RISKS:
-        if sigma_pts and sigma_pts > 0:
-            t.add_row(f"${risk}", f"{risk/(2*sigma_pts*POINT_VALUE):.1f}")
+    root = Table.grid(padding=(0, 0))
+    root.add_column(justify="center")
+    root.add_row(f"[{style}]  {status}  [/]" if style else f"  {status}  ")
+
+    if sig and now < sig.expires_at:
+        root.add_row("")
+        det = Table.grid(padding=(0, 1))
+        det.add_column(width=11, justify="right")
+        det.add_column()
+        rem = max(0, int((sig.expires_at - now).total_seconds()))
+        det.add_row("Rejection:", f"[bold]{sig.side}[/] wall @ {sig.wall_price:.2f}  (tests={sig.test_count})")
+        det.add_row("Entry:",  f"[bold green]{sig.entry:.2f}[/]")
+        det.add_row("Target:", f"[bold green]{sig.target:.2f}[/]  ({'+' if sig.direction == 1 else '-'}{BA_REV_TARGET_PTS:.0f}pt)")
+        det.add_row("Stop:",   f"[bold red]{sig.stop:.2f}[/]  ({'-' if sig.direction == 1 else '+'}{BA_REV_STOP_PTS:.1f}pt)")
+        det.add_row("Hold:",   f"{rem//60}m {rem%60:02d}s remaining")
+        root.add_row(det)
+    else:
+        root.add_row("")
+        det = Table.grid(padding=(0, 1))
+        det.add_column(width=14, justify="right")
+        det.add_column()
+        if state.ba_rev_ref_high is not None:
+            det.add_row("Ref range:", f"{state.ba_rev_ref_low:.2f} – {state.ba_rev_ref_high:.2f}  "
+                                        f"({state.ba_rev_ref_high - state.ba_rev_ref_low:.1f}pt)  locked")
         else:
-            t.add_row(f"${risk}", "—")
-    return Panel(t, title="[bold]SIZING (2σ stop)[/]",
-                 subtitle=f"σ: {min(SIZING_SIGMA_BARS, len(state.bars_1m))} 1-min bars",
-                 border_style="blue", padding=(0, 1), expand=False)
+            # Live preview: running high/low from 07:00 ET to now, updates
+            # every render until it locks at 10:30 ET — useful to watch build.
+            ref_start_et = datetime.combine(now.astimezone(ET).date(),
+                                             dtime(BA_REV_REF_START_HM // 60, BA_REV_REF_START_HM % 60), tzinfo=ET)
+            preview = [b for b in state.bars_1m if b.ts.astimezone(ET) >= ref_start_et]
+            if preview:
+                p_hi = max(b.high for b in preview)
+                p_lo = min(b.low for b in preview)
+                det.add_row("Ref range:", f"{p_lo:.2f} – {p_hi:.2f}  ({p_hi - p_lo:.1f}pt)  building…")
+            else:
+                det.add_row("Ref range:", "— (building, locks 10:30 ET)")
+        contain_style = "green" if state.ba_rev_contained else "red"
+        det.add_row("Status:", f"[{contain_style}]{'contained' if state.ba_rev_contained else 'broken out'}[/]"
+                                if past_lock else "pre-lock")
+        if ask_latest:
+            det.add_row("Ask tests:", f"{ask_latest.test_count} @ {ask_latest.wall_price:.2f}")
+        if bid_latest:
+            det.add_row("Bid tests:", f"{bid_latest.test_count} @ {bid_latest.wall_price:.2f}")
+        root.add_row(det)
+
+    root.add_row("")
+    foot = Table.grid(); foot.add_column(justify="center")
+    foot.add_row(f"{BA_REV_TEST_COUNT} tests, no break  "
+                 f"stop {BA_REV_STOP_PTS:.1f}pt  target {BA_REV_TARGET_PTS:.0f}pt  "
+                 f"hold {BA_REV_HOLD_MIN}min  both sides  "
+                 f"trades from 10:30 ET while contained in 07:00-10:30 range")
+    root.add_row(foot)
+
+    return Panel(root, title=f"BA-REV  {SYMBOL}", border_style=border,
+                 padding=(0, 1), width=107)
 
 
 def _position_row(t, symbol: str, size: int, direction: int,
@@ -1327,7 +1838,7 @@ def build_header() -> Table:
     t = Table.grid(expand=True)
     t.add_column(ratio=1); t.add_column(ratio=1, justify="center"); t.add_column(ratio=1, justify="right")
     t.add_row(
-        f"[bold]Focused Bot Monitor[/]  {sess}  ORB (MNQ+MES) · BA-BRK",
+        f"[bold]Focused Bot Monitor[/]  {sess}  ORB+ORB-cls (MNQ+MES) · BA-BRK · BA-REV",
         f"{now_loc.strftime('%H:%M:%S')}  /  {now_et.strftime('%H:%M ET')}",
         "",
     )
@@ -1337,7 +1848,7 @@ def build_header() -> Table:
 # Strategies the focused_bot currently trades (2026-08-29: switched from
 # VWASLR/PL_REV/Wall Break to ORB+BA-BRK for close monitoring). Restricts
 # the Trade Summary panel to just these — see trade_summary_panel.py.
-FOCUSED_STRATEGIES = {"ORB", "BA-BRK"}
+FOCUSED_STRATEGIES = {"ORB", "BA-BRK", "BA-REV"}
 
 
 def render(state: MonitorState) -> Table:
@@ -1347,27 +1858,26 @@ def render(state: MonitorState) -> Table:
     root.add_row(build_header())
 
     # ── Layout ─────────────────────────────────────────────────────────────────
-    # Col 1 (natural width): MNQ ORB · MES ORB · Positions|Sizing
-    # Col 2 (ratio=1):       BA-BRK
-    # Col 3 (ratio=1):       Trade Summary (own column, ORB+BA-BRK only)
-    pos_siz = Table(box=None, show_header=False, padding=(0, 0), expand=False)
-    pos_siz.add_column(); pos_siz.add_column()
-    pos_siz.add_row(build_positions_panel(state), build_sizing_panel(state))
-
+    # Col 1 (natural width): MNQ ORB · MES ORB · MNQ ORB-cls · MES ORB-cls
+    # Col 2 (ratio=1):       BA-BRK · BA-REV
+    # Col 3 (ratio=1):       Trade Summary · Positions
     col1 = Table.grid(); col1.add_column()
     col1.add_row(build_orb_panel(state, now))
     col1.add_row(build_mes_orb_panel(state, now))
-    col1.add_row(pos_siz)
+    col1.add_row(build_orb_cls_panel(state, now))
+    col1.add_row(build_mes_orb_cls_panel(state, now))
 
     # Col 2: BA-BRK
     col2 = Table(box=None, show_header=False, padding=(0, 0), expand=True)
     col2.add_column(ratio=1)
     col2.add_row(build_ba_brk_panel(state, now))
+    col2.add_row(build_ba_rev_panel(state, now))
 
     # Col 3: Trade Summary, given its own column so it isn't squeezed by col2
     col3 = Table(box=None, show_header=False, padding=(0, 0), expand=True)
     col3.add_column(ratio=1)
     col3.add_row(build_trade_summary_panel(strategies=FOCUSED_STRATEGIES))
+    col3.add_row(build_positions_panel(state))
 
     main = Table(box=None, show_header=False, padding=(0, 1), expand=True)
     main.add_column()           # col1: natural width, no ratio
@@ -1391,11 +1901,13 @@ def _detect_position_strategy(symbol: str = SYMBOL) -> str:
             for line in reversed(lines[-500:]):
                 if f" {symbol} " not in line:
                     continue
-                if "VWASLR ORDER" in line: return "VWASLR"
-                if "PL_REV ORDER" in line: return "PL REV"
-                if "ORB ORDER"    in line: return "ORB"
+                if "VWASLR ORDER"  in line: return "VWASLR"
+                if "PL_REV ORDER"  in line: return "PL REV"
+                if "ORB_CLS ORDER" in line: return "ORB-cls"
+                if "ORB ORDER"     in line: return "ORB"
                 if "WALL"         in line and "ORDER" in line: return "WALL BRK"
                 if "BA_BRK ORDER" in line: return "BA-BRK"
+                if "BA_REV ORDER" in line: return "BA-REV"
         except Exception:
             pass
     return ""
@@ -1459,6 +1971,11 @@ def run():
                 _update_orb(state)
                 fetch_mes_orb_bars(state)
                 _update_mes_orb(state)
+                _sync_orb_from_log(state)
+                # ORB-cls reuses the same MNQ/MES bars fetched above
+                _update_orb_cls(state)
+                _update_mes_orb_cls(state)
+                _sync_orb_cls_from_log(state)
             except Exception: traceback.print_exc()
     threading.Thread(target=_fetch_1min_loop, daemon=True, name="bar-fetch").start()
 
@@ -1604,35 +2121,101 @@ def run():
                         now >= state.wall_break_signal.expires_at):
                     state.wall_break_signal = None
 
-                # BA-BRK: accumulate every raw breakout (both sides, unfiltered
-                # by wall size) and check for a fresh cascade.
+                # BA-BRK: accumulate breakout + test events (both sides, unfiltered
+                # by wall size) for display, and check for a fresh ask cascade.
+                # (test events are display-only context — cascade detection below
+                # filters back down to breakouts, matching trading_bot.py's live logic.)
                 for ev in events:
-                    if ev.event == "breakout":
+                    if ev.event in ("test", "breakout"):
                         state.ba_brk_breakouts.append(ev)
                 prune_before = now - timedelta(minutes=BA_BRK_BUFFER_MIN)
                 state.ba_brk_breakouts = [e for e in state.ba_brk_breakouts if e.ts >= prune_before]
 
-                state.day_open = _day_open_price(state.bars_mes_orb, now) or state.day_open
+                today = now.astimezone(LOCAL).date()
+                if state.day_open_date != today:
+                    fresh_open = _day_open_price(state.bars_mes_orb, now)
+                    if fresh_open is not None:
+                        state.day_open      = fresh_open
+                        state.day_open_date = today
 
+                # Mirrors trading_bot.py's evaluate_ba_brk: check both sides (ask
+                # cascades are long, bid cascades are short — bid live since
+                # 2026-09-14, see BA_BRK_BID_* constants), pick whichever cascade
+                # triggered most recently, same as the real bot's own tie-break.
+                ask_breakouts_only = [e for e in state.ba_brk_breakouts if e.event == "breakout"]
                 last_ts = state.ba_brk_signal.last_break_ts if state.ba_brk_signal else None
-                r = _detect_cascade_signal(state.ba_brk_breakouts, "ask",
-                                            BA_BRK_CASCADE_MIN, BA_BRK_MAX_GAP_SEC, last_ts)
-                if r and (now - r[0].ts).total_seconds() <= BA_BRK_MAX_GAP_SEC + 15:
-                    trigger, cascade_start, cascade_len = r
-                    entry_price = trigger.price or trigger.wall_price
-                    if state.day_open is not None and entry_price > state.day_open:
-                        state.ba_brk_signal = BaBrkSignal(
-                            direction=1, side="ask", entry=entry_price,
-                            target=entry_price + BA_BRK_TARGET_PTS,
-                            stop=entry_price - BA_BRK_STOP_PTS,
-                            cascade_len=cascade_len, first_break_ts=cascade_start,
-                            last_break_ts=trigger.ts,
-                            fired_at=now, expires_at=now + timedelta(minutes=BA_BRK_HOLD_MIN),
-                        )
-                        play_alert()
+                brk_candidates = []
+                r_ask = _detect_cascade_signal(ask_breakouts_only, "ask",
+                                                BA_BRK_CASCADE_MIN, BA_BRK_MAX_GAP_SEC, last_ts)
+                if r_ask:
+                    brk_candidates.append(("ask", *r_ask))
+                r_bid = _detect_cascade_signal(ask_breakouts_only, "bid",
+                                                BA_BRK_CASCADE_MIN, BA_BRK_MAX_GAP_SEC, last_ts)
+                if r_bid:
+                    brk_candidates.append(("bid", *r_bid))
+                if brk_candidates:
+                    side, trigger, cascade_start, cascade_len = max(brk_candidates, key=lambda c: c[1].ts)
+                    if (now - trigger.ts).total_seconds() <= BA_BRK_MAX_GAP_SEC + 15:
+                        entry_price = trigger.price or trigger.wall_price
+                        if side == "ask" and state.day_open is not None and entry_price > state.day_open:
+                            state.ba_brk_signal = BaBrkSignal(
+                                direction=1, side="ask", entry=entry_price,
+                                target=entry_price + BA_BRK_TARGET_PTS,
+                                stop=entry_price - BA_BRK_STOP_PTS,
+                                cascade_len=cascade_len, first_break_ts=cascade_start,
+                                last_break_ts=trigger.ts,
+                                fired_at=now, expires_at=now + timedelta(minutes=BA_BRK_HOLD_MIN),
+                            )
+                            play_alert()
+                        elif side == "bid" and state.day_open is not None and entry_price < state.day_open:
+                            state.ba_brk_signal = BaBrkSignal(
+                                direction=-1, side="bid", entry=entry_price,
+                                target=entry_price - BA_BRK_BID_TARGET_PTS,
+                                stop=entry_price + BA_BRK_BID_STOP_PTS,
+                                cascade_len=cascade_len, first_break_ts=cascade_start,
+                                last_break_ts=trigger.ts,
+                                fired_at=now, expires_at=now + timedelta(minutes=BA_BRK_BID_HOLD_MIN),
+                            )
+                            play_alert()
                 if (state.ba_brk_signal is not None and
                         now >= state.ba_brk_signal.expires_at):
                     state.ba_brk_signal = None
+
+                # BA-REV: wall-rejection reversal — a wall surviving
+                # BA_REV_TEST_COUNT touches without breaking. Reuses the same
+                # ba_brk_breakouts buffer (already holds both test+breakout
+                # events). Trading starts at 10:30 ET (no free window — see
+                # trading_bot.py) and only while still contained within the
+                # 07:00-10:30 reference range.
+                _update_ba_rev_reference(state, now)
+                _update_ba_rev_containment(state, state.bars_1m)
+                now_et_hm_rev = now.astimezone(ET).hour * 60 + now.astimezone(ET).minute
+                rev_eligible = now_et_hm_rev >= BA_REV_LOCK_HM and state.ba_rev_contained
+                if rev_eligible:
+                    rev_last_ts = state.ba_rev_signal.trigger_ts if state.ba_rev_signal else None
+                    rev_candidates = []
+                    for side in ("ask", "bid"):
+                        e = _find_test_signal(state.ba_brk_breakouts, side,
+                                               BA_REV_TEST_COUNT, rev_last_ts)
+                        if e:
+                            rev_candidates.append((side, e))
+                    if rev_candidates:
+                        rside, rtrigger = max(rev_candidates, key=lambda c: c[1].ts)
+                        if (now - rtrigger.ts).total_seconds() <= BA_REV_SIGNAL_STALE_SEC:
+                            rdir  = -1 if rside == "ask" else 1
+                            rentry = rtrigger.price or rtrigger.wall_price
+                            state.ba_rev_signal = BaRevSignal(
+                                direction=rdir, side=rside, entry=rentry,
+                                target=rentry + rdir * BA_REV_TARGET_PTS,
+                                stop=rentry   - rdir * BA_REV_STOP_PTS,
+                                test_count=rtrigger.test_count, wall_price=rtrigger.wall_price,
+                                trigger_ts=rtrigger.ts,
+                                fired_at=now, expires_at=now + timedelta(minutes=BA_REV_HOLD_MIN),
+                            )
+                            play_alert()
+                if (state.ba_rev_signal is not None and
+                        now >= state.ba_rev_signal.expires_at):
+                    state.ba_rev_signal = None
     threading.Thread(target=_eval_walls, daemon=True, name="wall-eval").start()
 
     # Initial VWASLR EMA + ORB after bars loaded
@@ -1644,6 +2227,10 @@ def run():
     _update_orb(state)
     fetch_mes_orb_bars(state)
     _update_mes_orb(state)
+    _sync_orb_from_log(state)
+    _update_orb_cls(state)
+    _update_mes_orb_cls(state)
+    _sync_orb_cls_from_log(state)
 
     # Resolve account ID — same logic as trading_bot (uses TOPSTEP_ACCOUNT_ID env var)
     import os as _os

@@ -26,17 +26,20 @@ TRADE_LOGS = {
     "PL REV":   Path("logs/pl_rev_trades.csv"),
     "WBRK": Path("logs/wall_break_trades.csv"),
     "BA-BRK":   Path("logs/ba_brk_trades.csv"),
+    "BA-REV":   Path("logs/ba_rev_trades.csv"),
 }
 
 STRAT_STYLE = {
     "CSR":      "cyan",
     "ORB":      "yellow",
+    "ORB-cls":  "orange3",
     "VWASLR":   "blue",
     "SLR":      "blue",
     "PL MOM":   "magenta",
     "PL REV":   "green",
     "WBRK": "",
     "BA-BRK":   "red",
+    "BA-REV":   "purple",
 }
 
 MES_MNQ = {"MES", "MNQ"}
@@ -69,6 +72,7 @@ def _load_all(strategies: "set[str] | None" = None) -> list[dict]:
                             continue
 
                         pnl = float(r.get("pnl_pts", 0) or 0)
+                        row_strat = strat
 
                         # Detail string per strategy
                         if strat == "SLR":
@@ -86,6 +90,10 @@ def _load_all(strategies: "set[str] | None" = None) -> list[dict]:
                         elif strat == "ORB":
                             w = float(r.get("orb_width", 0) or 0)
                             detail = f"w={w:.2f}pt" if w else "ORB"
+                            # ORB-cls (15:50 ET closing range) shares orb_trades.csv
+                            # with the morning ORB, distinguished by window=Closing.
+                            if r.get("window") == "Closing":
+                                row_strat = "ORB-cls"
                         elif strat == "PL REV":
                             pl  = float(r.get("pl",       0) or 0)
                             mbp = float(r.get("move_bps", 0) or 0)
@@ -97,11 +105,15 @@ def _load_all(strategies: "set[str] | None" = None) -> list[dict]:
                             side = r.get("side", "")
                             cl   = r.get("cascade_len", "")
                             detail = f"{side} x{cl}"
+                        elif strat == "BA-REV":
+                            side = r.get("side", "")
+                            tc   = r.get("test_count", "")
+                            detail = f"{side} tests={tc}"
                         else:
                             detail = ""
 
                         rows.append({
-                            "strat":    strat,
+                            "strat":    row_strat,
                             "sym":      sym,
                             "fired_at": fired,
                             "direction": r.get("direction", "LONG"),
@@ -126,7 +138,7 @@ def build_trade_summary_panel(max_rows: int = 20,
     tbl = Table(box=None, show_header=True, padding=(0, 1))
     tbl.add_column("Sym",        width=4)
     tbl.add_column("Time",       width=5)
-    tbl.add_column("Strat",      width=6)
+    tbl.add_column("Strat",      width=7)   # widened for "ORB-cls" (7 chars)
     tbl.add_column("Dir",        width=7)
     tbl.add_column("Entry",      justify="right", width=9)
     tbl.add_column("Detail",     width=14)
