@@ -839,34 +839,37 @@ class BotInstrument:
 
 
 INSTRUMENTS = [
-    # MES: 1-min ORB. Sweep (Apr–Aug 2026, 84 sessions):
+    # MES: 1-min ORB — DISABLED 2026-10-02. The WR=65.9%/PF=3.03 sweep below
+    # turned out to assume entry at the ORB level itself (orb_h/orb_l)
+    # instead of the actual breakout bar's close that evaluate_orb() uses
+    # live — a backtest bug inherited by every ORB-family sweep script,
+    # including ORB-cls's. Re-run with entry priced correctly (bar.close):
+    # MES ORB WR=35.5% PF=0.71 (-$411 over 120 sessions, net losing) and
+    # MES ORB-cls PF=0.97 (-$33). Tried width-min/stop-floor filters to
+    # rescue it (src/backtest_orb_resweep.py) — the narrow-range-days-lose
+    # pattern is real but no specific threshold survived a walk-forward
+    # train/test split. User's call: shut down all ORB variants, focus on
+    # BA-BRK/BA-REV instead. See project_orb_cls_strategy memory.
     #   entry=close-break, stop=ORB midpoint (half-range), target=1×width,
     #   entry window=5min, hold=10min, both directions.
-    #   WR=65.9% PF=3.03 $1,325 (1 contract). Width filter makes no difference.
-    #   Midpoint stop outperforms far_side for MES (better R:R at ~2:1).
+    #   WR=65.9% PF=3.03 $1,325 (1 contract) — this number is the bugged one above.
     #   NOTE (2026-09-03): this WR/PF didn't reproduce in a faithful live-mirror
     #   backtest (src/backtest_orb_cross_confirm.py) — got WR=36.8% on the same
-    #   window. Unresolved; see project memory. Treat the WR/PF above with caution.
+    #   window, which is what led to finding the entry-pricing bug.
     BotInstrument("MES", "MES", tick_size=0.25, point_value=5.00,
                   csr_vol_windows=[(0.08, 4), (1.0, 8)],
                   blackout_windows=[
                       (16,  0,  9,  0, False),  # trade 09:00–16:00 ET only
                   ],
-                  orb_enabled=True,
+                  orb_enabled=False,
                   orb_width_pct_min=0.0,     orb_width_pct_max=0.0,    # no width filter
                   orb_period_min=1,           orb_entry_window_min=5,   # 5-min entry window
                   orb_target_mult=1.0,        orb_gap_fade_long=False,  # both directions
                   orb_full_range_stop=False,  orb_hold_min=10,          # midpoint stop, exit ~9:41 ET
                   orb_max_loss_dollars=0,                               # no dollar cap
                   orb_cross_confirm=True,    # only fire once MNQ's own ORB agrees in direction
-                  # ORB-cls: close-break, midpoint stop, 3.25x target, 5-min
-                  # entry window (15:51-15:55 ET), 15-min hold. Walk-forward
-                  # test PF=1.44 (+$106, Aug13-Sep30 2026 holdout). No cross-confirm.
-                  # Worst-case entry (15:55) + 15min hold lands exactly on
-                  # TopstepX's 16:10 ET cutoff with zero margin — the
-                  # ORB_CLS_SAFETY_DEADLINE_MIN force-flat (16:08 ET) is the
-                  # real protection in that edge case, not the nominal hold.
-                  orb_cls_enabled=True,
+                  # ORB-cls — DISABLED 2026-10-02, same reason as orb_enabled above.
+                  orb_cls_enabled=False,
                   orb_cls_target_mult=3.25, orb_cls_entry_window_min=5, orb_cls_hold_min=15,
                   vwaslr_n=50, vwaslr_threshold=0.4, vwaslr_start=(9, 40),
                   slr_enabled=False,
@@ -876,28 +879,29 @@ INSTRUMENTS = [
                   pl_rev_enabled=True,
                   ba_brk_enabled=True, ba_brk_ask_enabled=True, ba_brk_bid_enabled=True,
                   ba_rev_enabled=True, ba_rev_ask_enabled=True, ba_rev_bid_enabled=True),
-    # MNQ: 1-min ORB. Sweep (Apr–Aug 2026, 82 sessions):
+    # MNQ: 1-min ORB — DISABLED 2026-10-02, same reason as MES above (entry-
+    # pricing backtest bug). Corrected: MNQ ORB WR=46.8% PF=0.79 (-$1,234
+    # over 120 sessions). Width-min/far-side-cap re-sweep found a promising-
+    # looking region (width>=70pt, $100 cap) in-sample but it inverted on
+    # walk-forward test (PF dropped to 0.32-0.67). See project_orb_cls_strategy
+    # memory and src/backtest_orb_resweep.py.
     #   entry=close-break, stop=opposite-ORB capped at $500, target=1×width,
     #   width≤30bps, entry window=5min, hold=10min (exit ~9:40 ET).
-    #   Both directions (no gap filter). WR=63% PF=1.41 $2,512 (3 contracts).
+    #   Both directions (no gap filter). WR=63% PF=1.41 $2,512 (3 contracts) —
+    #   this number is the bugged one described above.
     BotInstrument("MNQ", "MNQ", tick_size=0.25, point_value=2.00,
                   blackout_windows=[
                       (16,  0,  9,  0, False),  # trade 09:00–16:00 ET only
                   ],
-                  orb_enabled=True,
+                  orb_enabled=False,
                   orb_width_pct_min=0.0,    orb_width_pct_max=0.003,  # ≤30bps
                   orb_period_min=1,          orb_entry_window_min=5,   # 5-min entry window
                   orb_target_mult=1.0,       orb_gap_fade_long=False,  # both directions
                   orb_full_range_stop=True,  orb_hold_min=10,          # exit ~9:40 ET
                   orb_max_loss_dollars=500,                            # $500 stop cap
                   orb_cross_confirm=True,    # only fire once MES's own ORB agrees in direction
-                  # ORB-cls: close-break, midpoint stop, 3.25x target, 3-min
-                  # entry window (15:51-15:54 ET), 15-min hold — shorter window
-                  # than MES; walk-forward showed 5-min overfit for MNQ (test
-                  # PF~1.0) while 3-min held up (test PF=1.28, +$107). No
-                  # cross-confirm. Worst-case exit ~16:08 ET, 2min inside the
-                  # TopstepX 16:10 ET flat-by cutoff.
-                  orb_cls_enabled=True,
+                  # ORB-cls — DISABLED 2026-10-02, same reason as orb_enabled above.
+                  orb_cls_enabled=False,
                   orb_cls_target_mult=3.25, orb_cls_entry_window_min=3, orb_cls_hold_min=15,
                   vwaslr_n=0,
                   slr_enabled=False,

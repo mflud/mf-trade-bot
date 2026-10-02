@@ -135,7 +135,7 @@ def sim_session(sess: dict, symbol: str,
         if not long_done and (direction == "both" or not short_done):
             triggered = (bar["h"] >= orb_h) if entry_type == "touch" else (bar["c"] > orb_h)
             if triggered:
-                entry = orb_h
+                entry = orb_h if entry_type == "touch" else bar["c"]
                 tgt   = entry + target_pts
                 stp   = entry - stop_pts_long
                 exit_p, result = _sim_exit(entry, tgt, stp, 1, bar, sess["bars"][i + 1:], hold, cap_1600)
@@ -150,7 +150,7 @@ def sim_session(sess: dict, symbol: str,
         if not short_done and (direction == "both" or not long_done):
             triggered = (bar["l"] <= orb_l) if entry_type == "touch" else (bar["c"] < orb_l)
             if triggered:
-                entry = orb_l
+                entry = orb_l if entry_type == "touch" else bar["c"]
                 tgt   = entry - target_pts
                 stp   = entry + stop_pts_short
                 exit_p, result = _sim_exit(entry, tgt, stp, -1, bar, sess["bars"][i + 1:], hold, cap_1600)

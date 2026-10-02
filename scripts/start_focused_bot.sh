@@ -1,14 +1,17 @@
 #!/bin/bash
-# Start trading_bot with ORB + BA-BRK strategies only (switched 2026-08-29 to
+# Start trading_bot with BA-BRK + BA-REV strategies only (switched 2026-08-29 to
 # closely monitor the new BA-BRK wall-cascade signal; PL_REV/Wall Break/VWASLR
 # disabled here — re-add to STRATEGIES if going back to the prior mix).
+# ORB and ORB-cls removed 2026-10-02 — corrected (bar.close entry) backtests
+# showed no real edge and didn't survive walk-forward re-validation even
+# after width/stop tuning. See project_orb_cls_strategy memory.
 # Logs to logs/focused_bot.log; PID tracked in logs/trading_bot.pid (shared).
 # Guards: skips before 08:45 ET; waits up to 60s for bar_collector to be actively writing bars.
 REPO=/Users/marek/mf-trade-bot
 PIDFILE="$REPO/logs/trading_bot.pid"
 LOGFILE="$REPO/logs/focused_bot.log"
 PYTHON=/Library/Frameworks/Python.framework/Versions/3.12/bin/python3
-STRATEGIES="orb,orb_cls,ba_brk,ba_rev"  # 2026-10-01: added ORB-cls (15:50 ET closing-range breakout, no cross-confirm)
+STRATEGIES="ba_brk,ba_rev"  # 2026-10-02: dropped orb,orb_cls — no validated edge, see note above
 
 mkdir -p "$REPO/logs"
 

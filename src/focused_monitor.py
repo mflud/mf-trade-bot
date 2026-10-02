@@ -1,13 +1,17 @@
 """
-focused_monitor.py — Monitor for the focused bot (ORB, ORB-cls, BA-BRK, BA-REV).
+focused_monitor.py — Monitor for the focused bot (BA-BRK, BA-REV).
+
+ORB and ORB-cls panels removed 2026-10-02 — corrected (bar.close entry)
+backtests showed no validated edge for either, even after width/stop
+tuning (see project_orb_cls_strategy memory). The underlying ORB/ORB-cls
+code (evaluate_orb/_cls, panel builders, log-sync) is left in place but
+unused, in case it's revisited.
 
 Layout:
-  ┌────────────────────────┬──────────────────┬───────────────────────────┐
-  │ MNQ ORB                │ BA-BRK            │ Trade Summary             │
-  │ MES ORB                │ BA-REV            │ Positions                 │
-  │ MNQ ORB-cls             │                   │                           │
-  │ MES ORB-cls             │                   │                           │
-  └────────────────────────┴──────────────────┴───────────────────────────┘
+  ┌──────────────────┬───────────────────────────┐
+  │ BA-BRK            │ Trade Summary             │
+  │ BA-REV            │ Positions                 │
+  └──────────────────┴───────────────────────────┘
 
 Usage:
     python src/focused_monitor.py
@@ -530,43 +534,54 @@ def fetch_1min_bars(client: TopstepClient, state: MonitorState):
 
 # ─── MNQ bar fetcher (for ORB) ────────────────────────────────────────────────
 
+def _orb_session_cutoff_utc() -> str:
+    """09:00 ET today, as an ISO UTC string — the lower bound for ORB bar
+    fetches. Using a time cutoff (not a row-count LIMIT) so a mid-day
+    restart of this monitor doesn't lose the 9:30 ET morning-ORB range:
+    a LIMIT 200 fetch only reaches back ~3.3hrs, which silently stops
+    covering 9:30 ET by early afternoon and leaves the morning ORB panel
+    stuck on LOADING for the rest of the day."""
+    session_start = datetime.now(ET).replace(hour=9, minute=0, second=0, microsecond=0)
+    return session_start.astimezone(timezone.utc).isoformat()
+
+
 def fetch_mnq_bars(state: MonitorState):
-    """Load MNQ 1-min bars from bars.db for today's ORB tracking."""
+    """Load MNQ 1-min bars from bars.db for today's ORB tracking (09:00 ET onward)."""
     try:
         import sqlite3
-        now_et = datetime.now(ET)
-        today  = now_et.date()
-        # Fetch last 200 1-min MNQ bars from db
         conn = sqlite3.connect("data/bars.db", timeout=1.0)
         rows = conn.execute(
             "SELECT ts, open, high, low, close, volume FROM bars "
-            "WHERE symbol='MNQ' AND minutes=1 ORDER BY ts DESC LIMIT 200"
+            "WHERE symbol='MNQ' AND minutes=1 AND ts >= ? ORDER BY ts LIMIT 600",
+            (_orb_session_cutoff_utc(),)
         ).fetchall()
         conn.close()
         if rows:
-            bars = [Bar(ts=datetime.fromisoformat(r[0]),
-                        open=r[1], high=r[2], low=r[3], close=r[4], volume=r[5])
-                    for r in reversed(rows)]
-            state.bars_orb = bars
+            state.bars_orb = [
+                Bar(ts=datetime.fromisoformat(r[0]),
+                    open=r[1], high=r[2], low=r[3], close=r[4], volume=r[5])
+                for r in rows
+            ]
     except Exception:
         pass
 
 
 def fetch_mes_orb_bars(state: MonitorState):
-    """Load MES 1-min bars from bars.db for today's MES ORB tracking."""
+    """Load MES 1-min bars from bars.db for today's MES ORB tracking (09:00 ET onward)."""
     try:
         import sqlite3
         conn = sqlite3.connect("data/bars.db", timeout=1.0)
         rows = conn.execute(
             "SELECT ts, open, high, low, close, volume FROM bars "
-            "WHERE symbol='MES' AND minutes=1 ORDER BY ts DESC LIMIT 200"
+            "WHERE symbol='MES' AND minutes=1 AND ts >= ? ORDER BY ts LIMIT 600",
+            (_orb_session_cutoff_utc(),)
         ).fetchall()
         conn.close()
         if rows:
             state.bars_mes_orb = [
                 Bar(ts=datetime.fromisoformat(r[0]),
                     open=r[1], high=r[2], low=r[3], close=r[4], volume=r[5])
-                for r in reversed(rows)
+                for r in rows
             ]
     except Exception:
         pass
@@ -1838,17 +1853,18 @@ def build_header() -> Table:
     t = Table.grid(expand=True)
     t.add_column(ratio=1); t.add_column(ratio=1, justify="center"); t.add_column(ratio=1, justify="right")
     t.add_row(
-        f"[bold]Focused Bot Monitor[/]  {sess}  ORB+ORB-cls (MNQ+MES) · BA-BRK · BA-REV",
+        f"[bold]Focused Bot Monitor[/]  {sess}  BA-BRK · BA-REV",
         f"{now_loc.strftime('%H:%M:%S')}  /  {now_et.strftime('%H:%M ET')}",
         "",
     )
     return t
 
 
-# Strategies the focused_bot currently trades (2026-08-29: switched from
-# VWASLR/PL_REV/Wall Break to ORB+BA-BRK for close monitoring). Restricts
-# the Trade Summary panel to just these — see trade_summary_panel.py.
-FOCUSED_STRATEGIES = {"ORB", "BA-BRK", "BA-REV"}
+# Strategies the focused_bot currently trades. ORB and ORB-cls removed
+# 2026-10-02 — corrected (bar.close entry) backtests showed no validated
+# edge even after width/stop tuning; see project_orb_cls_strategy memory.
+# Restricts the Trade Summary panel to just these — see trade_summary_panel.py.
+FOCUSED_STRATEGIES = {"BA-BRK", "BA-REV"}
 
 
 def render(state: MonitorState) -> Table:
@@ -1858,32 +1874,23 @@ def render(state: MonitorState) -> Table:
     root.add_row(build_header())
 
     # ── Layout ─────────────────────────────────────────────────────────────────
-    # Col 1 (natural width): MNQ ORB · MES ORB · MNQ ORB-cls · MES ORB-cls
-    # Col 2 (ratio=1):       BA-BRK · BA-REV
-    # Col 3 (ratio=1):       Trade Summary · Positions
-    col1 = Table.grid(); col1.add_column()
-    col1.add_row(build_orb_panel(state, now))
-    col1.add_row(build_mes_orb_panel(state, now))
-    col1.add_row(build_orb_cls_panel(state, now))
-    col1.add_row(build_mes_orb_cls_panel(state, now))
+    # Col 1 (ratio=1): BA-BRK · BA-REV
+    # Col 2 (ratio=1): Trade Summary · Positions
+    col1 = Table(box=None, show_header=False, padding=(0, 0), expand=True)
+    col1.add_column(ratio=1)
+    col1.add_row(build_ba_brk_panel(state, now))
+    col1.add_row(build_ba_rev_panel(state, now))
 
-    # Col 2: BA-BRK
+    # Col 2: Trade Summary, given its own column so it isn't squeezed by col1
     col2 = Table(box=None, show_header=False, padding=(0, 0), expand=True)
     col2.add_column(ratio=1)
-    col2.add_row(build_ba_brk_panel(state, now))
-    col2.add_row(build_ba_rev_panel(state, now))
-
-    # Col 3: Trade Summary, given its own column so it isn't squeezed by col2
-    col3 = Table(box=None, show_header=False, padding=(0, 0), expand=True)
-    col3.add_column(ratio=1)
-    col3.add_row(build_trade_summary_panel(strategies=FOCUSED_STRATEGIES))
-    col3.add_row(build_positions_panel(state))
+    col2.add_row(build_trade_summary_panel(strategies=FOCUSED_STRATEGIES))
+    col2.add_row(build_positions_panel(state))
 
     main = Table(box=None, show_header=False, padding=(0, 1), expand=True)
-    main.add_column()           # col1: natural width, no ratio
+    main.add_column(ratio=1)    # col1: fills remaining space
     main.add_column(ratio=1)    # col2: fills remaining space
-    main.add_column(ratio=1)    # col3: fills remaining space
-    main.add_row(col1, col2, col3)
+    main.add_row(col1, col2)
     root.add_row(main)
 
     return root
@@ -1966,16 +1973,6 @@ def run():
                     state.vwaslr_history.append((state.bars_1m[-1].ts, state.vwaslr_ema, fired))
                     if len(state.vwaslr_history) > 40:
                         state.vwaslr_history = state.vwaslr_history[-40:]
-                # Update ORB (MNQ and MES bars)
-                fetch_mnq_bars(state)
-                _update_orb(state)
-                fetch_mes_orb_bars(state)
-                _update_mes_orb(state)
-                _sync_orb_from_log(state)
-                # ORB-cls reuses the same MNQ/MES bars fetched above
-                _update_orb_cls(state)
-                _update_mes_orb_cls(state)
-                _sync_orb_cls_from_log(state)
             except Exception: traceback.print_exc()
     threading.Thread(target=_fetch_1min_loop, daemon=True, name="bar-fetch").start()
 
@@ -2218,19 +2215,11 @@ def run():
                     state.ba_rev_signal = None
     threading.Thread(target=_eval_walls, daemon=True, name="wall-eval").start()
 
-    # Initial VWASLR EMA + ORB after bars loaded
+    # Initial VWASLR EMA after bars loaded
     time.sleep(2)
     sigma_pts = _update_vwaslr_ema(state)
     if sigma_pts:
         state.vwaslr_sigma_pts = sigma_pts
-    fetch_mnq_bars(state)
-    _update_orb(state)
-    fetch_mes_orb_bars(state)
-    _update_mes_orb(state)
-    _sync_orb_from_log(state)
-    _update_orb_cls(state)
-    _update_mes_orb_cls(state)
-    _sync_orb_cls_from_log(state)
 
     # Resolve account ID — same logic as trading_bot (uses TOPSTEP_ACCOUNT_ID env var)
     import os as _os
