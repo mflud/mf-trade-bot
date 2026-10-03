@@ -312,11 +312,35 @@ BA_BRK_STOP_MAX           = 3.5
 # this signal, unlike Wall Break's 4-5pt clamp.
 BA_BRK_TARGET_PTS         = 12.0
 BA_BRK_HOLD_MIN           = 25
+BA_BRK_ASK_ALIGN_LOOKBACK_MIN = 90   # ask alignment ref = price 90min ago, not day's 9:30
+                                      # open — the since-open filter badly underperforms a
+                                      # trailing window on out-of-sample data (2026-10-02
+                                      # walk-forward: since-open test EV=+0.07, 90min
+                                      # trailing test EV=+0.28, same train quality). Many
+                                      # days fully reverse, making "since open" stale.
+                                      # Bid side unchanged (not backtested with trailing).
 BA_BRK_TRADE_START        = (9, 40)    # ET — standard first-10min blackout; backtest shows
 BA_BRK_TRADE_END          = (13, 0)    # ET   9:40-13:00 beats the narrower 10:30-13:00 gate
                                         # once the alignment filter is applied (see above)
 BA_BRK_BUFFER_MIN         = 5      # minutes of raw breakout events kept for cascade scanning
 BA_BRK_MAX_CONSEC_LOSSES  = 2
+# Target-widening management rule (2026-10-02): if an ask wall above a
+# currently-open ASK-side long never gets tested before it's pulled, that's
+# a strong "this is still working, don't touch it" signal (backtested:
+# baseline EV=+6.27pt/WR=69.2% on this subset; widening target to 18pt and
+# resetting a fresh 25min hold from the trigger improved it to EV=+7.16pt
+# at the SAME 69.2% WR — no trades flipped from win to loss). Explicitly
+# NOT doing breakeven-stop-and-extend instead — that was tested first and
+# roughly halved the profit on this same subset (cuts off ordinary
+# pullbacks that would have recovered). ASK side only — bid wasn't
+# backtested for this rule. See project memory project_ba_brk_strategy /
+# analyze_wall_ahead_exit.py. Only ~25 trades in the backtest — a genuine
+# lead, not yet a heavily-validated edge; watch live results.
+BA_BRK_WIDEN_ENABLED      = True
+BA_BRK_WIDEN_NEW_TARGET_PTS = 18.0
+BA_BRK_WIDEN_EXTEND_MIN     = 25
+BA_BRK_WIDEN_BUFFER_MIN     = 50   # lifecycle-event buffer window — must cover worst-case
+                                    # fired_at -> trigger -> +EXTEND_MIN span
 # Bid side, mirrors ask's "aligned with the day's move since open" filter
 # (fires only when price is BELOW the day's 9:30 open — i.e. aligned with a
 # downtrend, not countertrend fade; a separate countertrend-fade idea was
@@ -448,7 +472,7 @@ WALL_BREAK_LOG_FIELDS = [
 BA_BRK_LOG_FIELDS = [
     "fired_at", "resolved_at", "symbol", "direction", "side",
     "est_entry", "fill_price", "cascade_len", "first_break_ts", "last_break_ts",
-    "stop", "target", "outcome", "pnl_pts",
+    "stop", "target", "outcome", "pnl_pts", "widened",
 ]
 BA_REV_LOG_FIELDS = [
     "fired_at", "resolved_at", "symbol", "direction", "side",
@@ -1271,6 +1295,7 @@ class ActiveBaBrkTrade:
     fired_at:    datetime
     order_id:    int   | None = None
     fill_price:  float | None = None
+    widened:     bool  = False   # BA_BRK_WIDEN_ENABLED rule already applied?
 
     def target_price(self) -> float:
         p = self.fill_price or self.sig.entry
@@ -1384,6 +1409,10 @@ class InstrumentState:
     ba_brk_day:                 "date | None"                 = None
     ba_brk_consec_losses:       int                            = 0
     ba_brk_halted_today:        bool                           = False
+    # ALL wall-event types (found/test/breakout/pulled), longer window —
+    # feeds the BA_BRK_WIDEN_ENABLED target-widening management rule, which
+    # needs a wall's full lifecycle, not just breakouts.
+    recent_wall_lifecycle:      list                          = field(default_factory=list)
     # BA-REV state (reuses wall_tracker above; buffers raw "test" events)
     recent_ba_rev_tests:        list                          = field(default_factory=list)
     ba_rev_last_ts:             "datetime | None"             = None
@@ -3366,6 +3395,20 @@ def _day_open_price(bars: list, now: datetime) -> float | None:
     return None
 
 
+def _trailing_ref_price(bars: list, now: datetime, lookback_min: int) -> float | None:
+    """Close of the most recent bar at or before now-lookback_min. None if no
+    bar is old enough yet (e.g. early in the session) — `bars` assumed sorted
+    oldest-first, matching every other bar list in this file."""
+    cutoff = now - timedelta(minutes=lookback_min)
+    candidate = None
+    for bar in bars:
+        if bar.ts <= cutoff:
+            candidate = bar
+        else:
+            break
+    return candidate.close if candidate else None
+
+
 def _detect_cascade_signal(events: list, side: str, cascade_min: int, max_gap_sec: int,
                             after_ts: "datetime | None"):
     """Scan time-ordered WallEvent breakouts for `side`, chaining consecutive
@@ -3434,18 +3477,20 @@ def evaluate_ba_brk(state, now: datetime) -> "BaBrkSignal | None":
     if (now - trigger.ts).total_seconds() > BA_BRK_MAX_GAP_SEC + 15:
         return None   # stale — cascade completed too long ago to act on
 
-    day_open = _day_open_price(state.vwaslr_bars, now)
-    if day_open is None:
-        return None
-
     if side == "ask":
-        if best_ask <= day_open:
-            return None   # not aligned with the day's move since open — hard filter
+        align_ref = _trailing_ref_price(state.vwaslr_bars, now, BA_BRK_ASK_ALIGN_LOOKBACK_MIN)
+        if align_ref is None:
+            return None
+        if best_ask <= align_ref:
+            return None   # not aligned with the trailing-90min trend — hard filter
         stop_pts = max(BA_BRK_STOP_MIN, min(state.sigma_pts, BA_BRK_STOP_MAX))
         direction, entry = 1, best_ask
         stop, target = entry - stop_pts, entry + BA_BRK_TARGET_PTS
         hold_min = BA_BRK_HOLD_MIN
     else:
+        day_open = _day_open_price(state.vwaslr_bars, now)
+        if day_open is None:
+            return None
         if best_bid >= day_open:
             return None   # not aligned with the day's downtrend since open — hard filter
         direction, entry = -1, best_bid
@@ -3509,11 +3554,112 @@ def place_ba_brk_signal(client: TopstepClient, state,
     return trade
 
 
+def _find_untested_pull_trigger(events: list, entry_price: float, side: str,
+                                after_ts: datetime) -> "datetime | None":
+    """Live equivalent of analyze_wall_ahead_exit.py's
+    find_untested_pull_trigger(): nearest wall above (ask) entry_price that
+    was found, never tested or broken, then pulled after `after_ts`.
+    Mirrors the backtest exactly so live results are comparable to it."""
+    candidates = [e for e in events if e.side == side and e.ts >= after_ts
+                  and ((side == "ask" and e.wall_price > entry_price) or
+                       (side == "bid" and e.wall_price < entry_price))]
+    if not candidates:
+        return None
+    founds = [e for e in candidates if e.event == "wall_found"]
+    if not founds:
+        return None
+    nearest_price = min(founds, key=lambda e: abs(e.wall_price - entry_price)).wall_price
+    lifecycle = sorted((e for e in events if e.event in
+                       ("wall_found", "test", "breakout", "wall_pulled")
+                       and e.side == side and abs(e.wall_price - nearest_price) < 0.01),
+                      key=lambda e: e.ts)
+    event_types = {e.event for e in lifecycle}
+    if "breakout" in event_types or "test" in event_types:
+        return None
+    pulled = [e for e in lifecycle if e.event == "wall_pulled" and e.ts >= after_ts]
+    return pulled[0].ts if pulled else None
+
+
+def _widen_ba_brk_target(client: TopstepClient, state, trade: "ActiveBaBrkTrade",
+                         account_id: int, now: datetime, paper: bool) -> bool:
+    """Applies the BA_BRK_WIDEN_ENABLED rule: widen the target to
+    BA_BRK_WIDEN_NEW_TARGET_PTS and give it a fresh BA_BRK_WIDEN_EXTEND_MIN-
+    minute hold from the trigger, leaving the stop untouched. For a real
+    position, this means cancelling BOTH resting bracket legs and replacing
+    them with fresh standalone stop + (wider) limit orders — safer than
+    trying to identify and cancel only the take-profit leg individually
+    (no 'which order is which' guesswork; reuses cancel_orders_for_contract,
+    already proven elsewhere in this file). If the replace fails partway,
+    falls back to restoring the ORIGINAL bracket rather than leaving the
+    position naked."""
+    sig    = trade.sig
+    entry  = trade.fill_price or sig.entry
+    d      = sig.direction
+    new_target_price = entry + d * BA_BRK_WIDEN_NEW_TARGET_PTS
+    tick   = trade.instrument.tick_size
+
+    if paper:
+        log.info(f"[PAPER] BA_BRK {trade.instrument.symbol}: untested wall ahead pulled — "
+                 f"widening target {sig.target:.2f} -> {new_target_price:.2f}, "
+                 f"extending hold {BA_BRK_WIDEN_EXTEND_MIN}min from now")
+        sig.target = new_target_price
+        new_hold_min = ((now - trade.fired_at).total_seconds() / 60.0) + BA_BRK_WIDEN_EXTEND_MIN
+        sig.hold_min = max(sig.hold_min, new_hold_min)
+        return True
+
+    try:
+        client.cancel_orders_for_contract(account_id, trade.contract_id)
+    except Exception as e:
+        log.warning(f"BA_BRK {trade.instrument.symbol}: widen — cancel existing brackets failed: {e}")
+        return False
+
+    exit_side = TopstepClient.ASK if d == 1 else TopstepClient.BID
+    stop_price = trade.stop_price()
+    try:
+        client.place_order(account_id=account_id, contract_id=trade.contract_id,
+                           side=exit_side, size=1, order_type=TopstepClient.ORDER_STOP,
+                           stop_price=stop_price,
+                           custom_tag=f"babrk_widen_stop_{now.strftime('%Y%m%d%H%M%S')}")
+        client.place_order(account_id=account_id, contract_id=trade.contract_id,
+                           side=exit_side, size=1, order_type=TopstepClient.ORDER_LIMIT,
+                           limit_price=new_target_price,
+                           custom_tag=f"babrk_widen_tp_{now.strftime('%Y%m%d%H%M%S')}")
+    except Exception as e:
+        log.error(f"BA_BRK {trade.instrument.symbol}: widen — placing new stop/target failed: {e}. "
+                  f"Attempting to restore the ORIGINAL bracket so the position isn't left naked.")
+        try:
+            client.place_order(account_id=account_id, contract_id=trade.contract_id,
+                               side=exit_side, size=1, order_type=TopstepClient.ORDER_STOP,
+                               stop_price=stop_price,
+                               custom_tag=f"babrk_restore_stop_{now.strftime('%Y%m%d%H%M%S')}")
+            client.place_order(account_id=account_id, contract_id=trade.contract_id,
+                               side=exit_side, size=1, order_type=TopstepClient.ORDER_LIMIT,
+                               limit_price=sig.target,
+                               custom_tag=f"babrk_restore_tp_{now.strftime('%Y%m%d%H%M%S')}")
+            log.warning(f"BA_BRK {trade.instrument.symbol}: original bracket restored after widen failure.")
+        except Exception as e2:
+            log.error(f"BA_BRK {trade.instrument.symbol}: COULD NOT RESTORE BRACKET — "
+                     f"position may be unprotected, check manually: {e2}")
+        return False
+
+    log.info(f"BA_BRK {trade.instrument.symbol}: untested wall ahead pulled — "
+             f"widened target {sig.target:.2f} -> {new_target_price:.2f}, stop unchanged ({stop_price:.2f})")
+    sig.target = new_target_price
+    new_hold_min = ((now - trade.fired_at).total_seconds() / 60.0) + BA_BRK_WIDEN_EXTEND_MIN
+    sig.hold_min = max(sig.hold_min, new_hold_min)
+    return True
+
+
 def handle_active_ba_brk_trade(client: TopstepClient, state,
                                 account_id: int, now: datetime, paper: bool):
     trade = state.active_ba_brk_trade
 
     if paper:
+        if (BA_BRK_WIDEN_ENABLED and trade.sig.side == "ask" and not trade.widened):
+            trigger_ts = _find_untested_pull_trigger(
+                state.recent_wall_lifecycle, trade.sig.entry, "ask", trade.fired_at)
+            if trigger_ts is not None and _widen_ba_brk_target(client, state, trade, account_id, now, paper):
+                trade.widened = True
         if now >= trade.expires_at():
             exit_price = (state.vwaslr_bars[-1].close if state.vwaslr_bars
                           else trade.sig.entry)
@@ -3537,6 +3683,13 @@ def handle_active_ba_brk_trade(client: TopstepClient, state,
         trade.fill_price = pos.get("averagePrice")
         log.info(f"BA_BRK {trade.instrument.symbol} fill confirmed: {trade.fill_price:.2f}")
         play_trade_sound()
+
+    if (pos is not None and trade.fill_price is not None
+            and BA_BRK_WIDEN_ENABLED and trade.sig.side == "ask" and not trade.widened):
+        trigger_ts = _find_untested_pull_trigger(
+            state.recent_wall_lifecycle, trade.fill_price, "ask", trade.fired_at)
+        if trigger_ts is not None and _widen_ba_brk_target(client, state, trade, account_id, now, paper):
+            trade.widened = True
 
     if pos is None:
         exit_price = _get_exit_price(client, account_id, trade.fired_at,
@@ -3632,6 +3785,7 @@ def _log_ba_brk_trade(trade: ActiveBaBrkTrade, outcome: str,
         "target":         round(trade.target_price(), 4),
         "outcome":        outcome,
         "pnl_pts":        round(pnl_pts, 4),
+        "widened":        trade.widened,
     }
     with open(BA_BRK_LOG_PATH, "a", newline="") as f:
         csv.DictWriter(f, fieldnames=BA_BRK_LOG_FIELDS).writerow(row)
@@ -3639,6 +3793,7 @@ def _log_ba_brk_trade(trade: ActiveBaBrkTrade, outcome: str,
         f"BA_BRK LOGGED  {trade.instrument.symbol} {dirn}  {outcome}  "
         f"fill={fill:.2f}  exit={exit_price:.2f}  pnl={pnl_pts:+.2f}pts  "
         f"side={trade.sig.side}  cascade={trade.sig.cascade_len}"
+        f"{'  [WIDENED]' if trade.widened else ''}"
     )
     return pnl_pts
 
@@ -5286,6 +5441,13 @@ def run(account_id: int | None, paper: bool, strategies: set[str] | None = None)
                         e for e in state.recent_ba_brk_breakouts
                         if e.ts >= ba_brk_prune_before
                     ]
+                    if BA_BRK_WIDEN_ENABLED:
+                        widen_prune_before = now - timedelta(minutes=BA_BRK_WIDEN_BUFFER_MIN)
+                        state.recent_wall_lifecycle.extend(_wt_events)
+                        state.recent_wall_lifecycle = [
+                            e for e in state.recent_wall_lifecycle
+                            if e.ts >= widen_prune_before
+                        ]
                     ba_rev_prune_before = now - timedelta(minutes=BA_REV_BUFFER_MIN)
                     for evt in _wt_events:
                         if evt.event == "test":
