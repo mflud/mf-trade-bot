@@ -3474,14 +3474,22 @@ def evaluate_ba_brk(state, now: datetime) -> "BaBrkSignal | None":
         return None
 
     side, trigger, cascade_start, cascade_len = max(candidates, key=lambda c: c[1].ts)
-    if (now - trigger.ts).total_seconds() > BA_BRK_MAX_GAP_SEC + 15:
+    age_sec = (now - trigger.ts).total_seconds()
+    if age_sec > BA_BRK_MAX_GAP_SEC + 15:
+        log.info(f"BA_BRK {state.instrument.symbol}: {side} cascade len={cascade_len} "
+                 f"rejected — stale ({age_sec:.0f}s old, trigger={trigger.ts.isoformat()})")
         return None   # stale — cascade completed too long ago to act on
 
     if side == "ask":
         align_ref = _trailing_ref_price(state.vwaslr_bars, now, BA_BRK_ASK_ALIGN_LOOKBACK_MIN)
         if align_ref is None:
+            log.info(f"BA_BRK {state.instrument.symbol}: ask cascade len={cascade_len} "
+                     f"rejected — no {BA_BRK_ASK_ALIGN_LOOKBACK_MIN}min alignment reference yet")
             return None
         if best_ask <= align_ref:
+            log.info(f"BA_BRK {state.instrument.symbol}: ask cascade len={cascade_len} "
+                     f"rejected — not aligned (best_ask={best_ask:.2f} <= "
+                     f"{BA_BRK_ASK_ALIGN_LOOKBACK_MIN}min-ago={align_ref:.2f})")
             return None   # not aligned with the trailing-90min trend — hard filter
         stop_pts = max(BA_BRK_STOP_MIN, min(state.sigma_pts, BA_BRK_STOP_MAX))
         direction, entry = 1, best_ask
@@ -3490,8 +3498,12 @@ def evaluate_ba_brk(state, now: datetime) -> "BaBrkSignal | None":
     else:
         day_open = _day_open_price(state.vwaslr_bars, now)
         if day_open is None:
+            log.info(f"BA_BRK {state.instrument.symbol}: bid cascade len={cascade_len} "
+                     f"rejected — no day-open bar yet")
             return None
         if best_bid >= day_open:
+            log.info(f"BA_BRK {state.instrument.symbol}: bid cascade len={cascade_len} "
+                     f"rejected — not aligned (best_bid={best_bid:.2f} >= day_open={day_open:.2f})")
             return None   # not aligned with the day's downtrend since open — hard filter
         direction, entry = -1, best_bid
         stop   = entry + BA_BRK_BID_STOP_PTS
@@ -3909,7 +3921,7 @@ def evaluate_ba_rev(state, now: datetime) -> "BaRevSignal | None":
     (10:30 ET) onward, once the 07:00-10:30 reference has locked, and only
     while state.ba_rev_contained is still True (today hasn't broken that
     reference range) — see _update_ba_rev_reference/_update_ba_rev_containment."""
-    if not state.recent_ba_rev_tests or not state.ba_rev_contained:
+    if not state.recent_ba_rev_tests:
         return None
 
     candidates = []
@@ -3925,7 +3937,17 @@ def evaluate_ba_rev(state, now: datetime) -> "BaRevSignal | None":
         return None
 
     side, trigger = max(candidates, key=lambda c: c[1].ts)
-    if (now - trigger.ts).total_seconds() > BA_REV_SIGNAL_STALE_SEC:
+
+    if not state.ba_rev_contained:
+        log.info(f"BA_REV {state.instrument.symbol}: {side} wall survived "
+                 f"{trigger.test_count} tests but day already broke containment "
+                 f"({state.ba_rev_ref_low:.2f}-{state.ba_rev_ref_high:.2f}) — skipped")
+        return None
+
+    age_sec = (now - trigger.ts).total_seconds()
+    if age_sec > BA_REV_SIGNAL_STALE_SEC:
+        log.info(f"BA_REV {state.instrument.symbol}: {side} test_count={trigger.test_count} "
+                 f"rejected — stale ({age_sec:.0f}s old, trigger={trigger.ts.isoformat()})")
         return None   # stale — react promptly or not at all
 
     direction = -1 if side == "ask" else 1   # ask rejection -> short, bid rejection -> long
@@ -5647,12 +5669,19 @@ def run(account_id: int | None, paper: bool, strategies: set[str] | None = None)
                 # BA-BRK: 9:40-13:00 ET, wall-cascade signal (N consecutive same-side
                 # breakouts). Ask requires alignment with the day's move since open
                 # (enforced inside evaluate_ba_brk); bid disabled by default.
+                in_ba_brk_window = BA_BRK_TRADE_START <= now_et_hm < BA_BRK_TRADE_END
                 if (no_position and not past_cutoff and state.instrument.ba_brk_enabled
-                        and BA_BRK_TRADE_START <= now_et_hm < BA_BRK_TRADE_END
-                        and _ba_brk_can_trade(state, now)):
+                        and in_ba_brk_window and _ba_brk_can_trade(state, now)):
                     bb_sig = evaluate_ba_brk(state, now)
                     if bb_sig:
                         place_ba_brk_signal(client, state, bb_sig, account_id, paper)
+                elif (state.instrument.ba_brk_enabled and state.recent_ba_brk_breakouts
+                        and (now - max(e.ts for e in state.recent_ba_brk_breakouts)).total_seconds() <= 10):
+                    log.info(
+                        f"BA_BRK {state.instrument.symbol}: outer gate blocked a recent breakout event — "
+                        f"no_position={no_position} past_cutoff={past_cutoff} "
+                        f"in_window={in_ba_brk_window} can_trade={_ba_brk_can_trade(state, now)}"
+                    )
 
                 # BA-REV: wall-rejection reversal. Free 09:40-10:30 ET; after
                 # 10:30 ET, only while still contained within the 07:00-10:30
@@ -5660,12 +5689,19 @@ def run(account_id: int | None, paper: bool, strategies: set[str] | None = None)
                 if state.instrument.ba_rev_enabled:
                     _update_ba_rev_reference(state, now)
                     _update_ba_rev_containment(state, now)
-                    if (no_position and not past_cutoff
-                            and BA_REV_TRADE_START <= now_et_hm < BA_REV_TRADE_END
+                    in_ba_rev_window = BA_REV_TRADE_START <= now_et_hm < BA_REV_TRADE_END
+                    if (no_position and not past_cutoff and in_ba_rev_window
                             and _ba_rev_can_trade(state, now)):
                         br_sig = evaluate_ba_rev(state, now)
                         if br_sig:
                             place_ba_rev_signal(client, state, br_sig, account_id, paper)
+                    elif (state.recent_ba_rev_tests
+                            and (now - max(e.ts for e in state.recent_ba_rev_tests)).total_seconds() <= 10):
+                        log.info(
+                            f"BA_REV {state.instrument.symbol}: outer gate blocked a recent test event — "
+                            f"no_position={no_position} past_cutoff={past_cutoff} "
+                            f"in_window={in_ba_rev_window} can_trade={_ba_rev_can_trade(state, now)}"
+                        )
 
             except Exception as e:
                 log.error(f"{state.instrument.symbol}: {e}", exc_info=True)

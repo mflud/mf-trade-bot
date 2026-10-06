@@ -194,6 +194,7 @@ BA_BRK_BID_HOLD_MIN   = 30
 BA_BRK_BUFFER_MIN  = 10  # display buffer only — cascade detection itself only cares about
                           # gaps within BA_BRK_MAX_GAP_SEC, so this just controls how much
                           # history the panel's activity table can show
+BA_BRK_TRADE_END_HM = 13 * 60    # 13:00 ET — matches trading_bot.py's BA_BRK_TRADE_END
 
 @dataclass
 class BaBrkSignal:
@@ -223,6 +224,7 @@ BA_REV_LOCK_HM          = 10 * 60 + 30    # 10:30 ET — reference locks; tradin
 BA_REV_TRADE_START_HM   = BA_REV_LOCK_HM
 BA_REV_SIGNAL_STALE_SEC = 60
 BA_REV_RANGE_LOOKBACK_BARS = 2500
+BA_REV_TRADE_END_HM     = 16 * 60         # 16:00 ET — matches trading_bot.py's BA_REV_TRADE_END
 
 @dataclass
 class BaRevSignal:
@@ -1660,6 +1662,8 @@ def build_ba_brk_panel(state: MonitorState, now: datetime) -> Panel:
         side_word = "ask" if live_len >= bid_live_len else "bid"
         status = f"BUILDING {side_word} ({max(live_len, bid_live_len)}/{BA_BRK_CASCADE_MIN})"
         border = "yellow"; style = "bold yellow"
+    elif now.astimezone(ET).hour * 60 + now.astimezone(ET).minute >= BA_BRK_TRADE_END_HM:
+        status = "EXPIRED"; border = "default"; style = ""
     else:
         status = "WATCHING"; border = "blue" if state.ba_brk_breakouts else "default"; style = "bold" if state.ba_brk_breakouts else ""
 
@@ -1754,6 +1758,8 @@ def build_ba_rev_panel(state: MonitorState, now: datetime) -> Panel:
     elif ((ask_latest and ask_latest.test_count >= BA_REV_TEST_COUNT - 1) or
           (bid_latest and bid_latest.test_count >= BA_REV_TEST_COUNT - 1)):
         status = "BUILDING"; border = "yellow"; style = "bold yellow"
+    elif now_et_hm >= BA_REV_TRADE_END_HM:
+        status = "EXPIRED"; border = "default"; style = ""
     else:
         status = "WATCHING" + (" (pre-lock)" if not past_lock else " (contained)")
         border = "blue" if state.ba_brk_breakouts else "default"
