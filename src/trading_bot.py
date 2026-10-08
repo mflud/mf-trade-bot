@@ -102,7 +102,8 @@ load_dotenv()
 import sqlite3
 
 from topstep_client import TopstepClient, get_bars_from_db, get_5s_bars_from_db, bars_db_available
-from wall_tracker import WallTracker, WallEvent, log_wall_events, ensure_wall_log
+from wall_tracker import (WallTracker, WallEvent, log_wall_events, ensure_wall_log,
+                           WALL_MIN_SIZE_BY_SYMBOL, WALL_MIN_SIZE as _WALL_MIN_SIZE_DEFAULT)
 
 # Practice account — the only account the live bot is permitted to trade on.
 # Set TOPSTEP_ACCOUNT_ID in .env to override.
@@ -324,6 +325,14 @@ BA_BRK_TRADE_END          = (13, 0)    # ET   9:40-13:00 beats the narrower 10:3
                                         # once the alignment filter is applied (see above)
 BA_BRK_BUFFER_MIN         = 5      # minutes of raw breakout events kept for cascade scanning
 BA_BRK_MAX_CONSEC_LOSSES  = 2
+# Gap-volatility filter (2026-10-07): the price range between breakout #2 and
+# #3 of an ask cascade predicts the trade — a wide/choppy gap means the push
+# is less clean. Backtest (src/analyze_cascade_gap_vol.py, MES ask, live
+# config): gap<=2.5pt n=140 total=+138.1pt vs unfiltered n=171 total=+124.6pt,
+# AND lower top5_share (43% vs 48%, more robust not just fewer trades). Ask
+# only — bid showed no such effect (filtering only hurt bid's backtest).
+BA_BRK_GAP_MAX_PTS        = 2.5
+PRICE_TICK_BUFFER_MIN     = 3      # minutes of (ts, mid) kept for gap-range lookups (BA_BRK/BA_REV)
 # Target-widening management rule (2026-10-02): if an ask wall above a
 # currently-open ASK-side long never gets tested before it's pulled, that's
 # a strong "this is still working, don't touch it" signal (backtested:
@@ -418,6 +427,13 @@ BA_REV_TRADE_END        = (16, 0)    # ET
 BA_REV_SIGNAL_STALE_SEC = 60     # ignore a qualifying test event older than this
 BA_REV_BUFFER_MIN       = 3      # minutes of raw test events kept for signal scanning
 BA_REV_MAX_CONSEC_LOSSES = 2
+# Gap-volatility filter (2026-10-07): opposite effect from BA_BRK_GAP_MAX_PTS
+# — for a bid-side rejection, a MORE volatile test (bigger range between
+# test #2 and #3 of the same wall) is stronger evidence the wall is real, not
+# weaker. Backtest (src/analyze_rev_gap_vol.py, MES bid, live config):
+# gap>=1.25pt n=200 total=+83.4pt vs unfiltered n=234 total=+71.4pt, with
+# comparable top5_share. Bid only — ask showed no such effect.
+BA_REV_GAP_MIN_PTS      = 1.25
 BA_REV_RANGE_LOOKBACK_BARS = 2500   # ~41hrs of 1-min bars; comfortably covers the reference window
 
 SLR_LOG_FIELDS = [
@@ -940,6 +956,25 @@ INSTRUMENTS = [
                   # BA-REV also left off for the same reason — the backtest
                   # (src/backtest_wall_reject_trade.py) only used MES data.
                   ba_rev_enabled=False),
+    # MYM/M2K: added 2026-10-07 for PASSIVE wall-tracking data collection only
+    # (user's hypothesis: these should behave similarly to MES). Every actual
+    # trading strategy explicitly off — WallTracker still runs unconditionally
+    # (trading_bot.py:~5378) so wall_events.csv starts accumulating breakout/
+    # test history, same way MNQ's did before BA-BRK was ever validated for
+    # it. Requires bar_collector.py's INSTRUMENTS to also include these two
+    # (DOM depth has to flow into dom.db before this process can read it).
+    BotInstrument("MYM", "MYM", tick_size=1.00, point_value=0.50,
+                  csr_enabled=False, wall_enabled=False,
+                  orb_enabled=False, orb_cls_enabled=False,
+                  vwaslr_n=0, slr_enabled=False, eve_enabled=False, sun_gap_enabled=False,
+                  pl_mom_enabled=False, pl_rev_enabled=False,
+                  ba_brk_enabled=False, ba_rev_enabled=False),
+    BotInstrument("M2K", "M2K", tick_size=0.10, point_value=5.00,
+                  csr_enabled=False, wall_enabled=False,
+                  orb_enabled=False, orb_cls_enabled=False,
+                  vwaslr_n=0, slr_enabled=False, eve_enabled=False, sun_gap_enabled=False,
+                  pl_mom_enabled=False, pl_rev_enabled=False,
+                  ba_brk_enabled=False, ba_rev_enabled=False),
 ]
 
 
@@ -1405,6 +1440,11 @@ class InstrumentState:
     # wall_break qualifies).
     recent_ba_brk_breakouts:    list                          = field(default_factory=list)
     ba_brk_last_ts:             "datetime | None"             = None
+    # Rolling (ts, mid_price) ticks, fed every poll alongside the WallTracker
+    # update — used to measure the price range BETWEEN two wall events (e.g.
+    # breakout #2 -> #3 of a cascade), which the live wall-event log itself
+    # doesn't capture. See BA_BRK_GAP_MAX_PTS / BA_REV_GAP_MIN_PTS.
+    price_ticks:                list                          = field(default_factory=list)
     active_ba_brk_trade:        "ActiveBaBrkTrade | None"     = None
     ba_brk_day:                 "date | None"                 = None
     ba_brk_consec_losses:       int                            = 0
@@ -2549,9 +2589,15 @@ def _get_exit_price(client: TopstepClient, account_id: int,
             closing = [
                 t for t in trades
                 if t.get("contractId") == contract_id
-                and datetime.fromisoformat(t.get("timestamp", "1970-01-01T00:00:00")).replace(tzinfo=timezone.utc)
+                and datetime.fromisoformat(t.get("creationTimestamp", "1970-01-01T00:00:00")).replace(tzinfo=timezone.utc)
                     > fired_at
             ]
+            # search_trades returns most-recent-first (confirmed 2026-10-08 —
+            # NOT chronological-ascending as this code previously assumed when
+            # it took closing[-1] as "the exit"). Sort explicitly rather than
+            # rely on API ordering — the most recent fill after fired_at is
+            # the exit, regardless of which position it lands in the response.
+            closing = sorted(closing, key=lambda t: t.get("creationTimestamp", ""))
             price = float(closing[-1].get("price", 0)) if closing else 0.0
             only_entry_fill = (entry_price is not None and len(closing) == 1
                                 and abs(price - entry_price) < 1.0)
@@ -3413,10 +3459,14 @@ def _detect_cascade_signal(events: list, side: str, cascade_min: int, max_gap_se
                             after_ts: "datetime | None"):
     """Scan time-ordered WallEvent breakouts for `side`, chaining consecutive
     breakouts less than max_gap_sec apart. Returns (trigger_event,
-    cascade_start_ts, cascade_len) for the most recent point a fresh cascade
-    first reached cascade_min, considering only cascades whose trigger is
-    after `after_ts` (dedup) — or None. Mirrors backtest_wall_cascade.py's
-    detect_cascades() non-overlap chaining (one signal per cascade run)."""
+    cascade_start_ts, cascade_len, prev_breakout_ts) for the most recent
+    point a fresh cascade first reached cascade_min, considering only
+    cascades whose trigger is after `after_ts` (dedup) — or None.
+    prev_breakout_ts is the timestamp of the breakout immediately before the
+    trigger (e.g. breakout #2 of a cascade_min=3 cascade) — used for the
+    gap-volatility filter, see BA_BRK_GAP_MAX_PTS. Mirrors
+    backtest_wall_cascade.py's detect_cascades() non-overlap chaining (one
+    signal per cascade run)."""
     same_side = sorted((e for e in events if e.side == side), key=lambda e: e.ts)
 
     cascade_count = 0
@@ -3425,6 +3475,7 @@ def _detect_cascade_signal(events: list, side: str, cascade_min: int, max_gap_se
     signaled_this_cascade = False
     result = None
     for e in same_side:
+        prev_ts = last_ts
         if last_ts is not None and (e.ts - last_ts).total_seconds() <= max_gap_sec:
             cascade_count += 1
         else:
@@ -3435,8 +3486,21 @@ def _detect_cascade_signal(events: list, side: str, cascade_min: int, max_gap_se
         if cascade_count >= cascade_min and not signaled_this_cascade:
             signaled_this_cascade = True
             if after_ts is None or e.ts > after_ts:
-                result = (e, cascade_start, cascade_count)
+                result = (e, cascade_start, cascade_count, prev_ts)
     return result
+
+
+def _price_range_between(ticks: list, ts_start: "datetime | None",
+                          ts_end: "datetime | None") -> "float | None":
+    """High-low range of all (ts, mid_price) ticks strictly after ts_start
+    up to and including ts_end. None if either bound is missing or no ticks
+    fall in that window (e.g. the gap predates the buffer's retention)."""
+    if ts_start is None or ts_end is None:
+        return None
+    prices = [p for ts, p in ticks if ts_start < ts <= ts_end]
+    if not prices:
+        return None
+    return max(prices) - min(prices)
 
 
 def evaluate_ba_brk(state, now: datetime) -> "BaBrkSignal | None":
@@ -3473,7 +3537,7 @@ def evaluate_ba_brk(state, now: datetime) -> "BaBrkSignal | None":
     if not candidates:
         return None
 
-    side, trigger, cascade_start, cascade_len = max(candidates, key=lambda c: c[1].ts)
+    side, trigger, cascade_start, cascade_len, prev_breakout_ts = max(candidates, key=lambda c: c[1].ts)
     age_sec = (now - trigger.ts).total_seconds()
     if age_sec > BA_BRK_MAX_GAP_SEC + 15:
         log.info(f"BA_BRK {state.instrument.symbol}: {side} cascade len={cascade_len} "
@@ -3491,6 +3555,12 @@ def evaluate_ba_brk(state, now: datetime) -> "BaBrkSignal | None":
                      f"rejected — not aligned (best_ask={best_ask:.2f} <= "
                      f"{BA_BRK_ASK_ALIGN_LOOKBACK_MIN}min-ago={align_ref:.2f})")
             return None   # not aligned with the trailing-90min trend — hard filter
+        gap_2_3 = _price_range_between(state.price_ticks, prev_breakout_ts, trigger.ts)
+        if gap_2_3 is not None and gap_2_3 > BA_BRK_GAP_MAX_PTS:
+            log.info(f"BA_BRK {state.instrument.symbol}: ask cascade len={cascade_len} "
+                     f"rejected — pre-trigger gap too wide ({gap_2_3:.2f}pt > "
+                     f"{BA_BRK_GAP_MAX_PTS}pt, choppy push)")
+            return None
         stop_pts = max(BA_BRK_STOP_MIN, min(state.sigma_pts, BA_BRK_STOP_MAX))
         direction, entry = 1, best_ask
         stop, target = entry - stop_pts, entry + BA_BRK_TARGET_PTS
@@ -3850,6 +3920,18 @@ def _find_test_signal(events: list, side: str, test_count: int,
     return max(matches, key=lambda e: e.ts) if matches else None
 
 
+def _find_prior_test(events: list, side: str, wall_price: float, test_count: int,
+                      before_ts: datetime):
+    """Most recent WallEvent matching event=='test', the given side,
+    test_count, and wall_price (exact — the same resting wall), strictly
+    before before_ts. Used to find test #(N-1) of the SAME wall that just
+    reached test #N, for the gap-volatility filter (BA_REV_GAP_MIN_PTS)."""
+    matches = [e for e in events
+               if e.side == side and e.test_count == test_count
+               and e.wall_price == wall_price and e.ts < before_ts]
+    return max(matches, key=lambda e: e.ts) if matches else None
+
+
 def _update_ba_rev_reference(state, now: datetime):
     """Lock in the BA_REV_REF_START (07:00 ET) -> BA_REV_LOCK_HM (10:30 ET)
     reference range, once per ET calendar day, right at 10:30 ET. This window
@@ -3949,6 +4031,17 @@ def evaluate_ba_rev(state, now: datetime) -> "BaRevSignal | None":
         log.info(f"BA_REV {state.instrument.symbol}: {side} test_count={trigger.test_count} "
                  f"rejected — stale ({age_sec:.0f}s old, trigger={trigger.ts.isoformat()})")
         return None   # stale — react promptly or not at all
+
+    if side == "bid":
+        prior_test = _find_prior_test(state.recent_ba_rev_tests, "bid", trigger.wall_price,
+                                       BA_REV_TEST_COUNT - 1, trigger.ts)
+        gap_2_3 = _price_range_between(state.price_ticks, prior_test.ts if prior_test else None,
+                                        trigger.ts)
+        if gap_2_3 is not None and gap_2_3 < BA_REV_GAP_MIN_PTS:
+            log.info(f"BA_REV {state.instrument.symbol}: bid test_count={trigger.test_count} "
+                     f"rejected — pre-trigger gap too tight ({gap_2_3:.2f}pt < "
+                     f"{BA_REV_GAP_MIN_PTS}pt, weak/tepid test)")
+            return None
 
     direction = -1 if side == "ask" else 1   # ask rejection -> short, bid rejection -> long
     entry = trigger.price
@@ -5355,7 +5448,9 @@ def run(account_id: int | None, paper: bool, strategies: set[str] | None = None)
     # Initialise wall trackers
     ensure_wall_log()
     for state in states:
-        state.wall_tracker = WallTracker(state.instrument.symbol)
+        state.wall_tracker = WallTracker(
+            state.instrument.symbol,
+            wall_min_size=WALL_MIN_SIZE_BY_SYMBOL.get(state.instrument.symbol, _WALL_MIN_SIZE_DEFAULT))
 
     # Warn if positions are already open on startup
     try:
@@ -5445,6 +5540,11 @@ def run(account_id: int | None, paper: bool, strategies: set[str] | None = None)
                         _wt_bids, _wt_asks, _wt_best_bid, _wt_best_ask, ts=now)
                     if _wt_events:
                         log_wall_events(_wt_events)
+                    state.price_ticks.append((now, (_wt_best_bid + _wt_best_ask) / 2))
+                    price_tick_prune_before = now - timedelta(minutes=PRICE_TICK_BUFFER_MIN)
+                    state.price_ticks = [
+                        t for t in state.price_ticks if t[0] >= price_tick_prune_before
+                    ]
                     prune_before = now - timedelta(minutes=WALL_BREAK_HOLD_MIN + 2)
                     for evt in _wt_events:
                         if (evt.event == "breakout"

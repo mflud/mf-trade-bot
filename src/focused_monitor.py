@@ -17,6 +17,7 @@ Usage:
     python src/focused_monitor.py
 """
 
+import csv
 import json
 import re
 import sqlite3
@@ -45,13 +46,21 @@ load_dotenv()
 
 from topstep_client import TopstepClient, get_bars_from_db, get_5s_bars_from_db, bars_db_available
 from trade_summary_panel import build_trade_summary_panel
-from wall_tracker import WallTracker, log_wall_events, ensure_wall_log
+from wall_tracker import (WallTracker, log_wall_events, ensure_wall_log,
+                           WALL_MIN_SIZE_BY_SYMBOL, WALL_MIN_SIZE as _WALL_MIN_SIZE_DEFAULT,
+                           WALL_NOTABLE_SIZE_BY_SYMBOL)
 
 ET    = ZoneInfo("America/New_York")
 LOCAL = datetime.now().astimezone().tzinfo
 
 SYMBOL      = "MES"
 POINT_VALUE = 5.0
+
+# Symbols with their own BA-BRK/BA-REV monitor column. MYM/M2K have no
+# trading strategies enabled (see trading_bot.py INSTRUMENTS) — passive
+# wall-tracking only, same as MNQ's wall data before BA-BRK was validated
+# for it.
+BA_SYMBOLS = ["MES", "MYM", "M2K"]
 
 # ── VWASLR constants (mirrors trading_bot.py) ─────────────────────────────────
 VWASLR_SIGMA_BARS = 500
@@ -226,6 +235,73 @@ BA_REV_SIGNAL_STALE_SEC = 60
 BA_REV_RANGE_LOOKBACK_BARS = 2500
 BA_REV_TRADE_END_HM     = 16 * 60         # 16:00 ET — matches trading_bot.py's BA_REV_TRADE_END
 
+# Sim trade logs — for symbols with no live trading enabled (MYM/M2K), these
+# are the ONLY record of what the BA-BRK/BA-REV panels' own re-simulation
+# would have done, so they can be scored later the same way real trades are.
+# Also logs MES/MNQ's simulated signals for cross-checking against the real
+# trading_bot.py logs. Resolved against this process's own bars_1m (1-min
+# bars, refreshed every 60s) — coarser than the live bot's 5s/DOM-level
+# checks, so treat these as directionally useful, not tick-perfect.
+BA_BRK_SIM_LOG_PATH = Path("logs/ba_brk_sim_trades.csv")
+BA_REV_SIM_LOG_PATH = Path("logs/ba_rev_sim_trades.csv")
+BA_BRK_SIM_LOG_FIELDS = [
+    "fired_at", "resolved_at", "symbol", "direction", "side",
+    "est_entry", "cascade_len", "first_break_ts", "last_break_ts",
+    "stop", "target", "outcome", "pnl_pts",
+]
+BA_REV_SIM_LOG_FIELDS = [
+    "fired_at", "resolved_at", "symbol", "direction", "side",
+    "test_count", "wall_price", "ref_high", "ref_low",
+    "est_entry", "stop", "target", "outcome", "pnl_pts",
+]
+
+
+def _ensure_sim_log(path: Path, fields: list):
+    path.parent.mkdir(exist_ok=True)
+    if not path.exists():
+        with open(path, "w", newline="") as f:
+            csv.DictWriter(f, fieldnames=fields).writeheader()
+
+
+def _log_ba_brk_sim(symbol: str, sig: "BaBrkSignal", now: datetime,
+                     outcome: str, exit_price: float) -> float:
+    pnl_pts = (exit_price - sig.entry) * sig.direction
+    row = {
+        "fired_at": sig.fired_at.isoformat(), "resolved_at": now.isoformat(),
+        "symbol": symbol, "direction": "LONG" if sig.direction == 1 else "SHORT",
+        "side": sig.side, "est_entry": round(sig.entry, 4),
+        "cascade_len": sig.cascade_len,
+        "first_break_ts": sig.first_break_ts.isoformat(),
+        "last_break_ts": sig.last_break_ts.isoformat(),
+        "stop": round(sig.stop, 4), "target": round(sig.target, 4),
+        "outcome": outcome, "pnl_pts": round(pnl_pts, 4),
+    }
+    _ensure_sim_log(BA_BRK_SIM_LOG_PATH, BA_BRK_SIM_LOG_FIELDS)
+    with open(BA_BRK_SIM_LOG_PATH, "a", newline="") as f:
+        csv.DictWriter(f, fieldnames=BA_BRK_SIM_LOG_FIELDS).writerow(row)
+    return pnl_pts
+
+
+def _log_ba_rev_sim(symbol: str, sig: "BaRevSignal", now: datetime,
+                     outcome: str, exit_price: float, ref_high, ref_low) -> float:
+    pnl_pts = (exit_price - sig.entry) * sig.direction
+    row = {
+        "fired_at": sig.fired_at.isoformat(), "resolved_at": now.isoformat(),
+        "symbol": symbol, "direction": "LONG" if sig.direction == 1 else "SHORT",
+        "side": sig.side, "test_count": sig.test_count,
+        "wall_price": round(sig.wall_price, 4),
+        "ref_high": round(ref_high, 4) if ref_high is not None else "",
+        "ref_low": round(ref_low, 4) if ref_low is not None else "",
+        "est_entry": round(sig.entry, 4),
+        "stop": round(sig.stop, 4), "target": round(sig.target, 4),
+        "outcome": outcome, "pnl_pts": round(pnl_pts, 4),
+    }
+    _ensure_sim_log(BA_REV_SIM_LOG_PATH, BA_REV_SIM_LOG_FIELDS)
+    with open(BA_REV_SIM_LOG_PATH, "a", newline="") as f:
+        csv.DictWriter(f, fieldnames=BA_REV_SIM_LOG_FIELDS).writerow(row)
+    return pnl_pts
+
+
 @dataclass
 class BaRevSignal:
     direction:   int      # +1 LONG (bid rejection), -1 SHORT (ask rejection)
@@ -238,6 +314,27 @@ class BaRevSignal:
     trigger_ts:  datetime
     fired_at:    datetime
     expires_at:  datetime
+
+
+@dataclass
+class BaSymbolState:
+    """Everything BA-BRK/BA-REV needs for one symbol — fully independent of
+    the legacy MES-only state.dom/state.wall_tracker used by the DOM and Wall
+    Break panels (deliberately separate WallTracker instance, slightly
+    redundant but keeps this isolated and safe to extend to MYM/M2K)."""
+    symbol:           str
+    dom:              "DOMBook" = field(default_factory=lambda: DOMBook())
+    wall_tracker:     "WallTracker|None" = None
+    bars_1m:          list = field(default_factory=list)   # for day_open + BA-REV containment
+    ba_brk_breakouts: list = field(default_factory=list)
+    ba_brk_signal:    "BaBrkSignal|None" = None
+    day_open:         "float|None" = None
+    day_open_date:    "object|None" = None
+    ba_rev_signal:    "BaRevSignal|None" = None
+    ba_rev_ref_day:   "object|None" = None
+    ba_rev_ref_high:  "float|None" = None
+    ba_rev_ref_low:   "float|None" = None
+    ba_rev_contained: bool = True
 
 
 @dataclass
@@ -357,18 +454,9 @@ class MonitorState:
     # Wall Break
     wall_break_signal: "WallBreakSignal|None" = None
     wall_recent_events: list = field(default_factory=list)  # (ts, event, side, wall_price, test_count, entry, peak_size)
-    # BA-BRK (wall cascade)
-    ba_brk_signal:    "BaBrkSignal|None" = None
-    ba_brk_breakouts: list = field(default_factory=list)   # raw WallEvent breakouts, both sides
-    day_open:         "float|None" = None
-    day_open_date:    "object|None" = None   # date this day_open was computed for — set once/day
-    # BA-REV (wall rejection reversal) — reuses ba_brk_breakouts above for its
-    # "test" events (same buffer already holds both event types)
-    ba_rev_signal:     "BaRevSignal|None" = None
-    ba_rev_ref_day:    "object|None" = None
-    ba_rev_ref_high:   "float|None" = None
-    ba_rev_ref_low:    "float|None" = None
-    ba_rev_contained:  bool = True
+    # BA-BRK / BA-REV — one independent BaSymbolState per monitored symbol
+    # (MES, MYM, M2K), each with its own DOMBook/WallTracker/signal state.
+    ba_states: dict = field(default_factory=dict)
     # Position — MES
     position_size:  int   = 0
     position_dir:   int   = 0
@@ -446,7 +534,7 @@ def _find_test_signal(events: list, side: str, test_count: int,
     return max(matches, key=lambda e: e.ts) if matches else None
 
 
-def _update_ba_rev_reference(state: "MonitorState", now: datetime):
+def _update_ba_rev_reference(state: "BaSymbolState", now: datetime, symbol: str = SYMBOL):
     """Mirrors trading_bot.py's _update_ba_rev_reference — display-only copy.
     Locks the 07:00-10:30 ET reference range once per day, right at 10:30 ET."""
     now_et = now.astimezone(ET)
@@ -462,7 +550,7 @@ def _update_ba_rev_reference(state: "MonitorState", now: datetime):
     state.ba_rev_ref_low   = None
     state.ba_rev_contained = True
 
-    raw = get_bars_from_db(SYMBOL, 1, BA_REV_RANGE_LOOKBACK_BARS)
+    raw = get_bars_from_db(symbol, 1, BA_REV_RANGE_LOOKBACK_BARS)
     if not raw:
         return
 
@@ -481,15 +569,18 @@ def _update_ba_rev_reference(state: "MonitorState", now: datetime):
 
 
 def _update_ba_rev_containment(state: "MonitorState", bars_1m: list):
-    """After the reference locks, one bar breaking [ref_low, ref_high]
-    permanently disables containment for the rest of the day."""
+    """After the reference locks, any bar breaking [ref_low, ref_high]
+    permanently disables containment for the rest of the day. Scans the
+    whole retained buffer, not just the latest bar — bars_1m is only
+    refreshed every 60s (see _fetch_1min_loop), so a tail-only check can
+    silently skip the exact bar where a breach happened if it isn't still
+    "the last one" by the time this runs, with no way to catch it later."""
     if state.ba_rev_ref_high is None or not state.ba_rev_contained:
         return
-    if not bars_1m:
-        return
-    last = bars_1m[-1]
-    if last.high > state.ba_rev_ref_high or last.low < state.ba_rev_ref_low:
-        state.ba_rev_contained = False
+    for b in bars_1m:
+        if b.high > state.ba_rev_ref_high or b.low < state.ba_rev_ref_low:
+            state.ba_rev_contained = False
+            return
 
 
 def _pl_bar(pl: float, dir_sym: str, half: int = 6) -> str:
@@ -712,14 +803,17 @@ def _update_mes_orb_cls(state: MonitorState):
 
 # ─── DOM reader ───────────────────────────────────────────────────────────────
 
-def _read_dom_db(state: MonitorState):
+def _read_dom_for(symbol: str, dom: "DOMBook"):
+    """Read live DOM state from data/dom.db for an arbitrary symbol into the
+    given DOMBook (generalized from _read_dom_db, which stays MES-only for
+    the legacy DOM/Wall Break panels)."""
     if not DOM_DB_PATH.exists():
         return
     try:
         conn = sqlite3.connect(str(DOM_DB_PATH), timeout=1.0)
         row  = conn.execute(
             "SELECT updated,last_price,best_bid,best_ask,bids_json,asks_json "
-            "FROM dom_live WHERE symbol=?", (SYMBOL,)).fetchone()
+            "FROM dom_live WHERE symbol=?", (symbol,)).fetchone()
         conn.close()
         if not row:
             return
@@ -728,12 +822,27 @@ def _read_dom_db(state: MonitorState):
             return
         bids = {float(k): v for k, v in json.loads(row[4]).items()}
         asks = {float(k): v for k, v in json.loads(row[5]).items()}
-        with state.dom._lock:
-            state.dom.bids = bids; state.dom.asks = asks
-            state.dom.last_price = row[1]; state.dom.best_bid = row[2]
-            state.dom.best_ask   = row[3]; state.dom.last_update = updated_dt
+        with dom._lock:
+            dom.bids = bids; dom.asks = asks
+            dom.last_price = row[1]; dom.best_bid = row[2]
+            dom.best_ask   = row[3]; dom.last_update = updated_dt
     except Exception:
         pass
+
+
+def _read_dom_db(state: MonitorState):
+    _read_dom_for(SYMBOL, state.dom)
+
+
+def fetch_1min_bars_for(symbol: str) -> list:
+    """Cheap DB-only 1-min bar fetch for an arbitrary symbol's BaSymbolState
+    (bars.db is already populated for MYM/M2K by bar_collector — no live API
+    call needed here, unlike fetch_1min_bars which falls back to one)."""
+    if not bars_db_available():
+        return []
+    raw = get_bars_from_db(symbol, 1, BA_REV_RANGE_LOOKBACK_BARS)
+    return [Bar(ts=datetime.fromisoformat(b["t"]), open=b["o"], high=b["h"],
+                low=b["l"], close=b["c"], volume=b["v"]) for b in raw]
 
 
 # ─── VWASLR computation ───────────────────────────────────────────────────────
@@ -1628,8 +1737,8 @@ def build_wall_panel(state: MonitorState, now: datetime) -> Panel:
                  padding=(0, 1), expand=False)
 
 
-def build_ba_brk_panel(state: MonitorState, now: datetime) -> Panel:
-    sig = state.ba_brk_signal
+def build_ba_brk_panel(ba_state: "BaSymbolState", now: datetime) -> Panel:
+    sig = ba_state.ba_brk_signal
 
     # Live cascade progress: consecutive same-side breakouts chained within
     # the gap window, ending at the most recent breakout (informational —
@@ -1637,7 +1746,7 @@ def build_ba_brk_panel(state: MonitorState, now: datetime) -> Panel:
     # cursor so the panel always shows current progress, not just fresh
     # triggers). Tracked for both sides since the real bot trades both.
     def _live_cascade_len(side: str):
-        evs = sorted((e for e in state.ba_brk_breakouts
+        evs = sorted((e for e in ba_state.ba_brk_breakouts
                       if e.side == side and e.event == "breakout"), key=lambda e: e.ts)
         gaps = [None] + [(evs[i].ts - evs[i-1].ts).total_seconds() for i in range(1, len(evs))]
         n = 0
@@ -1646,12 +1755,12 @@ def build_ba_brk_panel(state: MonitorState, now: datetime) -> Panel:
         return n, evs
 
     live_len, ask_breakouts = _live_cascade_len("ask")
-    aligned = (state.day_open is not None and ask_breakouts and
-               (ask_breakouts[-1].price or ask_breakouts[-1].wall_price) > state.day_open)
+    aligned = (ba_state.day_open is not None and ask_breakouts and
+               (ask_breakouts[-1].price or ask_breakouts[-1].wall_price) > ba_state.day_open)
 
     bid_live_len, bid_breakouts = _live_cascade_len("bid")
-    bid_aligned = (state.day_open is not None and bid_breakouts and
-                   (bid_breakouts[-1].price or bid_breakouts[-1].wall_price) < state.day_open)
+    bid_aligned = (ba_state.day_open is not None and bid_breakouts and
+                   (bid_breakouts[-1].price or bid_breakouts[-1].wall_price) < ba_state.day_open)
 
     if sig and now < sig.expires_at:
         if sig.direction == 1:
@@ -1665,7 +1774,7 @@ def build_ba_brk_panel(state: MonitorState, now: datetime) -> Panel:
     elif now.astimezone(ET).hour * 60 + now.astimezone(ET).minute >= BA_BRK_TRADE_END_HM:
         status = "EXPIRED"; border = "default"; style = ""
     else:
-        status = "WATCHING"; border = "blue" if state.ba_brk_breakouts else "default"; style = "bold" if state.ba_brk_breakouts else ""
+        status = "WATCHING"; border = "blue" if ba_state.ba_brk_breakouts else "default"; style = "bold" if ba_state.ba_brk_breakouts else ""
 
     root = Table.grid(padding=(0, 0))
     root.add_column(justify="center")
@@ -1689,12 +1798,12 @@ def build_ba_brk_panel(state: MonitorState, now: datetime) -> Panel:
                                  f"({'-' if sig.direction == 1 else '+'}{stop_pts:.1f}pt)")
         det.add_row("Hold:",    f"{rem//60}m {rem%60:02d}s remaining")
         root.add_row(det)
-    elif state.day_open is not None:
+    elif ba_state.day_open is not None:
         root.add_row("")
         det = Table.grid(padding=(0, 1))
         det.add_column(width=14, justify="right")
         det.add_column()
-        det.add_row("Day open:", f"{state.day_open:.2f}")
+        det.add_row("Day open:", f"{ba_state.day_open:.2f}")
         det.add_row("Ask Aligned:", ("[green]yes[/]" if aligned else "[red]no — filtered[/]")
                                      if ask_breakouts else "—")
         det.add_row("Bid Aligned:", ("[green]yes[/]" if bid_aligned else "[red]no — filtered[/]")
@@ -1704,7 +1813,8 @@ def build_ba_brk_panel(state: MonitorState, now: datetime) -> Panel:
     # Recent wall activity, both sides, test + breakout (last 12) — same
     # richer view as WALL BREAK's event log, so there's something to watch
     # even on a bid-heavy day when no ask cascade has fired yet.
-    notable = sorted(state.ba_brk_breakouts, key=lambda e: e.ts, reverse=True)[:12]
+    notable = sorted(ba_state.ba_brk_breakouts, key=lambda e: e.ts, reverse=True)[:12]
+    notable_size = WALL_NOTABLE_SIZE_BY_SYMBOL.get(ba_state.symbol, 100)
     if notable:
         root.add_row("")
         lt = Table(box=None, show_header=True, padding=(0, 1), header_style="bold")
@@ -1719,7 +1829,7 @@ def build_ba_brk_panel(state: MonitorState, now: datetime) -> Panel:
             ec   = "bold yellow" if e.event == "breakout" else ""
             sc   = "green" if e.side == "bid" else "red"
             pk   = e.peak_size
-            pk_s = f"[bold green]{pk:.0f}[/]" if pk >= 100 else f"{pk:.0f}"
+            pk_s = f"[bold green]{pk:.0f}[/]" if pk >= notable_size else f"{pk:.0f}"
             lt.add_row(t_s, f"[{ec}]{e.event}[/]" if ec else e.event, f"[{sc}]{e.side}[/]",
                        f"{e.wall_price:.2f}", pk_s, f"T{e.test_count}")
         root.add_row(lt)
@@ -1730,20 +1840,22 @@ def build_ba_brk_panel(state: MonitorState, now: datetime) -> Panel:
     foot.add_row(f"ask {BA_BRK_STOP_PTS:.1f}/{BA_BRK_TARGET_PTS:.0f}/{BA_BRK_HOLD_MIN}  "
                  f"bid {BA_BRK_BID_STOP_PTS:.1f}/{BA_BRK_BID_TARGET_PTS:.0f}/{BA_BRK_BID_HOLD_MIN}  "
                  f"(stop/target/hold)")
+    wall_floor = WALL_MIN_SIZE_BY_SYMBOL.get(ba_state.symbol, _WALL_MIN_SIZE_DEFAULT)
+    foot.add_row(f"wall floor {wall_floor:.0f}  peak highlight {notable_size:.0f}")
     root.add_row(foot)
 
-    return Panel(root, title=f"BA-BRK  {SYMBOL}", border_style=border,
-                 padding=(0, 1), width=127)
+    return Panel(root, title=f"BA-BRK  {ba_state.symbol}", border_style=border,
+                 padding=(0, 1), width=84)
 
 
-def build_ba_rev_panel(state: MonitorState, now: datetime) -> Panel:
-    sig = state.ba_rev_signal
+def build_ba_rev_panel(ba_state: "BaSymbolState", now: datetime) -> Panel:
+    sig = ba_state.ba_rev_signal
     now_et_hm = now.astimezone(ET).hour * 60 + now.astimezone(ET).minute
     past_lock = now_et_hm >= BA_REV_LOCK_HM
 
     # Live test-count progress per side (most recent test event, informational)
-    ask_tests  = [e for e in state.ba_brk_breakouts if e.side == "ask" and e.event == "test"]
-    bid_tests  = [e for e in state.ba_brk_breakouts if e.side == "bid" and e.event == "test"]
+    ask_tests  = [e for e in ba_state.ba_brk_breakouts if e.side == "ask" and e.event == "test"]
+    bid_tests  = [e for e in ba_state.ba_brk_breakouts if e.side == "bid" and e.event == "test"]
     ask_latest = max(ask_tests, key=lambda e: e.ts) if ask_tests else None
     bid_latest = max(bid_tests, key=lambda e: e.ts) if bid_tests else None
 
@@ -1751,9 +1863,9 @@ def build_ba_rev_panel(state: MonitorState, now: datetime) -> Panel:
         dir_arrow = "▲" if sig.direction == 1 else "▼"
         status = f"{dir_arrow} REVERSAL {'LONG' if sig.direction == 1 else 'SHORT'}"
         border, style = "green", "bold green"
-    elif past_lock and not state.ba_rev_contained:
+    elif past_lock and not ba_state.ba_rev_contained:
         status = "BROKE OUT — disabled today"; border = "red"; style = "bold red"
-    elif not past_lock and state.ba_rev_ref_day is None:
+    elif not past_lock and ba_state.ba_rev_ref_day is None:
         status = "BUILDING REFERENCE (07:00-10:30)"; border = "blue"; style = "bold"
     elif ((ask_latest and ask_latest.test_count >= BA_REV_TEST_COUNT - 1) or
           (bid_latest and bid_latest.test_count >= BA_REV_TEST_COUNT - 1)):
@@ -1762,8 +1874,8 @@ def build_ba_rev_panel(state: MonitorState, now: datetime) -> Panel:
         status = "EXPIRED"; border = "default"; style = ""
     else:
         status = "WATCHING" + (" (pre-lock)" if not past_lock else " (contained)")
-        border = "blue" if state.ba_brk_breakouts else "default"
-        style = "bold" if state.ba_brk_breakouts else ""
+        border = "blue" if ba_state.ba_brk_breakouts else "default"
+        style = "bold" if ba_state.ba_brk_breakouts else ""
 
     root = Table.grid(padding=(0, 0))
     root.add_column(justify="center")
@@ -1786,23 +1898,23 @@ def build_ba_rev_panel(state: MonitorState, now: datetime) -> Panel:
         det = Table.grid(padding=(0, 1))
         det.add_column(width=14, justify="right")
         det.add_column()
-        if state.ba_rev_ref_high is not None:
-            det.add_row("Ref range:", f"{state.ba_rev_ref_low:.2f} – {state.ba_rev_ref_high:.2f}  "
-                                        f"({state.ba_rev_ref_high - state.ba_rev_ref_low:.1f}pt)  locked")
+        if ba_state.ba_rev_ref_high is not None:
+            det.add_row("Ref range:", f"{ba_state.ba_rev_ref_low:.2f} – {ba_state.ba_rev_ref_high:.2f}  "
+                                        f"({ba_state.ba_rev_ref_high - ba_state.ba_rev_ref_low:.1f}pt)  locked")
         else:
             # Live preview: running high/low from 07:00 ET to now, updates
             # every render until it locks at 10:30 ET — useful to watch build.
             ref_start_et = datetime.combine(now.astimezone(ET).date(),
                                              dtime(BA_REV_REF_START_HM // 60, BA_REV_REF_START_HM % 60), tzinfo=ET)
-            preview = [b for b in state.bars_1m if b.ts.astimezone(ET) >= ref_start_et]
+            preview = [b for b in ba_state.bars_1m if b.ts.astimezone(ET) >= ref_start_et]
             if preview:
                 p_hi = max(b.high for b in preview)
                 p_lo = min(b.low for b in preview)
                 det.add_row("Ref range:", f"{p_lo:.2f} – {p_hi:.2f}  ({p_hi - p_lo:.1f}pt)  building…")
             else:
                 det.add_row("Ref range:", "— (building, locks 10:30 ET)")
-        contain_style = "green" if state.ba_rev_contained else "red"
-        det.add_row("Status:", f"[{contain_style}]{'contained' if state.ba_rev_contained else 'broken out'}[/]"
+        contain_style = "green" if ba_state.ba_rev_contained else "red"
+        det.add_row("Status:", f"[{contain_style}]{'contained' if ba_state.ba_rev_contained else 'broken out'}[/]"
                                 if past_lock else "pre-lock")
         if ask_latest:
             det.add_row("Ask tests:", f"{ask_latest.test_count} @ {ask_latest.wall_price:.2f}")
@@ -1818,8 +1930,8 @@ def build_ba_rev_panel(state: MonitorState, now: datetime) -> Panel:
                  f"trades from 10:30 ET while contained in 07:00-10:30 range")
     root.add_row(foot)
 
-    return Panel(root, title=f"BA-REV  {SYMBOL}", border_style=border,
-                 padding=(0, 1), width=107)
+    return Panel(root, title=f"BA-REV  {ba_state.symbol}", border_style=border,
+                 padding=(0, 1), width=84)
 
 
 def _position_row(t, symbol: str, size: int, direction: int,
@@ -1879,25 +1991,27 @@ def render(state: MonitorState) -> Table:
     root.add_column(ratio=1)
     root.add_row(build_header())
 
-    # ── Layout ─────────────────────────────────────────────────────────────────
-    # Col 1 (ratio=1): BA-BRK · BA-REV
-    # Col 2 (ratio=1): Trade Summary · Positions
-    col1 = Table(box=None, show_header=False, padding=(0, 0), expand=True)
-    col1.add_column(ratio=1)
-    col1.add_row(build_ba_brk_panel(state, now))
-    col1.add_row(build_ba_rev_panel(state, now))
+    # ── Top: one column per BA_SYMBOLS entry, each BA-BRK · BA-REV stacked ──
+    top = Table(box=None, show_header=False, padding=(0, 1), expand=True)
+    for _ in BA_SYMBOLS:
+        top.add_column(ratio=1)
+    top_cols = []
+    for sym in BA_SYMBOLS:
+        col = Table(box=None, show_header=False, padding=(0, 0), expand=True)
+        col.add_column(ratio=1)
+        col.add_row(build_ba_brk_panel(state.ba_states[sym], now))
+        col.add_row(build_ba_rev_panel(state.ba_states[sym], now))
+        top_cols.append(col)
+    top.add_row(*top_cols)
+    root.add_row(top)
 
-    # Col 2: Trade Summary, given its own column so it isn't squeezed by col1
-    col2 = Table(box=None, show_header=False, padding=(0, 0), expand=True)
-    col2.add_column(ratio=1)
-    col2.add_row(build_trade_summary_panel(strategies=FOCUSED_STRATEGIES))
-    col2.add_row(build_positions_panel(state))
-
-    main = Table(box=None, show_header=False, padding=(0, 1), expand=True)
-    main.add_column(ratio=1)    # col1: fills remaining space
-    main.add_column(ratio=1)    # col2: fills remaining space
-    main.add_row(col1, col2)
-    root.add_row(main)
+    # ── Bottom: Trade Summary (wider — ratio=2) · Positions (ratio=1) ───────
+    bottom = Table(box=None, show_header=False, padding=(0, 1), expand=True)
+    bottom.add_column(ratio=2)
+    bottom.add_column(ratio=1)
+    bottom.add_row(build_trade_summary_panel(strategies=FOCUSED_STRATEGIES),
+                   build_positions_panel(state))
+    root.add_row(bottom)
 
     return root
 
@@ -1926,6 +2040,188 @@ def _detect_position_strategy(symbol: str = SYMBOL) -> str:
     return ""
 
 
+def _resolve_ba_brk_sim(ba_state: "BaSymbolState", now: datetime, force: bool = False):
+    """Check the active ba_brk_signal against bars_1m for stop/target, or
+    time expiry; logs the outcome and clears the signal once resolved.
+    force=True resolves immediately at the last known price — used when a
+    fresh cascade is about to overwrite a still-open signal, so every fired
+    signal gets logged exactly once, never silently dropped."""
+    sig = ba_state.ba_brk_signal
+    if sig is None:
+        return
+    for b in ba_state.bars_1m:
+        if b.ts <= sig.fired_at:
+            continue
+        if sig.direction == 1:
+            if b.low <= sig.stop:
+                _log_ba_brk_sim(ba_state.symbol, sig, b.ts, "STOPPED", sig.stop)
+                ba_state.ba_brk_signal = None
+                return
+            if b.high >= sig.target:
+                _log_ba_brk_sim(ba_state.symbol, sig, b.ts, "TARGET", sig.target)
+                ba_state.ba_brk_signal = None
+                return
+        else:
+            if b.high >= sig.stop:
+                _log_ba_brk_sim(ba_state.symbol, sig, b.ts, "STOPPED", sig.stop)
+                ba_state.ba_brk_signal = None
+                return
+            if b.low <= sig.target:
+                _log_ba_brk_sim(ba_state.symbol, sig, b.ts, "TARGET", sig.target)
+                ba_state.ba_brk_signal = None
+                return
+    if force or now >= sig.expires_at:
+        exit_price = ba_state.bars_1m[-1].close if ba_state.bars_1m else sig.entry
+        _log_ba_brk_sim(ba_state.symbol, sig, now, "REPLACED" if force else "TIME", exit_price)
+        ba_state.ba_brk_signal = None
+
+
+def _resolve_ba_rev_sim(ba_state: "BaSymbolState", now: datetime, force: bool = False):
+    """BA-REV counterpart to _resolve_ba_brk_sim — same semantics."""
+    sig = ba_state.ba_rev_signal
+    if sig is None:
+        return
+    rh, rl = ba_state.ba_rev_ref_high, ba_state.ba_rev_ref_low
+    for b in ba_state.bars_1m:
+        if b.ts <= sig.fired_at:
+            continue
+        if sig.direction == 1:
+            if b.low <= sig.stop:
+                _log_ba_rev_sim(ba_state.symbol, sig, b.ts, "STOPPED", sig.stop, rh, rl)
+                ba_state.ba_rev_signal = None
+                return
+            if b.high >= sig.target:
+                _log_ba_rev_sim(ba_state.symbol, sig, b.ts, "TARGET", sig.target, rh, rl)
+                ba_state.ba_rev_signal = None
+                return
+        else:
+            if b.high >= sig.stop:
+                _log_ba_rev_sim(ba_state.symbol, sig, b.ts, "STOPPED", sig.stop, rh, rl)
+                ba_state.ba_rev_signal = None
+                return
+            if b.low <= sig.target:
+                _log_ba_rev_sim(ba_state.symbol, sig, b.ts, "TARGET", sig.target, rh, rl)
+                ba_state.ba_rev_signal = None
+                return
+    if force or now >= sig.expires_at:
+        exit_price = ba_state.bars_1m[-1].close if ba_state.bars_1m else sig.entry
+        _log_ba_rev_sim(ba_state.symbol, sig, now, "REPLACED" if force else "TIME", exit_price, rh, rl)
+        ba_state.ba_rev_signal = None
+
+
+def _eval_ba_for(ba_state: "BaSymbolState", now: datetime):
+    """Per-symbol BA-BRK/BA-REV evaluation — feeds ba_state's own
+    WallTracker from its own DOMBook, accumulates breakout/test events, and
+    checks for a fresh cascade/rejection signal. Mirrors trading_bot.py's
+    evaluate_ba_brk/evaluate_ba_rev (display-only re-simulation, same as
+    the legacy MES-only block this was extracted from)."""
+    if ba_state.wall_tracker is None:
+        return
+    with ba_state.dom._lock:
+        bids = dict(ba_state.dom.bids); asks = dict(ba_state.dom.asks)
+        bb = ba_state.dom.best_bid;     ba = ba_state.dom.best_ask
+    if bb is None or ba is None:
+        return
+    events = ba_state.wall_tracker.update(bids, asks, bb, ba, now)
+    if events:
+        log_wall_events(events)
+
+    # BA-BRK: accumulate breakout + test events (both sides, unfiltered by
+    # wall size) for display, and check for a fresh cascade.
+    for ev in events:
+        if ev.event in ("test", "breakout"):
+            ba_state.ba_brk_breakouts.append(ev)
+    prune_before = now - timedelta(minutes=BA_BRK_BUFFER_MIN)
+    ba_state.ba_brk_breakouts = [e for e in ba_state.ba_brk_breakouts if e.ts >= prune_before]
+
+    today = now.astimezone(LOCAL).date()
+    if ba_state.day_open_date != today:
+        fresh_open = _day_open_price(ba_state.bars_1m, now)
+        if fresh_open is not None:
+            ba_state.day_open      = fresh_open
+            ba_state.day_open_date = today
+
+    # Resolve any already-active signal against price/time before possibly
+    # firing (and logging) a new one — see _resolve_ba_brk_sim.
+    _resolve_ba_brk_sim(ba_state, now)
+
+    # Mirrors trading_bot.py's evaluate_ba_brk: check both sides, pick
+    # whichever cascade triggered most recently, same as the live tie-break.
+    ask_breakouts_only = [e for e in ba_state.ba_brk_breakouts if e.event == "breakout"]
+    last_ts = ba_state.ba_brk_signal.last_break_ts if ba_state.ba_brk_signal else None
+    brk_candidates = []
+    r_ask = _detect_cascade_signal(ask_breakouts_only, "ask",
+                                    BA_BRK_CASCADE_MIN, BA_BRK_MAX_GAP_SEC, last_ts)
+    if r_ask:
+        brk_candidates.append(("ask", *r_ask))
+    r_bid = _detect_cascade_signal(ask_breakouts_only, "bid",
+                                    BA_BRK_CASCADE_MIN, BA_BRK_MAX_GAP_SEC, last_ts)
+    if r_bid:
+        brk_candidates.append(("bid", *r_bid))
+    if brk_candidates:
+        side, trigger, cascade_start, cascade_len = max(brk_candidates, key=lambda c: c[1].ts)
+        if (now - trigger.ts).total_seconds() <= BA_BRK_MAX_GAP_SEC + 15:
+            entry_price = trigger.price or trigger.wall_price
+            if side == "ask" and ba_state.day_open is not None and entry_price > ba_state.day_open:
+                if ba_state.ba_brk_signal is not None:
+                    _resolve_ba_brk_sim(ba_state, now, force=True)
+                ba_state.ba_brk_signal = BaBrkSignal(
+                    direction=1, side="ask", entry=entry_price,
+                    target=entry_price + BA_BRK_TARGET_PTS,
+                    stop=entry_price - BA_BRK_STOP_PTS,
+                    cascade_len=cascade_len, first_break_ts=cascade_start,
+                    last_break_ts=trigger.ts,
+                    fired_at=now, expires_at=now + timedelta(minutes=BA_BRK_HOLD_MIN),
+                )
+                play_alert()
+            elif side == "bid" and ba_state.day_open is not None and entry_price < ba_state.day_open:
+                if ba_state.ba_brk_signal is not None:
+                    _resolve_ba_brk_sim(ba_state, now, force=True)
+                ba_state.ba_brk_signal = BaBrkSignal(
+                    direction=-1, side="bid", entry=entry_price,
+                    target=entry_price - BA_BRK_BID_TARGET_PTS,
+                    stop=entry_price + BA_BRK_BID_STOP_PTS,
+                    cascade_len=cascade_len, first_break_ts=cascade_start,
+                    last_break_ts=trigger.ts,
+                    fired_at=now, expires_at=now + timedelta(minutes=BA_BRK_BID_HOLD_MIN),
+                )
+                play_alert()
+
+    # BA-REV: wall-rejection reversal — a wall surviving BA_REV_TEST_COUNT
+    # touches without breaking. Reuses the same ba_brk_breakouts buffer.
+    # Trading starts at 10:30 ET (no free window) and only while still
+    # contained within the 07:00-10:30 reference range.
+    _update_ba_rev_reference(ba_state, now, symbol=ba_state.symbol)
+    _update_ba_rev_containment(ba_state, ba_state.bars_1m)
+    _resolve_ba_rev_sim(ba_state, now)
+    now_et_hm_rev = now.astimezone(ET).hour * 60 + now.astimezone(ET).minute
+    rev_eligible = now_et_hm_rev >= BA_REV_LOCK_HM and ba_state.ba_rev_contained
+    if rev_eligible:
+        rev_last_ts = ba_state.ba_rev_signal.trigger_ts if ba_state.ba_rev_signal else None
+        rev_candidates = []
+        for side in ("ask", "bid"):
+            e = _find_test_signal(ba_state.ba_brk_breakouts, side,
+                                   BA_REV_TEST_COUNT, rev_last_ts)
+            if e:
+                rev_candidates.append((side, e))
+        if rev_candidates:
+            rside, rtrigger = max(rev_candidates, key=lambda c: c[1].ts)
+            if (now - rtrigger.ts).total_seconds() <= BA_REV_SIGNAL_STALE_SEC:
+                rdir  = -1 if rside == "ask" else 1
+                rentry = rtrigger.price or rtrigger.wall_price
+                if ba_state.ba_rev_signal is not None:
+                    _resolve_ba_rev_sim(ba_state, now, force=True)
+                ba_state.ba_rev_signal = BaRevSignal(
+                    direction=rdir, side=rside, entry=rentry,
+                    target=rentry + rdir * BA_REV_TARGET_PTS,
+                    stop=rentry   - rdir * BA_REV_STOP_PTS,
+                    test_count=rtrigger.test_count, wall_price=rtrigger.wall_price,
+                    trigger_ts=rtrigger.ts,
+                    fired_at=now, expires_at=now + timedelta(minutes=BA_REV_HOLD_MIN),
+                )
+                play_alert()
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def run():
@@ -1944,14 +2240,24 @@ def run():
     if not mnq_cid:
         print("WARNING: no contract for MNQ — MNQ position row will stay blank")
 
-    state = MonitorState(contract_id=cid, mnq_contract_id=mnq_cid,
-                          wall_tracker=WallTracker(SYMBOL))
-    fetch_1min_bars(client, state)
+    def _wall_tracker_for(sym: str) -> WallTracker:
+        return WallTracker(sym, wall_min_size=WALL_MIN_SIZE_BY_SYMBOL.get(sym, _WALL_MIN_SIZE_DEFAULT))
 
-    # DOM reader (250ms)
+    state = MonitorState(contract_id=cid, mnq_contract_id=mnq_cid,
+                          wall_tracker=_wall_tracker_for(SYMBOL))
+    state.ba_states = {sym: BaSymbolState(symbol=sym, wall_tracker=_wall_tracker_for(sym))
+                        for sym in BA_SYMBOLS}
+    fetch_1min_bars(client, state)
+    for sym in BA_SYMBOLS:
+        state.ba_states[sym].bars_1m = fetch_1min_bars_for(sym)
+
+    # DOM reader (250ms) — legacy MES-only state.dom plus each BA_SYMBOLS entry
     def _poll_dom():
         while True:
-            try: _read_dom_db(state)
+            try:
+                _read_dom_db(state)
+                for sym in BA_SYMBOLS:
+                    _read_dom_for(sym, state.ba_states[sym].dom)
             except Exception: traceback.print_exc()
             time.sleep(0.25)
     threading.Thread(target=_poll_dom, daemon=True, name="dom-reader").start()
@@ -1962,6 +2268,8 @@ def run():
             time.sleep(60)
             try:
                 fetch_1min_bars(client, state)
+                for sym in BA_SYMBOLS:
+                    state.ba_states[sym].bars_1m = fetch_1min_bars_for(sym)
                 sigma_pts = _update_vwaslr_ema(state)
                 if sigma_pts:
                     state.vwaslr_sigma_pts = sigma_pts
@@ -2124,101 +2432,13 @@ def run():
                         now >= state.wall_break_signal.expires_at):
                     state.wall_break_signal = None
 
-                # BA-BRK: accumulate breakout + test events (both sides, unfiltered
-                # by wall size) for display, and check for a fresh ask cascade.
-                # (test events are display-only context — cascade detection below
-                # filters back down to breakouts, matching trading_bot.py's live logic.)
-                for ev in events:
-                    if ev.event in ("test", "breakout"):
-                        state.ba_brk_breakouts.append(ev)
-                prune_before = now - timedelta(minutes=BA_BRK_BUFFER_MIN)
-                state.ba_brk_breakouts = [e for e in state.ba_brk_breakouts if e.ts >= prune_before]
-
-                today = now.astimezone(LOCAL).date()
-                if state.day_open_date != today:
-                    fresh_open = _day_open_price(state.bars_mes_orb, now)
-                    if fresh_open is not None:
-                        state.day_open      = fresh_open
-                        state.day_open_date = today
-
-                # Mirrors trading_bot.py's evaluate_ba_brk: check both sides (ask
-                # cascades are long, bid cascades are short — bid live since
-                # 2026-09-14, see BA_BRK_BID_* constants), pick whichever cascade
-                # triggered most recently, same as the real bot's own tie-break.
-                ask_breakouts_only = [e for e in state.ba_brk_breakouts if e.event == "breakout"]
-                last_ts = state.ba_brk_signal.last_break_ts if state.ba_brk_signal else None
-                brk_candidates = []
-                r_ask = _detect_cascade_signal(ask_breakouts_only, "ask",
-                                                BA_BRK_CASCADE_MIN, BA_BRK_MAX_GAP_SEC, last_ts)
-                if r_ask:
-                    brk_candidates.append(("ask", *r_ask))
-                r_bid = _detect_cascade_signal(ask_breakouts_only, "bid",
-                                                BA_BRK_CASCADE_MIN, BA_BRK_MAX_GAP_SEC, last_ts)
-                if r_bid:
-                    brk_candidates.append(("bid", *r_bid))
-                if brk_candidates:
-                    side, trigger, cascade_start, cascade_len = max(brk_candidates, key=lambda c: c[1].ts)
-                    if (now - trigger.ts).total_seconds() <= BA_BRK_MAX_GAP_SEC + 15:
-                        entry_price = trigger.price or trigger.wall_price
-                        if side == "ask" and state.day_open is not None and entry_price > state.day_open:
-                            state.ba_brk_signal = BaBrkSignal(
-                                direction=1, side="ask", entry=entry_price,
-                                target=entry_price + BA_BRK_TARGET_PTS,
-                                stop=entry_price - BA_BRK_STOP_PTS,
-                                cascade_len=cascade_len, first_break_ts=cascade_start,
-                                last_break_ts=trigger.ts,
-                                fired_at=now, expires_at=now + timedelta(minutes=BA_BRK_HOLD_MIN),
-                            )
-                            play_alert()
-                        elif side == "bid" and state.day_open is not None and entry_price < state.day_open:
-                            state.ba_brk_signal = BaBrkSignal(
-                                direction=-1, side="bid", entry=entry_price,
-                                target=entry_price - BA_BRK_BID_TARGET_PTS,
-                                stop=entry_price + BA_BRK_BID_STOP_PTS,
-                                cascade_len=cascade_len, first_break_ts=cascade_start,
-                                last_break_ts=trigger.ts,
-                                fired_at=now, expires_at=now + timedelta(minutes=BA_BRK_BID_HOLD_MIN),
-                            )
-                            play_alert()
-                if (state.ba_brk_signal is not None and
-                        now >= state.ba_brk_signal.expires_at):
-                    state.ba_brk_signal = None
-
-                # BA-REV: wall-rejection reversal — a wall surviving
-                # BA_REV_TEST_COUNT touches without breaking. Reuses the same
-                # ba_brk_breakouts buffer (already holds both test+breakout
-                # events). Trading starts at 10:30 ET (no free window — see
-                # trading_bot.py) and only while still contained within the
-                # 07:00-10:30 reference range.
-                _update_ba_rev_reference(state, now)
-                _update_ba_rev_containment(state, state.bars_1m)
-                now_et_hm_rev = now.astimezone(ET).hour * 60 + now.astimezone(ET).minute
-                rev_eligible = now_et_hm_rev >= BA_REV_LOCK_HM and state.ba_rev_contained
-                if rev_eligible:
-                    rev_last_ts = state.ba_rev_signal.trigger_ts if state.ba_rev_signal else None
-                    rev_candidates = []
-                    for side in ("ask", "bid"):
-                        e = _find_test_signal(state.ba_brk_breakouts, side,
-                                               BA_REV_TEST_COUNT, rev_last_ts)
-                        if e:
-                            rev_candidates.append((side, e))
-                    if rev_candidates:
-                        rside, rtrigger = max(rev_candidates, key=lambda c: c[1].ts)
-                        if (now - rtrigger.ts).total_seconds() <= BA_REV_SIGNAL_STALE_SEC:
-                            rdir  = -1 if rside == "ask" else 1
-                            rentry = rtrigger.price or rtrigger.wall_price
-                            state.ba_rev_signal = BaRevSignal(
-                                direction=rdir, side=rside, entry=rentry,
-                                target=rentry + rdir * BA_REV_TARGET_PTS,
-                                stop=rentry   - rdir * BA_REV_STOP_PTS,
-                                test_count=rtrigger.test_count, wall_price=rtrigger.wall_price,
-                                trigger_ts=rtrigger.ts,
-                                fired_at=now, expires_at=now + timedelta(minutes=BA_REV_HOLD_MIN),
-                            )
-                            play_alert()
-                if (state.ba_rev_signal is not None and
-                        now >= state.ba_rev_signal.expires_at):
-                    state.ba_rev_signal = None
+            # BA-BRK/BA-REV: fully independent per-symbol evaluation (own
+            # WallTracker/DOMBook per BA_SYMBOLS entry) — see _eval_ba_for.
+            for sym in BA_SYMBOLS:
+                try:
+                    _eval_ba_for(state.ba_states[sym], now)
+                except Exception:
+                    traceback.print_exc()
     threading.Thread(target=_eval_walls, daemon=True, name="wall-eval").start()
 
     # Initial VWASLR EMA after bars loaded

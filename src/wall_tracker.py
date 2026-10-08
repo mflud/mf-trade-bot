@@ -44,6 +44,29 @@ PULL_THRESH    = 0.35   # wall size drops below this fraction of peak → wall p
 MAX_WALL_AGE_S = 4 * 3600   # forget walls older than 4 hours
 MIN_WALL_GAP   = 1.0    # two walls on same side must be >= this pts apart
 
+# Per-instrument WALL_MIN_SIZE override — the default above was calibrated
+# for MES's book depth (median resting size ~40 contracts, sampled
+# 2026-10-07). MYM/M2K run 5-10x thinner (medians ~5 and ~8) — WALL_MULT
+# stays universal (it's median-relative, already self-scales), but the
+# absolute floor needs scaling down per symbol or nothing ever qualifies as
+# a wall for them. Also used by focused_monitor.py's BA-BRK panel to scale
+# its "notable wall" display highlight (MES's is 100 — roughly its own
+# typical top-of-book size, not just the detection floor).
+WALL_MIN_SIZE_BY_SYMBOL = {
+    "MES": 50,
+    "MNQ": 50,   # not separately calibrated yet — MNQ wall data already noted sparse elsewhere
+    "MYM": 15,   # raised 2026-10-08: 8 sat inside the noise cluster (85% of today's
+    "M2K": 20,   # events landed at 8-13/12-18 resp.) — rapid-fire fake "cascades" from
+                 # adjacent-tick trivial orders breaking within seconds. Floors now sit
+                 # cleanly above each symbol's observed noise band.
+}
+WALL_NOTABLE_SIZE_BY_SYMBOL = {
+    "MES": 100,
+    "MNQ": 100,
+    "MYM": 30,
+    "M2K": 35,
+}
+
 LOG_PATH = Path("logs/wall_events.csv")
 LOG_FIELDS = [
     "ts", "symbol", "side", "wall_price", "wall_size", "peak_size",
@@ -90,8 +113,15 @@ class WallTracker:
     Intended update frequency: every 1-5 seconds (from the display/eval loop).
     """
 
-    def __init__(self, symbol: str):
+    def __init__(self, symbol: str, wall_min_size: float = WALL_MIN_SIZE,
+                 wall_mult: float = WALL_MULT):
+        """wall_min_size/wall_mult default to the MES-calibrated module
+        constants — pass instrument-specific values for thinner books (e.g.
+        MYM/M2K, whose typical resting size is 5-10x smaller than MES's;
+        see project memory / focused_monitor.py's WALL_MIN_SIZE_BY_SYMBOL)."""
         self.symbol  = symbol
+        self.wall_min_size = wall_min_size
+        self.wall_mult     = wall_mult
         self._walls: list[WallLevel] = []
         self._lock   = threading.Lock()
 
@@ -151,7 +181,7 @@ class WallTracker:
         return float(np.median(sizes)) if sizes else 1.0
 
     def _is_significant(self, size: float, median: float) -> bool:
-        return size >= WALL_MULT * median and size >= WALL_MIN_SIZE
+        return size >= self.wall_mult * median and size >= self.wall_min_size
 
     def _detect_new_walls(self, bids, asks, best_bid, best_ask, ts) -> list[WallEvent]:
         events = []
@@ -248,7 +278,7 @@ class WallTracker:
                     continue
 
             # ── Wall pulled (disappeared without breakout) ─────────────────
-            if w.peak_size > 0 and current_size < w.peak_size * PULL_THRESH and current_size < WALL_MIN_SIZE:
+            if w.peak_size > 0 and current_size < w.peak_size * PULL_THRESH and current_size < self.wall_min_size:
                 w.pulled = True
                 events.append(WallEvent(
                     ts=ts, symbol=self.symbol, side=w.side,

@@ -52,6 +52,11 @@ USER_HUB_URL   = "wss://rtc.topstepx.com/hubs/user"
 INSTRUMENTS = {
     "MES": "MES",
     "MNQ": "MNQ",
+    # Added 2026-10-07 for passive DOM/wall-tracking data collection (no
+    # strategies enabled for these in trading_bot.py yet — see its
+    # INSTRUMENTS list comment).
+    "MYM": "MYM",
+    "M2K": "M2K",
 }
 
 # Bar sizes to build (in minutes).
@@ -273,7 +278,7 @@ def init_bars_db(db_path: Path) -> sqlite3.Connection:
         ON bars5s (symbol, ts DESC)
     """)
     # Trim bars5s to last 10,000 rows per symbol on startup to bound growth
-    for sym in ["MES", "MNQ", "ES", "NQ"]:
+    for sym in ["MES", "MNQ", "MYM", "M2K", "ES", "NQ"]:
         conn.execute("""
             DELETE FROM bars5s WHERE symbol = ? AND ts NOT IN (
                 SELECT ts FROM bars5s WHERE symbol = ?
@@ -597,8 +602,15 @@ def backfill(client: TopstepClient, states: dict[str, SymbolState],
              bars_conn: sqlite3.Connection, demo: bool):
     now = datetime.now(timezone.utc)
     log.info("Backfilling historical bars …")
+    # 1-min lookback needs to comfortably span from the prior RTH close
+    # (16:00 ET) through this restart (~08:30 ET, per _wait_for_session) now
+    # that _start_session_exit_watcher() makes bar_collector exit at 17:00 ET
+    # and restart fresh each day — that leaves a ~4.5hr gap (17:00-21:30 ET)
+    # in bars.db that only this backfill can fill in. ~20hr lookback (1150
+    # bars) covers a normal weekday with margin; BA_REV_* range gates in
+    # trading_bot.py/focused_monitor.py depend on this window being complete.
     for sym, state in states.items():
-        for minutes, count in [(1, 600), (5, 200)]:
+        for minutes, count in [(1, 1150), (5, 200)]:
             start = now - timedelta(minutes=minutes * count + 60)
             try:
                 raw = client.get_bars(
